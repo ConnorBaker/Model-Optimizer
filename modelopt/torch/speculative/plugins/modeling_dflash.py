@@ -46,6 +46,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP as _MLP_CLS  # noqa: N814
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm as _NORM_CLS  # noqa: N814
@@ -147,6 +148,9 @@ class DFlashBaseModelOutput:
             out_hiddens = d.get("base_model_hidden_states")
             if out_hiddens is None:
                 raise KeyError("base_model_hidden_states")
+            # A producer can store the hidden states in a wider dtype than the target's weights.
+            # Cast before the final norm too, which online training runs in the target's dtype.
+            out_hiddens = out_hiddens.to(base_model_lm_head.weight.dtype)
             out_hiddens = _maybe_apply_base_final_norm(out_hiddens, d, base_model_norm)
             logits = base_model_lm_head(out_hiddens)
         return cls(
@@ -324,7 +328,28 @@ class DFlashAttention(nn.Module):
         )
 
 
-class DFlashDecoderLayer(nn.Module):
+class _IdentitySublayerWrapper(nn.Module):
+    """No-op sublayer wrapper: the default around each attention/MLP sublayer.
+
+    ``DFlashDecoderLayer`` calls ``prepare()`` before a sublayer and ``finish()``
+    after it, so a variant can transform the sublayer's input and output without
+    the layer's forward growing a branch. This default does nothing and holds no
+    parameters, so it neither appears in ``state_dict()`` nor changes the numerics
+    of a plain DFlash (or Domino/DSpark) draft.
+
+    DFlash2 substitutes ``DFlashGroupedConv`` here (see ``modeling_dflash2.py``).
+    """
+
+    def prepare(self, hidden_states):
+        """Return the sublayer input unchanged, with no state to carry to ``finish``."""
+        return hidden_states, None
+
+    def finish(self, hidden_states, state):
+        """Return the sublayer output unchanged."""
+        return hidden_states
+
+
+class DFlashDecoderLayer(GradientCheckpointingLayer):
     """Draft decoder layer with KV injection."""
 
     def __init__(self, config, layer_idx):
@@ -334,25 +359,39 @@ class DFlashDecoderLayer(nn.Module):
         self.mlp = _MLP_CLS(config)
         self.input_layernorm = _NORM_CLS(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = _NORM_CLS(config.hidden_size, eps=config.rms_norm_eps)
+        # Sublayer wrappers; no-ops unless a variant replaces them (DFlash2).
+        self.attention_conv = _IdentitySublayerWrapper()
+        self.mlp_conv = _IdentitySublayerWrapper()
 
     def forward(self, hidden_states, target_hidden, position_embeddings, attention_mask=None):
         """Forward pass with residual connections."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, conv_state = self.attention_conv.prepare(hidden_states)
         hidden_states = self.self_attn(
             hidden_states, target_hidden, position_embeddings, attention_mask
         )
+        hidden_states = self.attention_conv.finish(hidden_states, conv_state)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, conv_state = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp_conv.finish(hidden_states, conv_state)
         hidden_states = residual + hidden_states
         return hidden_states
 
 
 class DFlashModule(nn.Module):
-    """DFlash draft module using Qwen3 components (MLP, RMSNorm, RotaryEmbedding)."""
+    """DFlash draft module using Qwen3 components (MLP, RMSNorm, RotaryEmbedding).
+
+    Activation checkpointing applies to this module and not to the frozen target, which
+    runs under ``no_grad`` and stores nothing: ``DFlashDecoderLayer`` inherits
+    ``GradientCheckpointingLayer``, so ``PreTrainedModel._set_gradient_checkpointing``
+    reaches the draft layers directly, and ``ModelOptTrainer`` forces ``use_reentrant=False``
+    before ``gradient_checkpointing_enable`` runs.
+    """
 
     def __init__(self, config):
         """Initialize DFlash module with feature fusion, decoder layers, and rotary embeddings."""

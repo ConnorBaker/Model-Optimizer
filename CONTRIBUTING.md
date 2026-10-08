@@ -145,6 +145,8 @@ See [`modelopt/torch/quantization/utils/calib_utils.py`](./modelopt/torch/quanti
 
 We use [pytest](https://docs.pytest.org/) for all tests. For any new features / examples, make sure to add tests and that the coverage check in your PR passes. The tests are organized into the following directories:
 
+Test filenames must mirror the production module they primarily cover: tests for `foo.py` belong in `test_foo.py`. When a production module is renamed, split, or removed, rename or split its tests in the same change so test filenames do not preserve obsolete module names. A cross-module integration test may use a feature-oriented name only when no single production module owns the behavior.
+
 - `tests/unit`: Fast cpu-based unit tests for the core ModelOpt library. They should not take more than a few seconds to run.
 - `tests/gpu`: Fast GPU-based unit tests for the core ModelOpt library. In most cases, they should not take more than a few seconds to run.
 - `tests/gpu_megatron`: Fast GPU-based unit tests for the core ModelOpt library for Megatron-Core features. In most cases, they should not take more than a few seconds to run.
@@ -264,6 +266,9 @@ nox -s "unit-3.12(torch_211, tf_latest)"
 ## Submitting your code
 
 - Submit a pull request and let auto-assigned reviewers (based on [CODEOWNERS](./.github/CODEOWNERS)) review your PR.
+- **Fork PRs:** An authorized vetter must comment `/ok to test <full-head-sha>` to run NVIDIA-hosted CI.
+- **Contributors without write access:** When GitHub requests workflow approval, a reviewer with write permission
+  must select **Approve and run workflows** to start GitHub Actions CI.
 - If any CI/CD checks fail, fix the issues and push again.
 - Once your PR is approved and all checks pass, one of the reviewers will merge the PR.
 - If your PR is a bug fix that should also land in an ongoing release branch, add the
