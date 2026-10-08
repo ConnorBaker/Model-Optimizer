@@ -153,18 +153,22 @@ python examples/speculative_decoding/collect_hidden_states/prepare_dsv4_mtp_data
 ```
 
 The default mixture gives math, chat, STEM, and code equal token budgets. It
-keeps only complete `finish_reason=stop` first turns with nonempty reasoning
-and answers, matching serialized output, safe roles/content, no tool calls,
-and an exact complete-conversation tokenization that fits the limit. It never
+keeps `finish_reason=stop` first turns with nonempty final answers and
+`finish_reason=length` first turns with any available response content.
+Serialized output must match, prompt roles must be supported, and tool calls
+are not supported. The full prompt plus available response must fit the
+collection limit; use a larger `--max-seq-len` for longer rows. It never
 truncates a reasoning trajectory. Selection and the validation split are
 deterministic. The output `report.json` gives every rejection count. A DSV4
 BF16 dump occupies 71,680 bytes per token (`5 * 7168 * 2`), so the one-million
 token default is about 71.7 GB before PyTorch container overhead.
 
-The supplied DSV4 template preserves reasoning and wraps the complete
-assistant span—reasoning, `</think>`, final answer, and EOS—in Transformers'
-`generation` block. Therefore `--answer-only-loss` trains on thinking as well
-as the final answer; it only excludes system and user tokens.
+The supplied DSV4 template preserves reasoning and wraps the available
+assistant span in Transformers' `generation` block. Length-capped responses
+receive no EOS; reasoning-only length-capped responses also receive no
+invented `</think>` marker. The prepared records and feature dumps retain
+`finish_reason`. Therefore `--answer-only-loss` trains on thinking as well
+as available final-answer tokens; it only excludes system and user tokens.
 
 First convert the downloaded target with the vendor `inference/convert.py`
 script using model parallelism one. Then dump the target's native four-stream
@@ -236,9 +240,9 @@ for this recipe.
 
 Train with the dedicated recipe. Full MTP masters require a suitably sharded
 FSDP launch; set `training.dp_shard_size` for the available GPU allocation.
-Set `mtp_boost.rollout_steps` above one for cache-free normal-causal rollouts.
+Set `mtp_boost.ttt_steps` above one for cache-free normal-causal TTT rounds.
 `mtp_boost.hsm_mode=uniform_layer_sample` mixes the raw state from the target
-and prior rounds; it requires at least two rollout steps and does not enable
+and prior rounds; it requires at least two TTT steps and does not enable
 EAGLE3 TTT masks or KV-cache updates.
 
 ```bash

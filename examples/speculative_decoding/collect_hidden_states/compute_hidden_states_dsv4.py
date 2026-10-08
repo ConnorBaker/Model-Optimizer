@@ -30,9 +30,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import os
 import re
+import shutil
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -101,10 +104,22 @@ def _parse_args() -> argparse.Namespace:
         help="JSONL file or directory of JSONL conversation files.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--completed-ids-file",
+        type=Path,
+        default=None,
+        help="Optional newline-delimited conversation IDs to skip in addition to existing outputs.",
+    )
     parser.add_argument("--max-seq-len", type=int, default=3072)
     parser.add_argument("--debug-max-num-conversations", type=int, default=None)
     parser.add_argument("--dp-rank", type=int, default=0)
     parser.add_argument("--dp-world-size", type=int, default=1)
+    parser.add_argument(
+        "--max-filesystem-usage-percent",
+        type=float,
+        default=None,
+        help="Stop before a feature write would raise output-filesystem usage above this percent.",
+    )
     parser.add_argument("--device", default="cuda")
     add_answer_only_loss_args(parser)
     return parser.parse_args()
@@ -134,17 +149,100 @@ def _prepare_tokenizer(model_dir: Path, args: argparse.Namespace):
     return tokenizer
 
 
+def _load_completed_ids(completed_ids_file: Path | None) -> set[str]:
+    """Load conversation IDs whose feature files have already been archived."""
+    if completed_ids_file is None:
+        return set()
+    completed_ids = {
+        line.strip() for line in completed_ids_file.read_text().splitlines() if line.strip()
+    }
+    invalid_id = next((value for value in completed_ids if not _SAFE_ID.fullmatch(value)), None)
+    if invalid_id is not None:
+        raise ValueError(f"Invalid conversation ID in {completed_ids_file}: {invalid_id!r}")
+    return completed_ids
+
+
+def _payload_nbytes(payload: dict[str, Any]) -> int:
+    """Return the tensor bytes that dominate a serialized feature payload."""
+    return sum(
+        value.numel() * value.element_size()
+        for value in payload.values()
+        if isinstance(value, torch.Tensor)
+    )
+
+
+def _atomic_write_reservation(reservation_path: Path, reserved_bytes: int) -> None:
+    """Publish a complete reservation before a writer can start saving its payload."""
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=reservation_path.parent, prefix=f".{reservation_path.name}.", suffix=".tmp"
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w") as reservation_file:
+            reservation_file.write(str(reserved_bytes))
+            reservation_file.flush()
+            os.fsync(reservation_file.fileno())
+        os.replace(temporary_path, reservation_path)
+    finally:
+        with contextlib.suppress(OSError):
+            temporary_path.unlink()
+
+
+def _save_below_filesystem_limit(
+    payload: dict[str, Any],
+    output_file: Path,
+    max_filesystem_usage_percent: float | None,
+) -> bool:
+    """Atomically save unless doing so would cross the shared-filesystem limit."""
+    if max_filesystem_usage_percent is None:
+        _atomic_torch_save(payload, output_file)
+        return True
+
+    reservation_dir = output_file.parent / ".storage-reservations"
+    reservation_dir.mkdir(exist_ok=True)
+    reservation_path = reservation_dir / f"{uuid.uuid4().hex}.bytes"
+    reserved_bytes = _payload_nbytes(payload) + 2**20
+    lock_path = output_file.parent / ".storage-limit.lock"
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            usage = shutil.disk_usage(output_file.parent)
+            maximum_used = int(usage.total * max_filesystem_usage_percent / 100)
+            outstanding_reservations = sum(
+                int(path.read_text()) for path in reservation_dir.glob("*.bytes")
+            )
+            projected_used = usage.used + outstanding_reservations + reserved_bytes
+            if projected_used > maximum_used:
+                return False
+            _atomic_write_reservation(reservation_path, reserved_bytes)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    try:
+        _atomic_torch_save(payload, output_file)
+        return True
+    finally:
+        with lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                reservation_path.unlink(missing_ok=True)
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def main(args: argparse.Namespace) -> None:
     if args.dp_world_size < 1 or not 0 <= args.dp_rank < args.dp_world_size:
         raise ValueError("--dp-rank must be in [0, --dp-world-size)")
+    if args.max_filesystem_usage_percent is not None and not (
+        0 < args.max_filesystem_usage_percent < 100
+    ):
+        raise ValueError("--max-filesystem-usage-percent must be between 0 and 100")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("--device requests CUDA but CUDA is unavailable")
 
     mp_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     mp_rank = int(os.environ.get("RANK", "0"))
     if mp_world_size > 1:
-        if args.dp_rank != 0 or args.dp_world_size != 1:
-            raise ValueError("--dp-rank/--dp-world-size cannot be combined with model parallelism")
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         torch.distributed.init_process_group("nccl")
@@ -157,6 +255,7 @@ def main(args: argparse.Namespace) -> None:
         dataset = dataset.select(range(min(args.debug_max_num_conversations, len(dataset))))
 
     is_writer = mp_rank == 0
+    completed_ids = _load_completed_ids(args.completed_ids_file)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     tokenizer = _prepare_tokenizer(args.model_dir, args)
     device = torch.device(args.device)
@@ -171,17 +270,32 @@ def main(args: argparse.Namespace) -> None:
     skipped = 0
     written = 0
     skipped_too_long = 0
+    stopped_at_storage_limit = False
     for entry in tqdm(dataset, desc=f"DSV4 MTP features DP#{args.dp_rank}", disable=not is_writer):
         conversation_id = entry.get("conversation_id") or entry.get("uuid") or entry.get("id")
         if not isinstance(conversation_id, str) or not _SAFE_ID.fullmatch(conversation_id):
             skipped += 1
             continue
         output_file = args.output_dir / f"{conversation_id}.pt"
-        output_exists = torch.tensor(int(output_file.exists()), device=device)
+        output_exists = torch.tensor(
+            int(conversation_id in completed_ids or output_file.exists()), device=device
+        )
         if mp_world_size > 1:
             torch.distributed.broadcast(output_exists, src=0)
         if output_exists.item():
             continue
+
+        # Quota queries can be expensive on shared filesystems; skipped outputs need no space.
+        storage_limit_reached = torch.tensor(0, device=device)
+        if is_writer and args.max_filesystem_usage_percent is not None:
+            usage = shutil.disk_usage(args.output_dir)
+            if usage.used >= usage.total * args.max_filesystem_usage_percent / 100:
+                storage_limit_reached.fill_(1)
+        if mp_world_size > 1:
+            torch.distributed.broadcast(storage_limit_reached, src=0)
+        if storage_limit_reached.item():
+            stopped_at_storage_limit = True
+            break
 
         conversations = entry.get("messages") or entry.get("conversations")
         if not isinstance(conversations, list):
@@ -194,24 +308,33 @@ def main(args: argparse.Namespace) -> None:
             skipped += 1
             continue
         if input_ids.shape[1] > args.max_seq_len:
-            # Never retain a prefix that ends in the middle of reasoning or before
-            # the final answer. Data preparation is responsible for selecting a
-            # complete conversation that fits the training sequence length.
+            # Preserve every available response token. Longer trajectories require
+            # a collection run with a larger context limit rather than truncation.
             skipped_too_long += 1
             continue
 
         raw_hiddens, teacher_hiddens = dsv4_target_features(model, input_ids.to(device))
+        saved = torch.tensor(1, device=device)
         if is_writer:
-            _atomic_torch_save(
-                {
-                    "input_ids": input_ids.squeeze(0).cpu(),
-                    "target_mtp_hidden_states": raw_hiddens.squeeze(0).cpu(),
-                    "target_lm_head_hidden_states": teacher_hiddens.squeeze(0).cpu(),
-                    "loss_mask": loss_mask.cpu(),
-                    "conversation_id": str(conversation_id),
-                },
+            payload = {
+                "input_ids": input_ids.squeeze(0).cpu(),
+                "target_mtp_hidden_states": raw_hiddens.squeeze(0).cpu(),
+                "target_lm_head_hidden_states": teacher_hiddens.squeeze(0).cpu(),
+                "loss_mask": loss_mask.cpu(),
+                "conversation_id": str(conversation_id),
+                "finish_reason": entry.get("finish_reason") or "stop",
+            }
+            if not _save_below_filesystem_limit(
+                payload,
                 output_file,
-            )
+                args.max_filesystem_usage_percent,
+            ):
+                saved.zero_()
+        if mp_world_size > 1:
+            torch.distributed.broadcast(saved, src=0)
+        if not saved.item():
+            stopped_at_storage_limit = True
+            break
         written += 1
 
     if mp_world_size > 1:
@@ -219,7 +342,8 @@ def main(args: argparse.Namespace) -> None:
     if is_writer:
         print(
             f"Wrote {written} DSV4 MTP feature files; skipped {skipped} invalid rows; "
-            f"skipped {skipped_too_long} overlong rows."
+            f"skipped {skipped_too_long} overlong rows; "
+            f"stopped_at_storage_limit={stopped_at_storage_limit}."
         )
 
 

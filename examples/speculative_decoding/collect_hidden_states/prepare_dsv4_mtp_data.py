@@ -6,8 +6,9 @@
 The Nemotron generation logs keep the prompt in ``messages`` and the generated
 assistant turn in top-level ``reasoning_content`` / ``generation`` fields.  The
 hidden-state collectors expect a complete conversation, so this script appends
-that assistant turn, verifies it against ``serialized_output``, tokenizes with
-the exact DSV4 template, and rejects incomplete or overlong trajectories.
+that assistant turn and verifies it against ``serialized_output``. Tokenization
+validation is optional because the hidden-state collector already tokenizes and
+rejects overlong trajectories.
 
 Selection is deterministic and token-budgeted.  A bounded hash reservoir is
 maintained independently for math/chat/STEM/code so the much larger chat source
@@ -21,6 +22,7 @@ import hashlib
 import heapq
 import json
 import re
+import time
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -30,16 +32,7 @@ from typing import Any
 from common import load_chat_template, tokenize_with_loss_mask, verify_generation_tags
 
 DEFAULT_CATEGORY_WEIGHTS = {"math": 1.0, "chat": 1.0, "stem": 1.0, "code": 1.0}
-DSV4_CONTROL_MARKERS = (
-    "<\uff5cbegin\u2581of\u2581sentence\uff5c>",
-    "<\uff5cend\u2581of\u2581sentence\uff5c>",
-    "<\uff5cUser\uff5c>",
-    "<\uff5cAssistant\uff5c>",
-    "<think>",
-    "</think>",
-)
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_UNSAFE_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 @dataclass(frozen=True)
@@ -97,14 +90,19 @@ def _parse_args() -> argparse.Namespace:
         help="Generation-log JSONL. Repeat once per source file.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-prefix",
+        default="",
+        help="Prefix for shards and the report, allowing independent workers to share a directory.",
+    )
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--chat-template", type=Path, default=default_template)
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument(
         "--token-budget",
         type=int,
-        default=1_000_000,
-        help="Maximum selected total tokens; 0 writes every eligible row.",
+        default=0,
+        help="Maximum selected total tokens; 0 (the default) writes every eligible row.",
     )
     parser.add_argument(
         "--category-weight",
@@ -115,7 +113,20 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--validation-fraction", type=float, default=0.02)
     parser.add_argument("--records-per-shard", type=int, default=10_000)
+    parser.add_argument("--progress-interval", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--deduplicate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Deduplicate conversation IDs and canonical message content (disabled by default).",
+    )
+    parser.add_argument(
+        "--validate-tokenization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Tokenize here to validate length and assistant masks; disable to defer to collection.",
+    )
     parser.add_argument(
         "--debug-max-input-rows",
         type=int,
@@ -130,22 +141,6 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _contains_control_marker(text: str) -> bool:
-    return _UNSAFE_CONTROL.search(text) is not None or any(
-        marker in text for marker in DSV4_CONTROL_MARKERS
-    )
-
-
-def _is_degenerate(text: str) -> bool:
-    """Detect only high-confidence repetition failures, without judging content quality."""
-    if re.search(r"(.)\1{255,}", text, flags=re.DOTALL):
-        return True
-    tokens = text.split()
-    if len(tokens) < 64:
-        return False
-    return Counter(tokens).most_common(1)[0][1] / len(tokens) > 0.5
-
-
 def normalize_generation_row(row: Any) -> tuple[dict[str, Any] | None, str | None]:
     """Return a canonical first-turn conversation or a stable rejection reason."""
     if not isinstance(row, Mapping):
@@ -157,19 +152,20 @@ def normalize_generation_row(row: Any) -> tuple[dict[str, Any] | None, str | Non
     category = str(row.get("category", "")).strip().lower()
     if category not in DEFAULT_CATEGORY_WEIGHTS:
         return None, "unsupported_category"
-    if row.get("finish_reason") != "stop":
-        return None, "incomplete_finish_reason"
+    finish_reason = row.get("finish_reason")
+    if finish_reason not in ("stop", "length"):
+        return None, "unsupported_finish_reason"
 
     reasoning = row.get("reasoning_content")
     content = row.get("generation")
-    if not isinstance(reasoning, str) or not reasoning.strip():
-        return None, "empty_reasoning"
-    if not isinstance(content, str) or not content.strip():
+    reasoning = "" if reasoning is None else reasoning
+    content = "" if content is None else content
+    if not isinstance(reasoning, str) or not isinstance(content, str):
+        return None, "non_string_response"
+    if not reasoning.strip() and not content.strip():
+        return None, "empty_response"
+    if finish_reason == "stop" and not content.strip():
         return None, "empty_final_answer"
-    if _contains_control_marker(reasoning) or _contains_control_marker(content):
-        return None, "embedded_control_marker"
-    if _is_degenerate(reasoning) or _is_degenerate(content):
-        return None, "degenerate_repetition"
 
     serialized_output = row.get("serialized_output")
     if (
@@ -181,7 +177,9 @@ def normalize_generation_row(row: Any) -> tuple[dict[str, Any] | None, str | Non
     assistant = serialized_output[0]
     if assistant.get("role") != "assistant":
         return None, "serialized_output_not_assistant"
-    if assistant.get("reasoning_content") != reasoning or assistant.get("content") != content:
+    if (assistant.get("reasoning_content") or "") != reasoning or (
+        assistant.get("content") or ""
+    ) != content:
         return None, "serialized_output_mismatch"
     if assistant.get("tool_calls") or assistant.get("function_call"):
         return None, "tool_or_function_call"
@@ -201,8 +199,6 @@ def normalize_generation_row(row: Any) -> tuple[dict[str, Any] | None, str | Non
             return None, "non_string_prompt_content"
         if message.get("role") == "user" and not prompt_content.strip():
             return None, "empty_user_prompt"
-        if _contains_control_marker(prompt_content):
-            return None, "embedded_control_marker"
         canonical_messages.append({"role": str(message["role"]), "content": prompt_content})
 
     canonical_messages.append(
@@ -210,11 +206,13 @@ def normalize_generation_row(row: Any) -> tuple[dict[str, Any] | None, str | Non
             "role": "assistant",
             "reasoning_content": reasoning,
             "content": content,
+            "finish_reason": finish_reason,
         }
     )
     return {
         "conversation_id": conversation_id,
         "category": category,
+        "finish_reason": finish_reason,
         "messages": canonical_messages,
     }, None
 
@@ -283,7 +281,13 @@ def _length_bucket(num_tokens: int) -> str:
         return "0513-1024"
     if num_tokens <= 1536:
         return "1025-1536"
-    return "1537-2048+"
+    if num_tokens <= 2048:
+        return "1537-2048"
+    if num_tokens <= 4096:
+        return "2049-4096"
+    if num_tokens <= 8192:
+        return "4097-8192"
+    return "8193+"
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -295,8 +299,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--validation-fraction must be in [0, 1)")
     if args.records_per_shard < 1:
         raise ValueError("--records-per-shard must be positive")
+    if args.progress_interval < 1:
+        raise ValueError("--progress-interval must be positive")
     if args.debug_max_input_rows is not None and args.debug_max_input_rows < 1:
         raise ValueError("--debug-max-input-rows must be positive")
+    if args.output_prefix and not _SAFE_ID.fullmatch(args.output_prefix):
+        raise ValueError("--output-prefix must contain only letters, digits, '.', '_', or '-'")
+    if not args.validate_tokenization and args.token_budget > 0:
+        raise ValueError("--token-budget requires --validate-tokenization")
     missing = [str(path) for path in args.input_file if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"Input JSONL files do not exist: {missing}")
@@ -304,23 +314,30 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def main(args: argparse.Namespace) -> None:
     _validate_args(args)
+    start_time = time.perf_counter()
     weights = _category_weights(args.category_weight)
     category_budgets = _budgets(args.token_budget, weights)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    occupied = list(args.output_dir.glob("*.jsonl")) + list(args.output_dir.glob("report.json"))
+    file_prefix = f"{args.output_prefix}-" if args.output_prefix else ""
+    report_path = args.output_dir / f"{file_prefix}report.json"
+    occupied = list(args.output_dir.glob(f"{file_prefix}*.jsonl"))
+    if report_path.exists():
+        occupied.append(report_path)
     if occupied:
         raise FileExistsError(
             f"Refusing to mix with existing preparation outputs in {args.output_dir}: {occupied[:3]}"
         )
 
-    from transformers import AutoTokenizer
+    tokenizer = None
+    if args.validate_tokenization:
+        from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.chat_template = load_chat_template(args.chat_template)
-    verify_generation_tags(tokenizer.chat_template)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.chat_template = load_chat_template(args.chat_template)
+        verify_generation_tags(tokenizer.chat_template)
 
     rejections: Counter[str] = Counter()
     input_by_category: Counter[str] = Counter()
@@ -333,12 +350,18 @@ def main(args: argparse.Namespace) -> None:
     heaps: dict[str, list[tuple[int, str, Candidate]]] = defaultdict(list)
     heap_tokens: Counter[str] = Counter()
     all_candidates: list[Candidate] = []
+    train_writer = ShardWriter(args.output_dir, f"{file_prefix}train", args.records_per_shard)
+    validation_writer = ShardWriter(
+        args.output_dir, f"{file_prefix}validation", args.records_per_shard
+    )
+    selected_by_category: Counter[str] = Counter()
+    selected_tokens_by_category: Counter[str] = Counter()
     input_rows = 0
     malformed_json = 0
 
     reject_file = None
     if args.write_rejects:
-        reject_file = (args.output_dir / "rejected.jsonl").open("w", encoding="utf-8")
+        reject_file = (args.output_dir / f"{file_prefix}rejected.jsonl").open("w", encoding="utf-8")
 
     def reject(reason: str, path: Path, line_number: int, conversation_id: Any = None) -> None:
         rejections[reason] += 1
@@ -356,14 +379,27 @@ def main(args: argparse.Namespace) -> None:
                 + "\n"
             )
 
+    def write_candidate(candidate: Candidate) -> None:
+        selected_by_category[candidate.category] += 1
+        selected_tokens_by_category[candidate.category] += candidate.num_tokens
+        writer = train_writer
+        if args.validation_fraction > 0:
+            split_score = _hash_int(args.seed, "split", candidate.canonical_hash) / 2**64
+            writer = validation_writer if split_score < args.validation_fraction else train_writer
+        writer.write(candidate)
+
     try:
         for path, line_number, line in _iter_rows(args.input_file):
-            if (
-                args.debug_max_input_rows is not None
-                and input_rows >= args.debug_max_input_rows
-            ):
+            if args.debug_max_input_rows is not None and input_rows >= args.debug_max_input_rows:
                 break
             input_rows += 1
+            if input_rows % args.progress_interval == 0:
+                elapsed = time.perf_counter() - start_time
+                print(
+                    f"[{args.output_prefix or 'all'}] read {input_rows} rows; "
+                    f"wrote {sum(selected_by_category.values())}; {input_rows / elapsed:.1f} rows/s",
+                    flush=True,
+                )
             try:
                 row = json.loads(line)
             except (TypeError, ValueError):
@@ -383,17 +419,37 @@ def main(args: argparse.Namespace) -> None:
                 continue
             assert record is not None
             conversation_id = record["conversation_id"]
-            if conversation_id in seen_ids:
-                reject("duplicate_conversation_id", path, line_number, conversation_id)
+            canonical_hash = ""
+            if args.deduplicate or args.token_budget > 0 or args.validation_fraction > 0:
+                canonical_hash = _canonical_hash(record)
+            if args.deduplicate:
+                if conversation_id in seen_ids:
+                    reject("duplicate_conversation_id", path, line_number, conversation_id)
+                    continue
+                seen_ids.add(conversation_id)
+                if canonical_hash in seen_conversations:
+                    reject("duplicate_conversation", path, line_number, conversation_id)
+                    continue
+                seen_conversations.add(canonical_hash)
+
+            if not args.validate_tokenization:
+                category = record["category"]
+                eligible_by_category[category] += 1
+                serialized = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                write_candidate(
+                    Candidate(
+                        conversation_id=conversation_id,
+                        category=category,
+                        num_tokens=0,
+                        score=0,
+                        serialized=serialized,
+                        canonical_hash=canonical_hash,
+                    )
+                )
                 continue
-            seen_ids.add(conversation_id)
-            canonical_hash = _canonical_hash(record)
-            if canonical_hash in seen_conversations:
-                reject("duplicate_conversation", path, line_number, conversation_id)
-                continue
-            seen_conversations.add(canonical_hash)
 
             try:
+                assert tokenizer is not None
                 input_ids, loss_mask = tokenize_with_loss_mask(
                     tokenizer, record["messages"], answer_only_loss=True
                 )
@@ -431,7 +487,7 @@ def main(args: argparse.Namespace) -> None:
             )
 
             if args.token_budget == 0:
-                all_candidates.append(candidate)
+                write_candidate(candidate)
                 continue
             category_budget = category_budgets[category]
             if category_budget == 0 or num_tokens > category_budget:
@@ -444,29 +500,25 @@ def main(args: argparse.Namespace) -> None:
     finally:
         if reject_file is not None:
             reject_file.close()
+        if args.token_budget == 0:
+            train_writer.close()
+            validation_writer.close()
 
     if args.token_budget > 0:
         all_candidates = [entry[2] for heap in heaps.values() for entry in heap]
-    all_candidates.sort(key=lambda candidate: (candidate.score, candidate.conversation_id))
+        all_candidates.sort(key=lambda candidate: (candidate.score, candidate.conversation_id))
+        try:
+            for candidate in all_candidates:
+                write_candidate(candidate)
+        finally:
+            train_writer.close()
+            validation_writer.close()
 
-    train_writer = ShardWriter(args.output_dir, "train", args.records_per_shard)
-    validation_writer = ShardWriter(args.output_dir, "validation", args.records_per_shard)
-    selected_by_category: Counter[str] = Counter()
-    selected_tokens_by_category: Counter[str] = Counter()
-    try:
-        for candidate in all_candidates:
-            selected_by_category[candidate.category] += 1
-            selected_tokens_by_category[candidate.category] += candidate.num_tokens
-            split_score = _hash_int(args.seed, "split", candidate.canonical_hash) / 2**64
-            writer = validation_writer if split_score < args.validation_fraction else train_writer
-            writer.write(candidate)
-    finally:
-        train_writer.close()
-        validation_writer.close()
-
+    elapsed_seconds = time.perf_counter() - start_time
     report = {
         "configuration": {
             "input_files": [str(path) for path in args.input_file],
+            "output_prefix": args.output_prefix,
             "model_dir": str(args.model_dir),
             "chat_template": str(args.chat_template),
             "max_seq_len": args.max_seq_len,
@@ -474,32 +526,39 @@ def main(args: argparse.Namespace) -> None:
             "category_weights": weights,
             "category_budgets": category_budgets,
             "validation_fraction": args.validation_fraction,
+            "deduplicate": args.deduplicate,
+            "validate_tokenization": args.validate_tokenization,
             "seed": args.seed,
             "debug_max_input_rows": args.debug_max_input_rows,
         },
         "input_rows": input_rows,
+        "elapsed_seconds": elapsed_seconds,
+        "input_rows_per_second": input_rows / elapsed_seconds,
         "malformed_json": malformed_json,
         "input_by_category": dict(sorted(input_by_category.items())),
         "rejections": dict(sorted(rejections.items())),
         "eligible_rows": sum(eligible_by_category.values()),
-        "eligible_tokens": sum(eligible_tokens_by_category.values()),
+        "eligible_tokens": (
+            sum(eligible_tokens_by_category.values()) if args.validate_tokenization else None
+        ),
         "eligible_by_category": dict(sorted(eligible_by_category.items())),
         "eligible_tokens_by_category": dict(sorted(eligible_tokens_by_category.items())),
         "length_buckets_by_category": {
             category: dict(sorted(buckets.items()))
             for category, buckets in sorted(length_buckets.items())
         },
-        "selected_rows": len(all_candidates),
-        "selected_tokens": sum(selected_tokens_by_category.values()),
+        "selected_rows": sum(selected_by_category.values()),
+        "selected_tokens": (
+            sum(selected_tokens_by_category.values()) if args.validate_tokenization else None
+        ),
         "selected_by_category": dict(sorted(selected_by_category.items())),
         "selected_tokens_by_category": dict(sorted(selected_tokens_by_category.items())),
         "train_rows": train_writer.num_records,
-        "train_tokens": train_writer.num_tokens,
+        "train_tokens": train_writer.num_tokens if args.validate_tokenization else None,
         "validation_rows": validation_writer.num_records,
-        "validation_tokens": validation_writer.num_tokens,
+        "validation_tokens": (validation_writer.num_tokens if args.validate_tokenization else None),
         "tokenization_error_samples": tokenization_errors,
     }
-    report_path = args.output_dir / "report.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2, sort_keys=True))
 
