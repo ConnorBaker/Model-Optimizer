@@ -182,14 +182,14 @@ def test_native_mtp_ttt_uses_normal_causal_hsm_without_a_kv_cache():
     assert model.mtp.e_proj.weight.grad is not None
 
 
-def test_native_mtp_round_recomputation_preserves_hsm_loss_and_gradients():
+def test_native_mtp_round_recomputation_preserves_hsm_loss_and_gradients(monkeypatch):
     """Long-sequence recomputation preserves the graph through all five HSM rounds."""
     model = _toy_mtp_model()
     model.ttt_steps = 5
     model.hsm_mode = "uniform_layer_sample"
     with torch.no_grad():
         model.mtp.h_proj.weight.copy_(torch.eye(4) * 0.2)
-    reference = copy.deepcopy(model).eval()
+    reference = copy.deepcopy(model)
     input_ids = torch.arange(257).remainder(4).unsqueeze(0)
     inputs = {
         "input_ids": input_ids,
@@ -198,7 +198,13 @@ def test_native_mtp_round_recomputation_preserves_hsm_loss_and_gradients():
         "target_lm_head_hidden_states": torch.randn(1, 257, 4),
     }
     torch.manual_seed(42)
-    expected = reference(**inputs)
+    # Keep training-only HSM active in both models; bypass only reference recomputation.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "modelopt.torch.speculative.mtp.deepseek_v4.checkpoint",
+            lambda function, *args, use_reentrant, **kwargs: function(*args, **kwargs),
+        )
+        expected = reference(**inputs)
     torch.manual_seed(42)
     actual = model(**inputs)
     torch.testing.assert_close(actual.loss, expected.loss)

@@ -861,6 +861,7 @@ _MINIMAL_BODIES: dict[RecipeType, dict] = {
     RecipeType.SPECULATIVE_EAGLE: {},  # body sections have field defaults
     RecipeType.SPECULATIVE_DFLASH: {},
     RecipeType.SPECULATIVE_MEDUSA: {},
+    RecipeType.SPECULATIVE_MTP_BOOST: {"data": {"offline_data_path": "dumps"}},
 }
 
 
@@ -1095,7 +1096,7 @@ def test_load_recipe_mtp_boost_requires_section_and_online_target(tmp_path):
         "data:\n  data_path: train.jsonl\n"
         "mtp_boost:\n  ttt_steps: 1\n"
     )
-    with pytest.raises(ValueError, match="requires mtp_boost.target_checkpoint"):
+    with pytest.raises(ValueError, match=r"requires mtp_boost\.target_checkpoint"):
         load_recipe(online)
 
 
@@ -1124,7 +1125,7 @@ def test_load_recipe_mtp_boost_rejects_streaming(tmp_path):
         "mtp_boost:\n  ttt_steps: 1\n"
     )
 
-    with pytest.raises(Exception, match="does not support data.mode"):  # pydantic.ValidationError
+    with pytest.raises(Exception, match=r"does not support data\.mode"):  # pydantic.ValidationError
         load_recipe(streaming)
 
 

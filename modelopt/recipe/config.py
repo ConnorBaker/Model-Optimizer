@@ -514,7 +514,9 @@ class ModelOptMedusaRecipe(ModelOptSpeculativeRecipeBase):
 class ModelOptMTPBoostRecipe(ModelOptSpeculativeRecipeBase):
     """Recipe for boosting a checkpoint-native MTP module."""
 
-    metadata: RecipeMetadataConfig = _metadata_field(RecipeType.SPECULATIVE_MTP_BOOST)
+    RECIPE_TYPE: ClassVar[RecipeType] = RecipeType.SPECULATIVE_MTP_BOOST
+
+    metadata: RecipeMetadataConfig = _metadata_field()
 
     mtp_boost: MTPBoostConfig = ModeloptField(
         default=MTPBoostConfig(),
