@@ -26,6 +26,7 @@ import os
 # ---------------------------------------------------------------------------
 import sys
 import types
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -57,6 +58,46 @@ assert _spec is not None and _spec.loader is not None
 _eagle_utils = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_eagle_utils)
 make_speculative_data_module = _eagle_utils.make_speculative_data_module
+
+
+def test_native_wandb_receives_enriched_training_metrics(tmp_path, monkeypatch):
+    """The native reporting callback receives all metrics in one log event."""
+    wandb = pytest.importorskip("wandb")
+    from transformers import TrainingArguments
+
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+    monkeypatch.setenv("WANDB_DISABLE_CODE", "true")
+    monkeypatch.setenv("WANDB_DISABLE_GIT", "true")
+    monkeypatch.setenv("WANDB_CONSOLE", "off")
+    monkeypatch.setenv("WANDB_PROJECT", "modelopt-unit-test")
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.delenv("WANDB_RUN_ID", raising=False)
+    monkeypatch.delenv("WANDB_RESUME", raising=False)
+    assert wandb.run is None
+    callback = _eagle_utils.EagleTrainingPlot(ar_validate_steps=-1)
+    assert wandb.run is None
+    trainer = _eagle_utils.EagleTrainerWithAccLog(
+        model=get_tiny_llama(),
+        args=TrainingArguments(output_dir=str(tmp_path), use_cpu=True, report_to=["wandb"]),
+        callbacks=[callback],
+    )
+    assert trainer.callback_handler.callbacks[0] is callback
+    trainer.state.global_step = 7
+    trainer.state.training_accs = [[[0.9, 0.8, 0.7, 0.6, 0.5]]]
+    trainer.state.component_losses = {"eagle": [2.0, 4.0]}
+    try:
+        trainer.log({"loss": 3.0})
+        assert wandb.run is not None
+        summary = dict(wandb.run.summary)
+        assert summary["train/global_step"] == 7
+        assert summary["train/loss"] == 3.0
+        assert summary["train/eagle_loss"] == 3.0
+        for step, accuracy in enumerate([0.9, 0.8, 0.7, 0.6, 0.5]):
+            assert summary[f"train/train_acc/parallel_0_step_{step}"] == pytest.approx(accuracy)
+        assert trainer.state.training_accs == []
+    finally:
+        wandb.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +586,49 @@ def _make_data_args(sample_size, tmp_path, n_files=5):
     )
 
 
+@pytest.mark.parametrize("sample_size", [-1, 2])
+def test_mtp_offline_file_order_is_stable(tmp_path, monkeypatch, sample_size):
+    """Directory enumeration order must not change offline dataset indices."""
+    payloads = {}
+    for value, relative_path in enumerate(("z.pt", "restored-s3/a.pt", "b.pt")):
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "input_ids": torch.full((8,), value, dtype=torch.int64),
+            "target_mtp_hidden_states": torch.full((8, 4, 4), value, dtype=torch.bfloat16),
+            "target_lm_head_hidden_states": torch.full((8, 4), value, dtype=torch.bfloat16),
+            "loss_mask": torch.ones(8, dtype=torch.int64),
+        }
+        torch.save(payload, path)
+        payloads[str(path)] = payload
+
+    expected_files = [str(tmp_path / name) for name in ("b.pt", "restored-s3/a.pt", "z.pt")]
+    if sample_size > 0:
+        expected_files = expected_files[:sample_size]
+    data_args = argparse.Namespace(
+        mode="offline",
+        vlm_processor=None,
+        offline_data_path=str(tmp_path),
+        sample_size=sample_size,
+    )
+    real_rglob = Path.rglob
+    for reverse in (False, True):
+        # Vary filesystem ordering, but still enumerate and load actual feature files.
+        def reordered_rglob(path, pattern, reverse=reverse):
+            return iter(sorted(real_rglob(path, pattern), reverse=reverse))
+
+        monkeypatch.setattr(Path, "rglob", reordered_rglob)
+        module = _eagle_utils.make_mtp_boost_data_module(
+            None, data_args, train_len=8, answer_only_loss=True
+        )
+        dataset = module["train_dataset"]
+        assert dataset.dumped_files == expected_files
+        for index, path in enumerate(expected_files):
+            item = dataset[index]
+            for key, expected in payloads[path].items():
+                assert torch.equal(item[key], expected)
+
+
 def test_sample_size_positive_truncates(tmp_path):
     """sample_size > 0 should truncate the dataset to that many samples."""
     data_args = _make_data_args(sample_size=3, tmp_path=tmp_path, n_files=5)
@@ -785,6 +869,19 @@ def test_collator_truncates(tmp_path):
     batch = collator([ds[0]])
     assert batch["input_ids"].shape == (1, train_len)
     assert batch["base_model_outputs"]["base_model_hidden_states"].shape[1] == train_len
+    assert batch["base_model_outputs"]["base_hidden_prenorm"] is False
+
+
+def test_collator_propagates_base_hidden_prenorm(tmp_path):
+    """Collator should keep the dump's pre-norm declaration with base-model outputs."""
+    p = tmp_path / "sample.pt"
+    data = _make_offline_pt(p)
+    data["hidden_states_prenorm"] = True
+    torch.save(data, p)
+
+    batch = EagleOfflineDataCollator(train_len=SEQ_LEN)([OfflineSupervisedDataset([str(p)])[0]])
+
+    assert batch["base_model_outputs"]["base_hidden_prenorm"] is True
 
 
 def test_collator_pads(tmp_path):

@@ -217,10 +217,11 @@ class OfflineSupervisedDataset(Dataset):
             "attention_mask": torch.ones_like(offline_data["input_ids"]),
             "loss_mask": loss_mask,
             "labels": labels,
-            # Whether the dumped hidden is pre-(final-)norm (the consumer re-applies the base
-            # norm if so). Read from the dump; default False = post-norm, the prior behavior.
-            "base_hidden_prenorm": bool(offline_data.get("hidden_states_prenorm", False)),
         }
+        # Whether the dumped base hidden is pre-(final-)norm. This metadata belongs to the
+        # EAGLE/DFlash base-model output contract, not custom feature schemas such as native MTP.
+        if "base_model_hidden_states" in self.feature_key_mapping.values():
+            ret["base_hidden_prenorm"] = bool(offline_data.get("hidden_states_prenorm", False))
         ret.update(
             {
                 output_key: offline_data[input_key]
@@ -292,6 +293,6 @@ class EagleOfflineDataCollator:
                     "base_hidden_prenorm is not constant across the batch "
                     f"(got {prenorm_flags}); do not mix pre-norm and post-norm dumps."
                 )
-            base_model_outputs["base_hidden_prenorm"] = prenorm_flags.pop()
+            model_features["base_hidden_prenorm"] = prenorm_flags.pop()
 
         return {**base_batch, self.feature_output_key: model_features}

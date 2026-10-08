@@ -60,7 +60,8 @@ __all__ = [
 def _get_offline_dumped_files(data_args) -> list[str]:
     """Discover and optionally limit offline feature dumps."""
     offline_data_path = Path(data_args.offline_data_path)
-    dumped_files = [str(path) for path in offline_data_path.rglob("*.pt")]
+    # Dataset indices must agree across distributed ranks and checkpoint resumes.
+    dumped_files = sorted(str(path) for path in offline_data_path.rglob("*.pt"))
     if not dumped_files:
         raise ValueError(f"No .pt files found in {data_args.offline_data_path}")
 
@@ -234,6 +235,21 @@ def make_speculative_data_module(
     }
 
 
+class _NativeMTPOptimizerBindingsCallback(TrainerCallback):
+    """Check optimizer references after distributed wrapping, before any updates."""
+
+    def on_train_begin(self, args, state, control, model=None, optimizer=None, **kwargs):
+        expected = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+        actual = [
+            id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+        ]
+        if len(actual) != len(set(actual)) or set(actual) != expected:
+            raise RuntimeError(
+                "Native MTP optimizer bindings are duplicated or incomplete after wrapping. "
+                "CPU-efficient FSDP2 needs distinct CPU parameter storage before preparation."
+            )
+
+
 class EagleTrainerWithAccLog(Trainer):
     """Wrapper around Trainer that logs training accuracy."""
 
@@ -244,7 +260,13 @@ class EagleTrainerWithAccLog(Trainer):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        # Enrich metrics before reporting integrations consume the log event.
+        self.callback_handler.callbacks.sort(
+            key=lambda callback: not isinstance(callback, EagleTrainingPlot)
+        )
         self.lora_lr_multiplier = lora_lr_multiplier
+        if getattr(self.model, "is_native_mtp_boost", False):
+            self.add_callback(_NativeMTPOptimizerBindingsCallback())
 
     def create_optimizer(self):
         """Override to give LoRA parameters a higher learning rate."""
@@ -286,19 +308,11 @@ class EagleTrainerWithAccLog(Trainer):
         # ``get_state_dict`` is collective under FSDP, therefore every rank
         # participates even though only the main process writes the checkpoint.
         # This is the portable BF16 MTP snapshot used for restore and export.
-        # Native-MTP checkpoints intentionally omit the much larger FSDP
-        # optimizer state; see ``_save_optimizer_and_scheduler`` below.
+        # Trainer separately saves FSDP model/optimizer state for exact resume.
         state_dict = self.accelerator.get_state_dict(self.model)
         if self.args.should_save:
             model.save_pretrained(output_dir, state_dict=state_dict)
         self.accelerator.wait_for_everyone()
-
-    def _save_optimizer_and_scheduler(self, output_dir: str) -> None:
-        """Skip non-portable optimizer state for native-MTP checkpoints."""
-        model = self.accelerator.unwrap_model(self.model)
-        if getattr(model, "is_native_mtp_boost", False):
-            return
-        super()._save_optimizer_and_scheduler(output_dir)
 
     def _load_from_checkpoint(
         self,
@@ -477,8 +491,6 @@ class EagleTrainingPlot(TrainerCallback):
 
     def __init__(self, ar_validate_steps: int = 1000, estimate_ar: bool = False):
         self.ar_validate_steps = ar_validate_steps
-        if wandb is not None and is_master():
-            wandb.init()
         self.estimate_ar = estimate_ar
 
     def on_log(self, args, state, control, **kwargs):
@@ -492,8 +504,10 @@ class EagleTrainingPlot(TrainerCallback):
             print_rank_0(f"Step {state.global_step} Training Acc: [{acc_str}]")
         except Exception:
             print_rank_0(f"Step {state.global_step} Training Acc: {average_acc}")
-        # Log accuracy to HF Trainer's logs dict (picked up by TensorBoard)
-        logs = kwargs.get("logs") or {}
+        # Reporting integrations share this dictionary with the metric callback.
+        logs = kwargs.get("logs")
+        if logs is None:
+            logs = {}
         for i, draft_acc in enumerate(average_acc):
             for j, step_acc in enumerate(draft_acc):
                 logs[f"train_acc/parallel_{i}_step_{j}"] = float(step_acc)
@@ -512,16 +526,10 @@ class EagleTrainingPlot(TrainerCallback):
             print_rank_0(f"Step {state.global_step} Estimated Training AR: {est_ar:.4f}")
             logs["estimated_training_ar"] = est_ar
 
-        # log to wandb
-        if wandb is not None and wandb.run is not None and is_master():
-            if logs:
-                wandb.log({k: v for k, v in logs.items() if v is not None}, step=state.global_step)
-
-            # Log per-component losses
-            if hasattr(state, "component_losses"):
-                for key, vals in state.component_losses.items():
-                    if vals:
-                        wandb.log({f"{key}_loss": np.mean(vals)}, step=state.global_step)
+        if hasattr(state, "component_losses"):
+            for key, vals in state.component_losses.items():
+                if vals:
+                    logs[f"{key}_loss"] = float(np.mean(vals))
 
         # reset training_accs and component_losses
         state.training_accs = []
