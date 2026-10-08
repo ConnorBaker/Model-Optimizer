@@ -39,7 +39,7 @@ training:
 mtp_boost:
   adapter: auto
   hsm_mode: "off"
-  rollout_steps: 1
+  ttt_steps: 1
   # Required online: vendor-converted file (single GPU) or model{rank}-mp{world}.safetensors dir.
   target_checkpoint:
   # Optional native DSV4 export destination. Omit to keep only resumable training checkpoints.

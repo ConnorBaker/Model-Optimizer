@@ -454,7 +454,7 @@ def test_load_recipe_mtp_boost_builtin():
     assert recipe.recipe_type == RecipeType.SPECULATIVE_MTP_BOOST
     assert isinstance(recipe, ModelOptMTPBoostRecipe)
     assert recipe.data.mode == "offline"
-    assert recipe.mtp_boost.rollout_steps == 1
+    assert recipe.mtp_boost.ttt_steps == 1
     assert recipe.mtp_boost.hsm_mode == "off"
 
 
@@ -469,7 +469,7 @@ def test_load_recipe_mtp_boost_requires_section_and_online_target(tmp_path):
     online.write_text(
         "metadata:\n  recipe_type: speculative_mtp_boost\n"
         "data:\n  data_path: train.jsonl\n"
-        "mtp_boost:\n  rollout_steps: 1\n"
+        "mtp_boost:\n  ttt_steps: 1\n"
     )
     with pytest.raises(ValueError, match="requires mtp_boost.target_checkpoint"):
         load_recipe(online)
@@ -497,35 +497,35 @@ def test_load_recipe_mtp_boost_rejects_streaming(tmp_path):
         "  data_path: train.jsonl\n"
         "  streaming_server_url: http://localhost:8000\n"
         "  streaming_model_name: deepseek-v4-pro\n"
-        "mtp_boost:\n  rollout_steps: 1\n"
+        "mtp_boost:\n  ttt_steps: 1\n"
     )
 
     with pytest.raises(Exception, match="does not support data.mode"):  # pydantic.ValidationError
         load_recipe(streaming)
 
 
-def test_load_recipe_mtp_boost_accepts_cache_free_rollout_and_hsm(tmp_path):
-    """Multiple normal-causal MTP rounds can use uniform hidden-state mixing."""
+def test_load_recipe_mtp_boost_accepts_cache_free_ttt_and_hsm(tmp_path):
+    """Multiple normal-causal TTT rounds can use uniform hidden-state mixing."""
     recipe_path = tmp_path / "mtp.yml"
     recipe_path.write_text(
         "metadata:\n  recipe_type: speculative_mtp_boost\n"
         "data:\n  offline_data_path: dumps\n"
-        "mtp_boost:\n  rollout_steps: 2\n  hsm_mode: uniform_layer_sample\n"
+        "mtp_boost:\n  ttt_steps: 5\n  hsm_mode: uniform_layer_sample\n"
     )
     recipe = load_recipe(recipe_path)
-    assert recipe.mtp_boost.rollout_steps == 2
+    assert recipe.mtp_boost.ttt_steps == 5
     assert recipe.mtp_boost.hsm_mode == "uniform_layer_sample"
 
 
 @pytest.mark.parametrize(
     ("override", "match"),
     [
-        ("rollout_steps: 0", "at least 1"),
-        ('hsm_mode: "uniform_layer_sample"', "requires rollout_steps >= 2"),
+        ("ttt_steps: 0", "at least 1"),
+        ('hsm_mode: "uniform_layer_sample"', "requires ttt_steps >= 2"),
     ],
 )
-def test_load_recipe_mtp_boost_rejects_invalid_rollouts(tmp_path, override, match):
-    """MTP rollout validation rejects impossible schedules."""
+def test_load_recipe_mtp_boost_rejects_invalid_ttt_steps(tmp_path, override, match):
+    """MTP TTT-step validation rejects impossible schedules."""
     invalid = tmp_path / "invalid.yml"
     invalid.write_text(
         "metadata:\n  recipe_type: speculative_mtp_boost\n"

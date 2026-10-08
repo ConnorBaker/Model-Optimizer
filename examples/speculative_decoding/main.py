@@ -276,7 +276,7 @@ def train():
             model_name_or_path,
             dtype=torch.bfloat16,
             adapter=recipe.mtp_boost.adapter,
-            rollout_steps=recipe.mtp_boost.rollout_steps,
+            ttt_steps=recipe.mtp_boost.ttt_steps,
             hsm_mode=recipe.mtp_boost.hsm_mode,
         )
         tokenizer = transformers.AutoTokenizer.from_pretrained(

@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from modelopt.torch.speculative.eagle.utils import IGNORE_TOKEN_ID, masked_soft_target_cross_entropy
 
@@ -89,7 +90,7 @@ def _default_device(device: torch.device) -> Iterator[None]:
 
 
 def _is_fsdp_efficient_nonzero_rank() -> bool:
-    """Return whether this process should leave model state on ``meta`` for FSDP2."""
+    """Return whether this process should skip checkpoint reads for FSDP2."""
     efficient_loading = os.environ.get("FSDP_CPU_RAM_EFFICIENT_LOADING", "false").lower()
     if efficient_loading not in ("1", "true", "yes", "on"):
         return False
@@ -152,6 +153,45 @@ def _require_dsv4_transformers():
         DeepseekV4RotaryEmbedding,
         ModelOutput,
     )
+
+
+def _chunked_mtp_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    *,
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Bound native attention memory while preserving HF's sinks and compressed-KV mask."""
+    # Keep the optional DSV4 implementation lazy, as with the decoder primitives.
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import eager_attention_forward
+
+    if query.shape[-2] <= 256:
+        return eager_attention_forward(
+            module, query, key, value, attention_mask, scaling, dropout, **kwargs
+        )
+
+    def attend(q, k, v, mask):
+        return eager_attention_forward(module, q, k, v, mask, scaling, dropout, **kwargs)[0]
+
+    chunks = []
+    for start in range(0, query.shape[-2], 256):
+        q = query[..., start : start + 256, :]
+        mask = attention_mask
+        if mask is not None and mask.shape[-2] != 1:
+            mask = mask[..., start : start + 256, :]
+        # Without recomputation, autograd retains every chunk's quadratic scores
+        # across all TTT rounds, defeating the forward-memory bound.
+        if torch.is_grad_enabled():
+            chunk = checkpoint(attend, q, key, value, mask, use_reentrant=False)
+        else:
+            chunk = attend(q, key, value, mask)
+        chunks.append(chunk)
+    return torch.cat(chunks, dim=1), None
 
 
 def load_dsv4_target_model(
@@ -592,7 +632,7 @@ class NativeMTPBoostModel(nn.Module):
         config: Any,
         *,
         mtp_layer_index: int,
-        rollout_steps: int = 1,
+        ttt_steps: int = 1,
         hsm_mode: str = "off",
     ) -> None:
         """Construct one trainable native MTP layer and its frozen target endpoints."""
@@ -608,7 +648,7 @@ class NativeMTPBoostModel(nn.Module):
         self.config = config
         self._model_output_type = _native_mtp_output_type(model_output_cls)
         self.mtp_layer_index = mtp_layer_index
-        self.rollout_steps = rollout_steps
+        self.ttt_steps = ttt_steps
         self.hsm_mode = hsm_mode
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -622,11 +662,8 @@ class NativeMTPBoostModel(nn.Module):
         self.mtp.norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
         self.mtp.rotary_emb = rotary_embedding_cls(config)
 
-        # HF represents routing correction state as persistent buffers.  The
-        # FSDP2 CPU-efficient full-state broadcast expects every persistent
-        # state entry to have a DTensor placement, and floating MTP state must
-        # also participate in optimization. Promote such state without
-        # changing its checkpoint key; integer routing tables remain frozen.
+        # FSDP2 broadcasts persistent state through DTensor placements.
+        # Preserve buffer gradient semantics: routing corrections are fixed state.
         for module in self.mtp.modules():
             for name, buffer in list(module._buffers.items()):
                 if (
@@ -638,7 +675,7 @@ class NativeMTPBoostModel(nn.Module):
                 delattr(module, name)
                 module.register_parameter(
                     name,
-                    nn.Parameter(buffer, requires_grad=buffer.is_floating_point()),
+                    nn.Parameter(buffer, requires_grad=buffer.requires_grad),
                 )
 
     @property
@@ -725,7 +762,7 @@ class NativeMTPBoostModel(nn.Module):
 
     @staticmethod
     def _sample_uniform_hsm(hidden_state_history: list[torch.Tensor]) -> torch.Tensor:
-        """Sample one prior raw MTP state per token, matching EAGLE uniform HSM."""
+        """Sample aligned HC states, falling back to the newest at zeroed roll boundaries."""
         stacked = torch.stack(hidden_state_history, dim=0)
         num_candidates, batch_size, sequence_length, hc_mult, hidden_size = stacked.shape
         candidate_indices = torch.randint(
@@ -733,10 +770,13 @@ class NativeMTPBoostModel(nn.Module):
             (1, batch_size, sequence_length, 1, 1),
             device=stacked.device,
         )
-        return stacked.gather(
+        selected = stacked.gather(
             0,
             candidate_indices.expand(-1, -1, -1, hc_mult, hidden_size),
         ).squeeze(0)
+        return torch.where(
+            selected.eq(0).all(dim=(-2, -1), keepdim=True), hidden_state_history[-1], selected
+        )
 
     def _run_mtp_round(
         self,
@@ -792,7 +832,7 @@ class NativeMTPBoostModel(nn.Module):
         target_lm_head_hidden_states: torch.Tensor | None = None,
         **_: Any,
     ) -> Any:
-        """Run cache-free MTP rollouts and optionally compute EAGLE's logit loss.
+        """Run cache-free MTP TTT rounds and optionally compute EAGLE's logit loss.
 
         ``mtp_boost_inputs`` is the offline dataset contract.  Direct target
         tensor kwargs are retained for small standalone callers.
@@ -834,17 +874,17 @@ class NativeMTPBoostModel(nn.Module):
             )
 
         _, sequence_length = input_ids.shape
-        rollout_steps = getattr(self, "rollout_steps", 1)
+        ttt_steps = self.ttt_steps
         hsm_mode = getattr(self, "hsm_mode", "off")
-        if rollout_steps < 1:
-            raise ValueError("rollout_steps must be at least 1")
+        if ttt_steps < 1:
+            raise ValueError("ttt_steps must be at least 1")
         if hsm_mode not in {"off", "uniform_layer_sample"}:
             raise ValueError(f"Unsupported native MTP HSM mode {hsm_mode!r}")
-        if hsm_mode == "uniform_layer_sample" and rollout_steps < 2:
-            raise ValueError("uniform_layer_sample HSM requires at least two MTP rollouts")
-        if target_lm_head_hidden_states is not None and rollout_steps >= sequence_length:
+        if hsm_mode == "uniform_layer_sample" and ttt_steps < 2:
+            raise ValueError("uniform_layer_sample HSM requires at least two TTT steps")
+        if target_lm_head_hidden_states is not None and ttt_steps >= sequence_length:
             raise ValueError(
-                "rollout_steps must be smaller than the sequence length when computing MTP loss"
+                "ttt_steps must be smaller than the sequence length when computing MTP loss"
             )
 
         teacher_probabilities = None
@@ -882,16 +922,28 @@ class NativeMTPBoostModel(nn.Module):
         accuracies = []
         hidden = None
         logits = None
-        for rollout_index in range(rollout_steps):
-            raw_hidden_states, hidden, logits = self._run_mtp_round(
-                input_ids,
-                raw_hidden_states,
-                attention_mask,
-                token_shift=rollout_index + 1,
-            )
+        for ttt_step in range(ttt_steps):
+            if self.training and torch.is_grad_enabled() and sequence_length > 256:
+                # Reusing the MTP across TTT rounds otherwise retains all rounds'
+                # MoE activations and gathered weights until the single backward.
+                raw_hidden_states, hidden, logits = checkpoint(
+                    self._run_mtp_round,
+                    input_ids,
+                    raw_hidden_states,
+                    attention_mask,
+                    token_shift=ttt_step + 1,
+                    use_reentrant=False,
+                )
+            else:
+                raw_hidden_states, hidden, logits = self._run_mtp_round(
+                    input_ids,
+                    raw_hidden_states,
+                    attention_mask,
+                    token_shift=ttt_step + 1,
+                )
             if teacher_probabilities is not None and teacher_logits is not None:
                 # At round n, MTP token t predicts target token t + n + 1.
-                target_start = rollout_index + 1
+                target_start = ttt_step + 1
                 student_logits = logits[:, :-target_start]
                 aligned_mask = loss_mask[:, target_start:].to(student_logits.dtype)
                 losses.append(
@@ -905,13 +957,14 @@ class NativeMTPBoostModel(nn.Module):
                         teacher_logits[:, target_start:].argmax(-1) == student_logits.argmax(-1)
                     ) & valid
                     accuracies.append((correct.sum().float() / valid.sum().clamp_min(1)).item())
-            if rollout_index + 1 < rollout_steps:
+            if self.training and hsm_mode == "uniform_layer_sample" and ttt_step + 1 < ttt_steps:
+                # Older entries must advance to the newest output's target position.
+                raw_hidden_state_history = [
+                    torch.cat((state[:, 1:], torch.zeros_like(state[:, :1])), dim=1)
+                    for state in raw_hidden_state_history
+                ]
                 raw_hidden_state_history.append(raw_hidden_states)
-                raw_hidden_states = (
-                    self._sample_uniform_hsm(raw_hidden_state_history)
-                    if hsm_mode == "uniform_layer_sample"
-                    else raw_hidden_states
-                )
+                raw_hidden_states = self._sample_uniform_hsm(raw_hidden_state_history)
 
         loss = sum(losses) if losses else None
 
@@ -951,7 +1004,10 @@ class NativeMTPBoostModel(nn.Module):
         # hard link avoids duplicating the large BF16 MTP master checkpoint.
         resume_checkpoint = output / "pytorch_model.bin"
         try:
-            os.link(checkpoint, resume_checkpoint)
+            if not resume_checkpoint.exists() or not os.path.samefile(
+                checkpoint, resume_checkpoint
+            ):
+                os.link(checkpoint, resume_checkpoint)
         except OSError:
             shutil.copy2(checkpoint, resume_checkpoint)
         with (output / "mtp_boost_config.json").open("w") as handle:
@@ -959,7 +1015,7 @@ class NativeMTPBoostModel(nn.Module):
                 {
                     "adapter": "deepseek_v4",
                     "mtp_layer_index": self.mtp_layer_index,
-                    "rollout_steps": self.rollout_steps,
+                    "ttt_steps": self.ttt_steps,
                     "hsm_mode": self.hsm_mode,
                 },
                 handle,
@@ -1030,6 +1086,9 @@ class DeepSeekV4MTPAdapter(NativeMTPAdapter):
 
     @classmethod
     def _transformers_config(cls, layout: _CheckpointLayout) -> tuple[Any, int]:
+        # This adapter is instantiated only after the optional HF backend is available.
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
         config_cls, *_ = _require_dsv4_transformers()
         base_layers = int(layout.config["num_hidden_layers"])
         config_data = dict(layout.config)
@@ -1038,7 +1097,12 @@ class DeepSeekV4MTPAdapter(NativeMTPAdapter):
         # checkpoint schedule entry while instantiating the single MTP layer.
         config_data["num_hidden_layers"] = base_layers + 1
         config = config_cls(**config_data)
-        config._attn_implementation = "eager"
+        ALL_ATTENTION_FUNCTIONS.register(
+            "modelopt_dsv4_mtp_chunked_eager", _chunked_mtp_attention_forward
+        )
+        config._attn_implementation = "modelopt_dsv4_mtp_chunked_eager"
+        # Grouped GEMMs avoid materializing full expert gradients for every slice.
+        config._experts_implementation = "grouped_mm"
         return config, base_layers
 
     @classmethod
@@ -1049,7 +1113,7 @@ class DeepSeekV4MTPAdapter(NativeMTPAdapter):
         *,
         dtype: torch.dtype,
         device: torch.device | str | None,
-        rollout_steps: int,
+        ttt_steps: int,
         hsm_mode: str,
     ) -> NativeMTPBoostModel:
         if dtype is not torch.bfloat16:
@@ -1061,7 +1125,7 @@ class DeepSeekV4MTPAdapter(NativeMTPAdapter):
             model = NativeMTPBoostModel(
                 config,
                 mtp_layer_index=mtp_layer_index,
-                rollout_steps=rollout_steps,
+                ttt_steps=ttt_steps,
                 hsm_mode=hsm_mode,
             )
         model.to_empty(device=target_device)
@@ -1192,22 +1256,24 @@ class DeepSeekV4MTPAdapter(NativeMTPAdapter):
         *,
         dtype: torch.dtype,
         device: torch.device | str | None,
-        rollout_steps: int,
+        ttt_steps: int,
         hsm_mode: str,
     ) -> NativeMTPBoostModel:
-        """Load the checkpoint's native MTP, using meta state on nonzero FSDP2 ranks."""
+        """Load native MTP weights only on rank zero under CPU-efficient FSDP2."""
         layout = _checkpoint_layout(model_path, strict=True)
         config, mtp_layer_index = cls._transformers_config(layout)
-        leave_on_meta = _is_fsdp_efficient_nonzero_rank()
+        skip_checkpoint_load = _is_fsdp_efficient_nonzero_rank()
+        # Accelerate rebinds optimizer parameters by storage address before sharding.
+        # Empty CPU storage is distinct; meta tensors all have address zero.
         model = cls._build_empty_model(
             config,
             mtp_layer_index,
             dtype=dtype,
-            device="meta" if leave_on_meta else device,
-            rollout_steps=rollout_steps,
+            device="cpu" if skip_checkpoint_load else device,
+            ttt_steps=ttt_steps,
             hsm_mode=hsm_mode,
         )
-        if leave_on_meta:
+        if skip_checkpoint_load:
             model.freeze_target_endpoints()
         else:
             cls._load_model(model, layout)

@@ -57,7 +57,7 @@ class NativeMTPAdapter(ABC):
         *,
         dtype: torch.dtype,
         device: torch.device | str | None,
-        rollout_steps: int,
+        ttt_steps: int,
         hsm_mode: str,
     ) -> nn.Module:
         """Construct a trainable native-MTP model from ``model_path``."""
@@ -153,7 +153,7 @@ def create_native_mtp_boost_model(
     dtype: torch.dtype = torch.bfloat16,
     device: torch.device | str | None = None,
     adapter: str = "auto",
-    rollout_steps: int = 1,
+    ttt_steps: int = 1,
     hsm_mode: str = "off",
 ) -> nn.Module:
     """Load a checkpoint-native MTP as a standalone trainable draft model.
@@ -167,7 +167,7 @@ def create_native_mtp_boost_model(
         model_path,
         dtype=dtype,
         device=device,
-        rollout_steps=rollout_steps,
+        ttt_steps=ttt_steps,
         hsm_mode=hsm_mode,
     )
 

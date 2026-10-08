@@ -52,8 +52,8 @@ def test_dsv4_hadamard_fallback_matches_normalized_sylvester_transform():
     )
 
 
-def test_dsv4_adapter_leaves_nonzero_fsdp_ranks_on_meta(monkeypatch):
-    """CPU-efficient FSDP2 loads checkpoint tensors only on rank zero."""
+def test_dsv4_adapter_uses_empty_cpu_storage_on_nonzero_fsdp_ranks(monkeypatch):
+    """Skip nonzero-rank checkpoint reads without aliasing meta storage addresses."""
 
     class FakeModel:
         endpoints_frozen = False
@@ -87,12 +87,12 @@ def test_dsv4_adapter_leaves_nonzero_fsdp_ranks_on_meta(monkeypatch):
         "unused",
         dtype=torch.bfloat16,
         device=None,
-        rollout_steps=2,
+        ttt_steps=2,
         hsm_mode="uniform_layer_sample",
     )
 
     assert result is model
-    assert captured["device"] == "meta"
+    assert captured["device"] == "cpu"
     assert model.endpoints_frozen
 
 

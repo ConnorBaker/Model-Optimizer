@@ -15,6 +15,7 @@
 
 """Small forward coverage for the checkpoint-native MTP loss contract."""
 
+import copy
 from types import SimpleNamespace
 
 import torch
@@ -61,7 +62,7 @@ def _toy_mtp_model() -> NativeMTPBoostModel:
     nn.Module.__init__(model)
     model.config = SimpleNamespace(hc_mult=2, hidden_size=4, sliding_window=128)
     model.mtp_layer_index = 0
-    model.rollout_steps = 1
+    model.ttt_steps = 1
     model.hsm_mode = "off"
     model._model_output_type = _Output
     model.embedding = nn.Embedding(4, 4)
@@ -154,14 +155,16 @@ def test_native_mtp_online_features_match_offline_forward():
     assert torch.equal(online.loss, offline.loss)
 
 
-def test_native_mtp_rollout_uses_normal_causal_hsm_without_a_kv_cache():
+def test_native_mtp_ttt_uses_normal_causal_hsm_without_a_kv_cache():
     """Multiple MTP rounds reuse raw states and retain gradients only on the MTP."""
     model = _toy_mtp_model()
-    model.rollout_steps = 2
+    model.ttt_steps = 5
     model.hsm_mode = "uniform_layer_sample"
-    input_ids = torch.tensor([[0, 1, 2, 3]])
-    target_mtp_hidden_states = torch.zeros(1, 4, 2, 4)
-    target_lm_head_hidden_states = torch.flip(torch.eye(4), dims=[0]).unsqueeze(0)
+    input_ids = torch.tensor([[0, 1, 2, 3, 0, 1]])
+    target_mtp_hidden_states = torch.zeros(1, 6, 2, 4)
+    target_lm_head_hidden_states = torch.cat(
+        [torch.flip(torch.eye(4), dims=[0]), torch.eye(4)[:2]]
+    ).unsqueeze(0)
 
     output = model(
         input_ids=input_ids,
@@ -173,10 +176,40 @@ def test_native_mtp_rollout_uses_normal_causal_hsm_without_a_kv_cache():
     )
 
     assert torch.isfinite(output.loss)
-    assert len(output.train_acc[0]) == 2
-    assert model.mtp.decoder.past_key_values == [None, None]
+    assert len(output.train_acc[0]) == 5
+    assert model.mtp.decoder.past_key_values == [None] * 5
     output.loss.backward()
     assert model.mtp.e_proj.weight.grad is not None
+
+
+def test_native_mtp_round_recomputation_preserves_hsm_loss_and_gradients():
+    """Long-sequence recomputation preserves the graph through all five HSM rounds."""
+    model = _toy_mtp_model()
+    model.ttt_steps = 5
+    model.hsm_mode = "uniform_layer_sample"
+    with torch.no_grad():
+        model.mtp.h_proj.weight.copy_(torch.eye(4) * 0.2)
+    reference = copy.deepcopy(model).eval()
+    input_ids = torch.arange(257).remainder(4).unsqueeze(0)
+    inputs = {
+        "input_ids": input_ids,
+        "loss_mask": torch.ones_like(input_ids),
+        "target_mtp_hidden_states": torch.randn(1, 257, 2, 4),
+        "target_lm_head_hidden_states": torch.randn(1, 257, 4),
+    }
+    torch.manual_seed(42)
+    expected = reference(**inputs)
+    torch.manual_seed(42)
+    actual = model(**inputs)
+    torch.testing.assert_close(actual.loss, expected.loss)
+    torch.testing.assert_close(actual.logits, expected.logits)
+    expected.loss.backward()
+    actual.loss.backward()
+    for (_, parameter), (_, expected_parameter) in zip(
+        model.named_parameters(), reference.named_parameters()
+    ):
+        if parameter.requires_grad:
+            torch.testing.assert_close(parameter.grad, expected_parameter.grad)
 
 
 def test_native_mtp_training_checkpoint_is_mtp_only_and_resumable(tmp_path):
@@ -193,6 +226,13 @@ def test_native_mtp_training_checkpoint_is_mtp_only_and_resumable(tmp_path):
         value.dtype == torch.bfloat16 for value in saved_state.values() if value.is_floating_point()
     )
     assert (tmp_path / "pytorch_model.bin").is_file()
+
+    # Resumed training writes its final export into the same output directory.
+    with torch.no_grad():
+        model.mtp.e_proj.weight.fill_(0.5)
+    model.save_pretrained(tmp_path)
+    alias_state = torch.load(tmp_path / "pytorch_model.bin", weights_only=True)
+    assert torch.equal(alias_state["mtp.e_proj.weight"], model.mtp.e_proj.weight)
 
     restored = _toy_mtp_model()
     load_native_mtp_boost_checkpoint(restored, tmp_path)

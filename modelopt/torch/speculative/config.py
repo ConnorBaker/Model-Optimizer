@@ -326,15 +326,16 @@ class MTPBoostConfig(ModeloptBaseConfig):
     hsm_mode: Literal["off", "uniform_layer_sample"] = ModeloptField(
         default="off",
         description=(
-            "How cache-free MTP rollouts choose their next raw hidden state. "
+            "How cache-free MTP TTT rounds choose their next raw hidden state. "
             "'uniform_layer_sample' samples one prior-round state per token."
         ),
     )
 
-    rollout_steps: int = ModeloptField(
+    ttt_steps: int = ModeloptField(
         default=1,
         description=(
-            "Number of normal-causal MTP rollouts. These do not use EAGLE3's TTT mask or KV cache."
+            "Number of train-time-test steps. Native MTP uses normal-causal rounds without "
+            "EAGLE3's TTT mask or KV cache."
         ),
     )
 
@@ -354,13 +355,11 @@ class MTPBoostConfig(ModeloptBaseConfig):
     )
 
     @model_validator(mode="after")
-    def _check_rollouts(self) -> "MTPBoostConfig":
-        if self.rollout_steps < 1:
-            raise ValueError("mtp_boost.rollout_steps must be at least 1.")
-        if self.hsm_mode == "uniform_layer_sample" and self.rollout_steps < 2:
-            raise ValueError(
-                "mtp_boost.hsm_mode='uniform_layer_sample' requires rollout_steps >= 2."
-            )
+    def _check_ttt_steps(self) -> "MTPBoostConfig":
+        if self.ttt_steps < 1:
+            raise ValueError("mtp_boost.ttt_steps must be at least 1.")
+        if self.hsm_mode == "uniform_layer_sample" and self.ttt_steps < 2:
+            raise ValueError("mtp_boost.hsm_mode='uniform_layer_sample' requires ttt_steps >= 2.")
         return self
 
 

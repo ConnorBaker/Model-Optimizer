@@ -425,7 +425,7 @@ class ModelOptMTPBoostRecipe(ModelOptSpeculativeRecipeBase):
     mtp_boost: MTPBoostConfig = ModeloptField(
         default=MTPBoostConfig(),
         title="Native MTP boost config",
-        description="Configuration for cache-free native MTP boost rollouts.",
+        description="Configuration for cache-free native MTP boost TTT rounds.",
         validate_default=True,
     )
 
