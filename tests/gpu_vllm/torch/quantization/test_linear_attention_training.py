@@ -17,7 +17,9 @@ from inspect import signature
 
 import pytest
 import torch
+import triton
 from _test_utils.torch.quantization.linear_attention_reference import recurrent_delta_rule_reference
+from packaging.version import Version
 
 from modelopt.torch.quantization.config import QuantizerAttributeConfig
 from modelopt.torch.quantization.linear_attention import (
@@ -145,12 +147,15 @@ def _native_forward(args, quantizer, kda, kimi_k3):
 @pytest.fixture(scope="module", params=["gdn", "kda", "kimi_k3"])
 def compiled_serving_case(request):
     """Compile one shared BF16 shape per model, outside the test-call timer."""
+    # Skip before any kernels: an FLA backward fault poisons later tests' CUDA context.
+    if torch.cuda.get_device_capability()[0] >= 12 and Version(triton.__version__) < Version("3.7"):
+        pytest.skip("FLA backward causes misaligned CUDA access on sm_120+ with Triton < 3.7")
     kda = request.param != "gdn"
     kimi_k3 = request.param == "kimi_k3"
     if kimi_k3 and optional_module("vllm.models.kimi_k3.nvidia.ops.third_party.kda") is None:
         pytest.skip("This vLLM build does not provide the Kimi-K3 backend")
     torch.manual_seed(73)
-    keys = 128 if kda else 32
+    keys = 128 if kimi_k3 else 32
     args = [
         torch.randn(1, 73, 1, dim, device="cuda", dtype=torch.bfloat16)
         # Rectangular GDN state catches transposes; equal padded tile widths also
