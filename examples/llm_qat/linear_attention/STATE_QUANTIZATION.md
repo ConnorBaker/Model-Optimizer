@@ -3,7 +3,8 @@
 GDN/KDA state QAT must reproduce the state consumed by serving. This requires
 matching the quantization boundaries, scale groups, native arithmetic, and output
 read timing. The implementation combines a native chunked prefix with a recurrent
-suffix and supplies a differentiable Torch adjoint for training.
+suffix, using FLA's recurrence backward for the prefix and a Torch adjoint for
+the suffix.
 
 ## Why chunk-only quantization does not match decode
 
@@ -126,36 +127,43 @@ are separate from the public vLLM profile and ordinary state-only fake quantizat
 Temporary native cache buffers protect tensors needed by backward. The persistent
 training carry remains floating fake-QDQ data.
 
-The Torch adjoint uses saved forward values and identity STE through casts and
-QDQ. This is a training approximation to rounding, with gradients through the
-prefix, handoff, token writes, and checkpoint refreshes. It is not an exact
-derivative of the discontinuous quantizer.
+The backward uses FLA's recurrence for the prefix, a Torch adjoint for the suffix,
+and identity STE through casts and QDQ. This approximation supplies gradients
+through the prefix, handoff, token writes, and checkpoint refreshes. It is not an
+exact derivative of the discontinuous quantizer.
 
 ## Validation results
 
-The following checks used RTX A6000 GPUs. The replay and training matrix used
-Torch 2.9.1, FLA 0.5.1, public vLLM 0.15.1 prefill, and compatible native ReplaySSM
-sources with local KDA extensions. Results describe the tested implementation
-snapshots and environments.
+The current public profile targets vLLM 0.30.0 and FLA 0.5.1. Twelve focused
+GDN/KDA kernel tests passed on an RTX A6000 for the parent implementation. They
+cover native output/state agreement, QDQ placement, handoff gradients, raw-gate
+requirements, and BF16 projection inputs. This is kernel-level evidence, not a
+completed Bridge training or serving-engine benchmark.
 
-| Check | Result |
-| --- | --- |
-| 22 GDN/KDA native replay cases, including windows 1/4/16, nonzero states, partial prefixes, longer sequences, and QDQ-off controls | Exact outputs, checkpoint values/scales, and BF16 ring entries; finite gradients into nonempty prefixes |
-| Four split/resume cases with Q/K normalization | Exact outputs, final states, and gradients; empty calls perform no write |
-| Four GDN Bridge runs: QAT/QAD with Hadamard token mode and replay window 4 | One-step student updates; QAD teachers remain frozen and unquantized |
-| Four KDA Megatron layer runs with training or distillation losses | Student updates and gradients into the prefix; separate from Bridge trainer validation |
-| Public-vLLM GDN/KDA checks on 0.15.1, 0.20.0, and 0.30.0 | Exact native output/final-state comparisons, QDQ placement/effect, and gradients in the focused kernel tests |
+Both GDN Bridge example tests passed on an RTX A6000 with the dependency pair
+listed in the [example requirements](README.md#requirements). They use a tiny
+random Qwen3.5 model and mock data, with one optimizer step followed by one
+resumed step.
 
-The Bridge checks used the example's training entry point, tiny random weights,
-and mock data, including activation recomputation and the distributed optimizer.
-The tested Bridge provider supported GDN; KDA requires its own compatible
-provider. Matching versions and arithmetic settings remains necessary even where
-more than one runtime version passes kernel tests.
+| Check | QAT | QAD |
+| --- | --- | --- |
+| Enabled INT8 state QDQ and student weight update | Passed | Passed |
+| Save, exact weight/policy restore, and another optimizer step | Passed | Passed |
+| HF export, Transformers weight loading, and Megatron reimport with metadata | Passed | Passed |
+| Effective parameters, logits, and attention gradients after HF round trip | Exact | Exact |
+| Frozen, unquantized teacher | Not applicable | Passed |
 
-These checks resolve the reproduced kernel/cache mismatch for the tested cases.
-They do not establish full-model serving equivalence: model conversion,
-projections, convolution, normalization, engine-managed multi-call prefill,
-cache-slot reuse, and scheduler batching still need matched integration tests.
-Pretrained-model quality recovery, multi-GPU scaling, and training throughput
-also require separate validation. Long recurrent suffixes can be slow with the
-current Python orchestration and Torch backward implementation.
+HF weights alone do not enable state quantization in Transformers or vLLM. The
+exact numerical round-trip check restores ModelOpt metadata after reimporting
+those weights into Megatron.
+
+Older vLLM and private ReplaySSM results do not qualify this updated workflow.
+ReplaySSM requires its separate compatible fork and a fresh validation run;
+KDA Bridge training also requires a provider for the chosen checkpoint.
+
+Kernel agreement does not establish full-model serving equivalence. Model
+conversion, projections, convolution, normalization, engine-managed multi-call
+prefill, cache-slot reuse, and scheduler batching still need matched integration
+tests. Pretrained-model quality recovery, multi-GPU scaling, and training
+throughput also require separate validation. Long recurrent suffixes can be slow
+with the current Python orchestration and Torch backward implementation.

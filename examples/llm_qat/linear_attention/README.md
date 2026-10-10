@@ -14,11 +14,30 @@ solution, and numerical validation. The example quantizes recurrent state only.
 ## Requirements
 
 Use the [Megatron Bridge environment](../../megatron_bridge/README.md#pre-requisites),
-CUDA GPUs, and mutually compatible Bridge/Core revisions. ModelOpt adapts
+CUDA GPUs, and mutually compatible Bridge/Core revisions. GDN state QAT requires
+Core with `_compute_gates` and either `forward_pre_attn_and_core_attn` or
+`_forward_compute`; Core 0.19.2 is
+unsupported, including the Core shipped in `nemo:26.08`. ModelOpt adapts
 Megatron `GatedDeltaNet` and `KimiDeltaAttention`; FLA supplies their kernel
 dependency. KDA requires a Core revision exporting `KimiDeltaAttention` and a
 Bridge provider that can convert the chosen checkpoint. Layer support in
 ModelOpt alone does not provide checkpoint conversion support in Bridge.
+
+The single-GPU GDN QAT/QAD checkpoint tests passed with this source pair:
+
+| Dependency | Tested revision/version |
+| --- | --- |
+| Megatron Bridge | `056b78e0a96fb0f5b50a82d09d1ec456b073d1e0` |
+| Megatron Core (Bridge's pinned submodule) | `e998be072d22ff57b4b49899819a1a153f4f3dc9` |
+| PyTorch / Transformer Engine | `2.13.0` / `2.16.1` |
+| vLLM / FLA | `0.30.0` / `0.5.1` |
+| Transformers / NVIDIA Resiliency Extension | `5.15.0` / `0.7.0` |
+
+Use Bridge's installation instructions for the selected revision. A Core source
+checkout also needs its dataset extension built: run
+`python setup.py build_ext --inplace` from the Core repository root. The tested
+Core revision supplies GDN but not `KimiDeltaAttention`; this pair does not
+qualify KDA Bridge training.
 
 Prepare a local model/tokenizer snapshot and a Megatron `.bin`/`.idx` dataset
 using that tokenizer. `--train-data` takes the shared filename prefix without an
@@ -32,7 +51,7 @@ pip install -r examples/llm_qat/linear_attention/requirements.txt
 pip install -r examples/llm_qat/linear_attention/requirements-vllm.txt
 ```
 
-The example pins `fla-core==0.5.1` and public `vllm==0.15.1`. vLLM supplies forward
+The example pins `fla-core==0.5.1` and public `vllm==0.30.0`. vLLM supplies forward
 kernels; no running server is needed for training. INT8 + Hadamard and ReplaySSM
 require a compatible quantized-ReplaySSM fork instead of public vLLM, including
 its KDA vector-gate kernel when training KDA.
@@ -49,10 +68,24 @@ bash examples/llm_qat/linear_attention/with_vllm_defaults.sh \
   --train-steps 1 --length 128 --prefill-tokens 64
 ```
 
-Add `--teacher-model /path/to/unquantized-model` for QAD. Student and teacher must
-have matching tokenizer vocabularies and output vocabulary dimensions. QAD uses
-`kd_loss_alpha=1.0`, disabling the language-model loss. Both QAT and QAD mask loss
-to positions after `--prefill-tokens`.
+For QAD, use a separate output directory and add an unquantized teacher:
+
+```bash
+bash examples/llm_qat/linear_attention/with_vllm_defaults.sh \
+  torchrun --standalone --nproc-per-node=1 examples/llm_qat/linear_attention/train.py \
+  --model /path/to/local-model \
+  --teacher-model /path/to/unquantized-model \
+  --train-data /path/to/tokenized/train_text_document \
+  --output /path/to/megatron-qad-checkpoint \
+  --recipe general/ptq/linear_attention_state_int8_block32_dynamic \
+  --train-steps 1 --length 128 --prefill-tokens 64
+```
+
+Student and teacher must have matching tokenizer vocabularies and output
+vocabulary dimensions. QAD uses
+`kd_loss_alpha=1.0`, disabling the language-model loss. Both modes use Bridge
+`pretrain()`; QAD wraps the student in Bridge's `DistillationProvider`. Both modes
+mask loss to positions after `--prefill-tokens`.
 
 Only the student's linear-attention parameters are trainable; the remaining
 parameters are frozen. Training uses BF16 mixed precision. Each dense sequence
@@ -101,8 +134,13 @@ linear_attention:
       replay_window: 8
 ```
 
-`precision="vllm"` selects the installed public vLLM arithmetic; `vllm_0_15` is
-an accepted legacy spelling. `precision="replayssm"` selects native INT8/Hadamard
+`precision="vllm"` selects vLLM 0.30.0's Triton GDN kernels and standalone
+KDA kernels. For GDN serving, select `gdn_prefill_backend="triton"` and enable
+`VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1`. Mixed prefill/decode
+batches are outside this profile. Standalone KDA has no model-level serving
+guarantee; Kimi-Linear/Kimi-K3 on vLLM 0.30 requires `precision="vllm_kimi_k3"`,
+both KDA backends set to `triton`, and an unbounded softplus gate.
+`precision="replayssm"` selects native INT8/Hadamard
 checkpoints. `replay_window=1` refreshes every token; values from 2 to 64 require
 ReplaySSM. The prefill chunk size of 64 is independent of this suffix window.
 
@@ -122,7 +160,6 @@ cfg["linear_attention"][0]["cfg"]["replay_window"] = 8
 
 For the CLI, put the modified recipe in a YAML file and pass its path to
 `--recipe`. State QAT requires `backend="serving"` and explicit prefix lengths.
-Keep the legacy `gdn_w_quantizer` disabled; this workflow does not quantize W.
 
 ## Supply prefill/decode boundaries in a training loop
 
@@ -239,24 +276,31 @@ with microbatch size one and must be divisible by the data-parallel size.
 
 Choose a topology supported by the model's Bridge/Core provider. This example
 requires linear-attention layers in each local pipeline chunk. Context parallelism
-is fixed at one. The available topology options do not imply multi-GPU qualification.
+is fixed at one. State QAT supports selective GDN recomputation on compatible Core
+revisions, not full-layer recomputation. The available topology options do not
+imply multi-GPU qualification.
 
 ## Validation and limitations
 
-The two example tests cover GDN QAT and QAD with shared compilation setup. Each
+The two example tests exercise GDN QAT and QAD with shared compilation setup. Each
 saves a checkpoint, checks exact weight and policy restoration, resumes for one
 step, and exports/reloads HF weights with the separate Megatron ModelOpt metadata.
 The HF round trip checks all effective parameters, logits, and attention gradients.
-The QAD test also checks that the teacher stays frozen and unquantized. Run them
-in the matching Bridge/vLLM environment:
+The QAD test also checks that the teacher stays frozen and unquantized.
+Both tests passed on an RTX A6000 with the dependency versions above. They use a
+tiny random Qwen3.5 GDN model and mock data: one optimizer step, then one resumed
+step. This validates the workflow, not pretrained-model quality recovery. Run:
 
 ```bash
 bash examples/llm_qat/linear_attention/with_vllm_defaults.sh \
   python -m pytest tests/examples/megatron_bridge/test_linear_attention.py
 ```
 
-GDN Bridge workflow checks and KDA Megatron layer checks are distinct: the tested
-Bridge provider supports GDN, while a KDA trainer needs a compatible provider.
+The CLI entry point was also checked in-process with local HF weights and a
+`.bin`/`.idx` dataset; both QAT and QAD saved a checkpoint.
+
+GDN Bridge workflow tests and KDA Megatron layer tests are distinct. The example
+tests use a GDN provider; a KDA trainer needs a compatible provider.
 Native-cache and gradient checks are summarized in
 [State quantization alignment](STATE_QUANTIZATION.md#validation-results).
 
