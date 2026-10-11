@@ -28,11 +28,11 @@ class LinearAttentionConfig(ModeloptBaseConfig):
     """One execution policy shared by the chunked prefix and recurrent suffix.
 
     ``serving`` uses native forward arithmetic with a differentiable adjoint;
-    ``fla`` is the disabled/default path. ``vllm`` targets the installed vLLM's
+    ``fla`` is the disabled/default path. ``vllm`` targets vLLM 0.30.0's
     Triton prefill and single-token, non-speculative decode with BF16 operands and
     FP32 recurrent storage. Deployment must explicitly select Triton prefill
-    (``gdn_prefill_backend="triton"``) and enable packed recurrent decode where
-    available (``VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1``). Mixed prefill/decode
+    (``gdn_prefill_backend="triton"``) and enable packed recurrent decode
+    (``VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1``). Mixed prefill/decode
     batches and automatic FlashInfer/CuTe dispatch are outside this profile.
     KDA uses the standalone FLA/Triton API, with no model-level serving guarantee.
     ``vllm_kimi_k3`` explicitly selects

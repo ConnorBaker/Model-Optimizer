@@ -16,7 +16,6 @@
 """Numerical policies and differentiable kernels for linear attention."""
 
 from .config import *
-from .decode import *
 from .gdn import *
 from .kda import *
 from .training import *

@@ -63,11 +63,6 @@ class GatedDeltaNetStateQuantMixin(_LinearAttentionQuantMixin):
             raise ValueError("vllm_kimi_k3 is a KDA-only precision profile")
         super().validate_linear_attention()
 
-    @property
-    def gdn_state_qdq_block_v(self) -> int:
-        """Execution tile width; also sets grouping for legacy tile quantizers."""
-        return self.linear_attention_config.state_block_v
-
     def _state_quantized_chunk_gated_delta_rule(
         self, gated_delta_rule: GatedDeltaRuleFn, *args: Any, **kwargs: Any
     ) -> tuple[torch.Tensor, torch.Tensor | None]:

@@ -83,6 +83,12 @@ def validate_gdn_quantizer(
 
     if not isinstance(quantizer, TensorQuantizer):
         raise ValueError(f"{name} requires a single TensorQuantizer")
+    if quantizer.block_sizes is not None and quantizer.block_sizes.get("type") == "dynamic":
+        raise ValueError(
+            f"{name} does not support block_sizes['type']='dynamic'. For INT8 state QDQ, "
+            "use top-level type='dynamic' with block_sizes={-1: N}; "
+            "quantized block scales are not supported."
+        )
     if not (
         quantizer._dynamic
         and quantizer.num_bits in num_bits
@@ -111,7 +117,7 @@ def validate_gdn_quantizer(
 
 
 def state_quantizer_config(
-    quantizer: TensorQuantizer, *, name="state_quantizer"
+    quantizer: TensorQuantizer, *, name="state_quantizer", state_codec="tile"
 ) -> tuple[str, int]:
     """Validate the state quantizer and derive its format and last-axis group size.
 
@@ -120,6 +126,11 @@ def state_quantizer_config(
     validate_gdn_quantizer(
         quantizer, name=name, num_bits=tuple(_STATE_FORMATS), block_sizes=(16, 32, 64)
     )
+    if state_codec == "int8_hadamard32":
+        if quantizer.num_bits != 8:
+            raise ValueError("int8_hadamard32 requires INT8 state quantization")
+        if quantizer.block_sizes is not None:
+            raise ValueError("TensorQuantizer block_sizes requires state_codec='tile'")
     if quantizer.block_sizes is not None:
         return _STATE_FORMATS[quantizer.num_bits], quantizer.block_sizes[-1]
     if quantizer.axis != (0, 1):
@@ -127,74 +138,25 @@ def state_quantizer_config(
     return _STATE_FORMATS[quantizer.num_bits], 0
 
 
-def _make_state_quantizer(state_format):
-    """Build a standalone-call quantizer; converted modules supply their registered instance."""
-    # QuantizeConfig imports this module before the quantizer classes are initialized.
-    from ..config import QuantizerAttributeConfig
-    from ..nn import TensorQuantizer
-
-    if state_format not in _STATE_FORMATS.values():
-        raise ValueError("State format must be fp8_e4m3 or int8")
-    return TensorQuantizer(
-        QuantizerAttributeConfig(
-            num_bits=(4, 3) if state_format == "fp8_e4m3" else 8,
-            type="dynamic",
-            axis=(0, 1),
-            narrow_range=True,
-            pass_through_bwd=True,
-        )
-    )
+def _resolve_state_quantizer(state_quantizer, *, state_codec="tile"):
+    """Validate an enabled quantizer once; return None when state QDQ is inactive."""
+    if state_quantizer is not None and state_quantizer.is_enabled:
+        state_quantizer_config(state_quantizer, state_codec=state_codec)
+        if state_quantizer._if_quant:
+            return state_quantizer
+    return None
 
 
-def _resolve_state_quantizer(state_quantizer, state_qdq, state_format):
-    """Resolve legacy flags and registered quantizer settings at either training entry point."""
-    if state_quantizer is None and state_qdq:
-        state_quantizer = _make_state_quantizer(state_format)
-    if state_quantizer is not None:
-        state_qdq = state_quantizer.is_enabled and state_quantizer._if_quant
-        if state_quantizer.is_enabled:
-            state_format, _ = state_quantizer_config(state_quantizer)
-    return state_quantizer, state_qdq, state_format
-
-
-def _state_qdq(
-    state: torch.Tensor,
-    block_v: int = 64,
-    state_format: str = "fp8_e4m3",
-    state_quantizer: TensorQuantizer | None = None,
-):
-    """Apply the same state encoding used by recurrent writes."""
-    return _state_qdq_with_scales(state, block_v, state_format, state_quantizer)[0]
-
-
-def _state_qdq_with_scales(state, block_v, state_format, state_quantizer=None):
-    """Shared continuation/decode QDQ; blockwise scales remain owned by TensorQuantizer."""
-    if state_quantizer is not None and state_quantizer.block_sizes is not None:
-        return state_quantizer(state), None
-    if state_format not in ("fp8_e4m3", "int8"):
-        raise ValueError("State format must be fp8_e4m3 or int8")
-    if block_v not in (16, 32, 64, 128):
-        raise ValueError("block_v must be 16, 32, 64, or 128")
-    return _tile_qdq(state, block_v, state_format, state_quantizer=state_quantizer)
-
-
-def _tile_qdq(value, block_v, state_format, *, state_quantizer=None):
-    """Return TensorQuantizer tile QDQ with identity STE and detached scales."""
-    quantizer = (
-        state_quantizer if state_quantizer is not None else _make_state_quantizer(state_format)
-    )
-    rounded, scales = [], []
-    for part in value.split(block_v, dim=-1):
+def _state_qdq(state: torch.Tensor, state_quantizer: TensorQuantizer | None, block_v: int = 64):
+    """Apply state QDQ; TensorQuantizer owns the format, scales, and backward rule."""
+    if state_quantizer is None:
+        return state
+    if state_quantizer.block_sizes is not None:
+        return state_quantizer(state)
+    rounded = []
+    for part in state.split(block_v, dim=-1):
         # Canonical [N, H, K*BV] shape preserves per-head tile scales for both state ranks.
         tensor = part.flatten(-2)
         inputs = tensor.reshape(1, -1, tensor.shape[-1])
-        decoded = quantizer(inputs)
-        amax = quantizer._get_amax(inputs).float()
-        if quantizer.num_bits == 8:
-            scale = amax / quantizer.maxbound
-        else:
-            safe_amax = torch.where(amax <= 2**-24, torch.ones_like(amax), amax)
-            scale = torch.div(quantizer.maxbound, safe_amax).reciprocal()
-        rounded.append(decoded.reshape_as(part))
-        scales.append(scale.reshape(tensor.shape[:-1]))
-    return torch.cat(rounded, dim=-1).to(value.dtype), torch.stack(scales, dim=-1)
+        rounded.append(state_quantizer(inputs).reshape_as(part))
+    return torch.cat(rounded, dim=-1).to(state.dtype)

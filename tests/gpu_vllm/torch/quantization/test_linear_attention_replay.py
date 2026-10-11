@@ -18,7 +18,25 @@
 import pytest
 import torch
 
-from modelopt.torch.quantization.linear_attention import LinearAttentionConfig, recurrent_decode
+from modelopt.torch.quantization.config import QuantizerAttributeConfig
+from modelopt.torch.quantization.linear_attention import LinearAttentionConfig, gdn_state_qat
+from modelopt.torch.quantization.linear_attention.decode import _replay_decode
+from modelopt.torch.quantization.nn import TensorQuantizer
+
+pytest.importorskip("vllm")
+
+
+@pytest.fixture(scope="module")
+def state_quantizer():
+    return TensorQuantizer(
+        QuantizerAttributeConfig(
+            num_bits=8,
+            type="dynamic",
+            axis=(0, 1),
+            narrow_range=True,
+            pass_through_bwd=True,
+        )
+    )
 
 
 @pytest.fixture(
@@ -26,11 +44,15 @@ from modelopt.torch.quantization.linear_attention import LinearAttentionConfig, 
     params=[(False, 1), (False, 4), (True, 4)],
     ids=["gdn-token", "gdn-replay", "kda-replay"],
 )
-def compiled_replay(request):
-    native = pytest.importorskip(
-        "vllm.model_executor.layers.fla.ops.fused_recurrent_replayssm",
-        exc_type=ModuleNotFoundError,
-    )
+def compiled_replay(request, state_quantizer):
+    try:
+        from vllm.model_executor.layers.fla.ops import fused_recurrent_replayssm as native
+    except ModuleNotFoundError as error:
+        if error.name and "vllm.model_executor.layers.fla.ops.fused_recurrent_replayssm".startswith(
+            error.name
+        ):
+            pytest.skip("Requires the optional quantized-ReplaySSM serving fork")
+        raise
     channel, window = request.param
     torch.manual_seed(71)
     q, k = [
@@ -57,18 +79,56 @@ def compiled_replay(request):
     )
     kwargs = {
         "config": config,
-        "state_qdq": True,
-        "state_format": "int8",
+        "state_quantizer": state_quantizer,
         "gate_inputs": None if channel else (raw, raw_beta, rate, bias),
     }
 
     def forward():
-        return recurrent_decode(*args, initial_state=initial, **kwargs)
+        return _replay_decode(
+            *(x.float() for x in args),
+            initial,
+            window,
+            state_quantizer.is_enabled,
+            64**-0.5,
+            False,
+            kwargs["gate_inputs"],
+        )
 
     out, carry = forward()
     torch.autograd.grad(out.sum() + carry.reconstruct().sum(), (*args, initial))
     torch.cuda.synchronize()
     return native, args, initial, kwargs, forward
+
+
+@pytest.mark.parametrize(
+    ("keys", "values", "overrides", "message"),
+    [
+        (32, 48, {}, "Dv divisible by 32"),
+        (32, 32, {"num_bits": (4, 3)}, "requires INT8"),
+        (32, 32, {"block_sizes": {-1: 32}, "axis": None}, "requires state_codec='tile'"),
+        (16, 32, {}, "power-of-two K >= 32"),
+        (32, 32, {}, "raw GDN gate inputs"),
+    ],
+)
+def test_replay_rejects_invalid_inputs_before_backend(keys, values, overrides, message):
+    quantizer = TensorQuantizer(
+        QuantizerAttributeConfig(num_bits=8, type="dynamic", axis=(0, 1), narrow_range=True)
+    )
+    quantizer.set_from_attribute_config(overrides)
+    q = torch.ones(1, 2, 1, keys, device="cuda", dtype=torch.bfloat16)
+    v = q.new_ones(1, 2, 1, values)
+    with pytest.raises(ValueError, match=message):
+        gdn_state_qat(
+            q,
+            q,
+            v,
+            q[..., 0],
+            q[..., 0],
+            policy=LinearAttentionConfig(backend="serving", precision="replayssm"),
+            state_quantizer=quantizer,
+            prefill_lengths=[1],
+            initial_state=q.new_ones(1, 1, keys, values),
+        )
 
 
 def test_replay_matches_persistent_serving_cache(compiled_replay):
@@ -127,9 +187,9 @@ def test_replay_matches_persistent_serving_cache(compiled_replay):
         decoded = state[1].transpose(-1, -2).float().unflatten(-1, (-1, 32))
         metadata = scales[1].transpose(-1, -2)
         torch.testing.assert_close(
-            carry.anchor.values, (decoded * metadata[..., None]).flatten(-2), rtol=0, atol=0
+            carry.anchor, (decoded * metadata[..., None]).flatten(-2), rtol=0, atol=0
         )
-        torch.testing.assert_close(carry.anchor.scales, metadata, rtol=0, atol=0)
+        torch.testing.assert_close(carry.scales, metadata, rtol=0, atol=0)
     grads = torch.autograd.grad(
         output.square().mean() + carry.reconstruct().square().mean(), (*args, initial)
     )

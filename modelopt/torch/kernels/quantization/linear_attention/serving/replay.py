@@ -16,11 +16,17 @@
 """Functional training launches of the optional quantized-ReplaySSM serving kernels."""
 
 import torch
-from vllm.model_executor.layers.fla.ops.fused_recurrent_replayssm import (
-    _apply_h_value_axis,
-    fused_recurrent_gated_delta_rule_replayssm,
-    prefill_write_checkpoint,
-)
+
+# This optional fork has an explicit API separate from the public vLLM 0.30 profile.
+from vllm.model_executor.layers.fla.ops import fused_recurrent_replayssm as _native
+
+
+def _prefill_kernels():
+    # Keep this fork's import contract isolated from the public vLLM profile.
+    from vllm.model_executor.layers.fla import ops
+    from vllm.model_executor.layers.fla.ops import kda
+
+    return ops, kda
 
 
 def _storage(value, enabled):
@@ -50,33 +56,33 @@ def checkpoint(value, enabled):
     state, scales, indices = _storage(value, enabled)
     original = value.transpose(-1, -2).unsqueeze(0).contiguous().float()
     if enabled:
-        prefill_write_checkpoint(
+        _native.prefill_write_checkpoint(
             original, state, None, None, scales, None, None, indices, 8, hadamard=True
         )
     else:
-        state[1] = _apply_h_value_axis(original)[0]
+        state[1] = _native._apply_h_value_axis(original)[0]
     return _decoded(state, scales)
 
 
 def original_basis(value):
     """Use serving's FP32 checkpoint transform when returning a dense state."""
-    return _apply_h_value_axis(value.transpose(-1, -2).unsqueeze(0).contiguous())[0].transpose(
-        -1, -2
-    )
+    return _native._apply_h_value_axis(value.transpose(-1, -2).unsqueeze(0).contiguous())[
+        0
+    ].transpose(-1, -2)
 
 
 def step(q, k, v, gate, beta, carry, window, enabled, scale, normalize, gate_inputs):
     """Launch one token on private cache buffers; never mutate tensors saved for backward."""
     anchor = carry.anchor
-    state, scales, indices = _storage(anchor.values, enabled)
+    state, scales, indices = _storage(anchor, enabled)
     if enabled:
-        metadata = anchor.scales
-        codes = (anchor.values.unflatten(-1, (-1, 32)) / metadata.float().unsqueeze(-1)).round()
+        metadata = carry.scales
+        codes = (anchor.unflatten(-1, (-1, 32)) / metadata.float().unsqueeze(-1)).round()
         state[1] = codes.flatten(-2).transpose(-1, -2).to(torch.int8)
         scales[1] = metadata.transpose(-1, -2)
     else:
-        state[1] = anchor.values.transpose(-1, -2)
-    heads, keys, values = anchor.values.shape
+        state[1] = anchor.transpose(-1, -2)
+    heads, keys, values = anchor.shape
     d = torch.zeros(2, heads, window, values, device=q.device, dtype=torch.bfloat16)
     kc = torch.zeros(2, heads, window, keys, device=q.device, dtype=torch.bfloat16)
     channel = gate.ndim == 2
@@ -86,8 +92,8 @@ def step(q, k, v, gate, beta, carry, window, enabled, scale, normalize, gate_inp
         dtype=torch.float32,
     )
     for i, entry in enumerate(carry.entries):
-        d[1, :, i] = entry.update.values
-        kc[1, :, i] = entry.key.values
+        d[1, :, i] = entry.update
+        kc[1, :, i] = entry.key
         gc[1, :, i] = entry.log_retention
     mixed = torch.cat([x.to(torch.bfloat16).flatten() for x in (q, k, v)])[None]
     if channel:
@@ -96,8 +102,8 @@ def step(q, k, v, gate, beta, carry, window, enabled, scale, normalize, gate_inp
         raw_gate, raw_beta, a_log, bias = gate_inputs
         a, b = raw_gate[None].contiguous(), raw_beta[None].contiguous()
     output = torch.empty(1, heads, values, device=q.device, dtype=torch.bfloat16)
-    cursor = carry.cursor
-    fused_recurrent_gated_delta_rule_replayssm(
+    cursor = len(carry.entries)
+    _native.fused_recurrent_gated_delta_rule_replayssm(
         mixed,
         a,
         b,

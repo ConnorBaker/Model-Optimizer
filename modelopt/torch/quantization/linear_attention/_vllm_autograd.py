@@ -46,7 +46,7 @@ def prefix(
             scale,
             normalize,
             gate_inputs,
-            kimi_k3=precision == "vllm_kimi_k3",
+            precision=precision,
         )
     if not torch.is_grad_enabled() or not any(x.requires_grad for x in (q, k, v, g, beta, state)):
         return out.float(), final
@@ -83,7 +83,7 @@ def step(q, k, v, gate, beta, state, scale, normalize=False, gate_inputs=None, p
             scale,
             normalize,
             gate_inputs,
-            kimi_k3=precision == "vllm_kimi_k3",
+            precision=precision,
         )
     if not torch.is_grad_enabled() or not any(
         x.requires_grad for x in (q, k, v, gate, beta, state)

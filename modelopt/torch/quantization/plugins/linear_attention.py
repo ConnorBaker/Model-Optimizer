@@ -114,20 +114,16 @@ class _LinearAttentionQuantMixin(QuantModule):
     def validate_linear_attention(self):
         """Validate quantizer contracts shared by GDN and KDA."""
         if self._linear_attn_state.is_enabled:
-            state_format, group_size = state_quantizer_config(
+            state_quantizer_config(
                 self._linear_attn_state,
                 name=self.linear_attention_quantizer_names[0],
+                state_codec=self.linear_attention_config.state_codec,
             )
             if self.linear_attention_config.backend != "serving":
                 raise ValueError(
                     "GDN/KDA state QAT requires backend='serving'; use "
                     "linear_attention_training_phase to select a recurrent training suffix"
                 )
-            if self.linear_attention_config.state_codec == "int8_hadamard32":
-                if state_format != "int8":
-                    raise ValueError("int8_hadamard32 requires INT8 state quantization")
-                if group_size:
-                    raise ValueError("TensorQuantizer block_sizes requires state_codec='tile'")
 
     def warn_linear_attention_profile(self):
         """Warn at conversion/restore on one TP/DP representative of each owning stage."""

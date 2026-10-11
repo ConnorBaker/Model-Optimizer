@@ -22,7 +22,7 @@ import textwrap
 import types
 from contextlib import contextmanager
 from copy import copy
-from functools import cache, partial
+from functools import cache
 from itertools import pairwise
 from typing import Any
 
@@ -1174,17 +1174,17 @@ class _MegatronLinearAttentionMixin(_LinearAttentionQuantMixin):
     def _quantized_linear_attention_kernel(self):
         kernel = self.gated_delta_rule
         previous_gates = self._linear_attention_gate_inputs
-        if self._serving_arithmetic:
 
-            def run_kernel(*args, **kwargs):
-                kwargs["use_qk_l2norm_in_kernel"] = self.use_qk_l2norm
-                if self._linear_attention_gate_inputs is not None:
-                    kwargs["gate_inputs"] = self._linear_attention_gate_inputs
-                return self._linear_attention_kernel(kernel, *args, **kwargs)
+        def run_kernel(*args, **kwargs):
+            kwargs["use_qk_l2norm_in_kernel"] = self.use_qk_l2norm
+            if self._linear_attention_gate_inputs is None:
+                raise NotImplementedError(
+                    "Serving state QAT requires raw gates captured by Megatron's _compute_gates hook"
+                )
+            kwargs["gate_inputs"] = self._linear_attention_gate_inputs
+            return self._linear_attention_kernel(kernel, *args, **kwargs)
 
-            self.gated_delta_rule = run_kernel
-        else:
-            self.gated_delta_rule = partial(self._linear_attention_kernel, kernel)
+        self.gated_delta_rule = run_kernel
         self._linear_attention_gate_inputs = None
         try:
             yield
@@ -1196,20 +1196,13 @@ class _MegatronLinearAttentionMixin(_LinearAttentionQuantMixin):
         self.validate_linear_attention_execution()
         recompute = getattr(self, "recompute_gdn", False)
         capture = self._serving_arithmetic and self.training and recompute
-        if capture and not hasattr(super(), "_forward_compute"):
-            raise NotImplementedError("Selective state QAT recompute requires Megatron's core hook")
         previous = self._linear_attention_recompute
         self._linear_attention_recompute = capture
         if capture:
             # The adapter checkpoints the same core, with microbatch-local metadata.
             self.recompute_gdn = False
         try:
-            if hasattr(super(), "_forward_compute") or hasattr(
-                super(), "forward_pre_attn_and_core_attn"
-            ):
-                return super().forward(*args, **kwargs)
-            with self._quantized_linear_attention_kernel():
-                return super().forward(*args, **kwargs)
+            return super().forward(*args, **kwargs)
         finally:
             self._linear_attention_recompute = previous
             if capture:
@@ -1218,8 +1211,7 @@ class _MegatronLinearAttentionMixin(_LinearAttentionQuantMixin):
     def _forward_compute(self, hidden_states, *args, **kwargs):
         compute = super()._forward_compute
         if not self._serving_arithmetic:
-            with self._quantized_linear_attention_kernel():
-                return compute(hidden_states, *args, **kwargs)
+            return compute(hidden_states, *args, **kwargs)
         lengths = self._linear_attention_prefill_lengths
         sequence_lengths = self._linear_attention_sequence_lengths
         if lengths is None:
@@ -1275,27 +1267,26 @@ class _MegatronLinearAttentionMixin(_LinearAttentionQuantMixin):
             return tensor_parallel.checkpoint(run, False, hidden_states)
         return run(hidden_states)
 
-    def forward_pre_attn_and_core_attn(self, *args, **kwargs):
-        with self._quantized_linear_attention_kernel():
-            return super().forward_pre_attn_and_core_attn(*args, **kwargs)
-
     def validate_linear_attention_execution(self):
         super().validate_linear_attention_execution()
         self._validate_linear_attention_config()
         active = self.linear_attention_is_enabled
         serving = self.linear_attention_config.backend == "serving" and active
+        if active and not serving:
+            self.validate_linear_attention()
         if self.config.context_parallel_size > 1 and active:
             raise NotImplementedError("GDN/KDA QAT does not support Megatron context parallelism.")
         if serving and self.training and self.config.recompute_granularity == "full":
             raise NotImplementedError(
                 "State QAT supports selective GDN recompute, not full-layer recompute"
             )
-        if (
-            serving
-            and getattr(self, "recompute_gdn", False)
-            and not hasattr(super(), "_forward_compute")
+        if serving and (
+            not hasattr(super(), "_compute_gates") or not hasattr(super(), "_forward_compute")
         ):
-            raise NotImplementedError("Selective state QAT recompute requires Megatron's core hook")
+            raise NotImplementedError(
+                "Serving state QAT requires Megatron-Core's _compute_gates and _forward_compute "
+                "hooks to preserve raw gates and packed sequence lengths. Upgrade Megatron-Core."
+            )
 
     def _validate_linear_attention_config(self):
         if self._serving_arithmetic and self.config.deterministic_mode:

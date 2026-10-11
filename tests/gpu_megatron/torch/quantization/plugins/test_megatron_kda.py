@@ -28,7 +28,9 @@ from modelopt.recipe import load_recipe
 from modelopt.torch.quantization.linear_attention import linear_attention_training_phase
 
 KimiDeltaAttention = pytest.importorskip("megatron.core.ssm.gated_delta_net.kda").KimiDeltaAttention
-pytest.importorskip("vllm")
+vllm = pytest.importorskip("vllm")
+if vllm.__version__ != "0.30.0":
+    pytest.skip("State QAT profiles target vLLM 0.30.0", allow_module_level=True)
 
 
 def _layer():

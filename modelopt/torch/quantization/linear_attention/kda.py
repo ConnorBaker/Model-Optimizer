@@ -32,8 +32,6 @@ def kda_state_qat(
     beta,
     *,
     policy,
-    state_qdq=False,
-    state_format="fp8_e4m3",
     state_quantizer=None,
     scale=None,
     initial_state=None,
@@ -62,7 +60,8 @@ def kda_state_qat(
     Prepare per-key-channel gates and optional beta activation using FLA's formula.
     The shared training forward runs the chunked prefix and recurrent suffix with
     native forward values and configured state QDQ. FLA supplies the prefix backward;
-    a Torch recurrence supplies the suffix adjoint.
+    a Torch recurrence supplies the suffix adjoint. ``state_quantizer`` owns state
+    QDQ; passing None or a disabled quantizer retains the unquantized native path.
     """
     if cp_context is not None or disable_recompute or return_intermediate_states:
         raise NotImplementedError(
@@ -90,10 +89,11 @@ def kda_state_qat(
         rate = A_log.to(dtype).exp().reshape(g.shape[-2], 1)
         g = -rate * F.softplus(g)
         # Import the optional vLLM backend only for the native precision profile.
-        from ...kernels.quantization.linear_attention.serving._compat import fla_module
+        from ...kernels.quantization.linear_attention.serving.forward import _kernels
 
         with torch.no_grad():
-            native_gate = fla_module("kda").fused_kda_gate(
+            _, native_kda = _kernels("replayssm" if policy.precision == "replayssm" else "vllm")
+            native_gate = native_kda.fused_kda_gate(
                 raw_gate.flatten(-2).contiguous(), A_log, raw_gate.shape[-1], g_bias=dt_bias
             )
         g = forward_value(g, native_gate)
@@ -109,8 +109,6 @@ def kda_state_qat(
         g,
         beta,
         policy=policy,
-        state_qdq=state_qdq,
-        state_format=state_format,
         state_quantizer=state_quantizer,
         scale=scale,
         initial_state=initial_state,

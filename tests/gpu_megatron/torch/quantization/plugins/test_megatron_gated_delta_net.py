@@ -32,11 +32,16 @@ from modelopt.torch.quantization.linear_attention import linear_attention_traini
 
 pytest.importorskip("fla")  # Megatron-Core GatedDeltaNet needs FLA for its baseline kernels.
 GatedDeltaNet = pytest.importorskip("megatron.core.ssm.gated_delta_net").GatedDeltaNet
-pytest.importorskip("vllm")
+vllm = pytest.importorskip("vllm")
+if vllm.__version__ != "0.30.0":
+    pytest.skip("State QAT profiles target vLLM 0.30.0", allow_module_level=True)
 
 from modelopt.torch.quantization.plugins.megatron import _QuantGatedDeltaNet
 
 SEED = 1234
+HAS_SERVING_HOOKS = all(
+    hasattr(GatedDeltaNet, name) for name in ("_compute_gates", "_forward_compute")
+)
 
 
 def _make_model(tp_size):
@@ -95,6 +100,12 @@ def _test_gdn_qat_helper(rank, size, checkpoint_path):
         baseline = forward(model, decode_aware=False)
     mtq.quantize(model, _gdn_config())
     module = next(m for m in model.modules() if isinstance(m, _QuantGatedDeltaNet))
+    module.linear_attention_config.backend = "fla"
+    try:
+        with pytest.raises(ValueError, match="requires backend='serving'"):
+            forward(model, decode_aware=False)
+    finally:
+        module.linear_attention_config.backend = "serving"
     calls = []
     hook = module.gdn_state_quantizer.register_forward_hook(lambda *_: calls.append(True))
     try:
@@ -205,6 +216,8 @@ def _compile_gdn_qat_kernels(rank, size):
     forward = _gdn_forward(model)
     with torch.no_grad():
         forward(model)
+    if not HAS_SERVING_HOOKS:
+        return  # The compatibility test only needs the original Megatron kernel.
     cfg = _gdn_config()
     cfg["linear_attention"][0]["cfg"]["state_block_v"] = 32
     mtq.quantize(model, cfg)
@@ -216,7 +229,7 @@ def _compile_gdn_qat_kernels(rank, size):
     torch.cuda.synchronize()
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def compiled_gdn_workers(dist_workers_size_1):
     """Warm one small QAT model in the same worker, outside the test-call budget."""
     dist_workers_size_1.run(_compile_gdn_qat_kernels)
@@ -225,4 +238,40 @@ def compiled_gdn_workers(dist_workers_size_1):
 
 def test_gdn_qat_and_sharded_restore(compiled_gdn_workers, tmp_path):
     """Train through QDQ after a Megatron distributed-checkpoint round trip."""
+    if not HAS_SERVING_HOOKS:
+        pytest.skip("Serving QAT requires Megatron-Core gate and packed-forward hooks")
     compiled_gdn_workers.run(_test_gdn_qat_helper, tmp_path)
+
+
+def _test_missing_serving_hooks(rank, size):
+    initialize_for_megatron(
+        tensor_model_parallel_size=size, pipeline_model_parallel_size=1, seed=SEED
+    )
+    model = _make_model(size)
+    forward = _gdn_forward(model)
+    with torch.no_grad():
+        baseline = forward(model, decode_aware=False)
+    mtq.quantize(model, _gdn_config())
+    layer = next(m for m in model.modules() if isinstance(m, _QuantGatedDeltaNet))
+    with (
+        linear_attention_training_phase(layer, [64, 64]),
+        layer._quantized_linear_attention_kernel(),
+        pytest.raises(NotImplementedError, match="raw gates captured"),
+    ):
+        layer.gated_delta_rule()
+    for name in ("_compute_gates", "_forward_compute"):
+        with pytest.MonkeyPatch.context() as patch:
+            for cls in GatedDeltaNet.__mro__:
+                if name in vars(cls):
+                    patch.delattr(cls, name)
+            restored = _make_model(size)
+            mto.restore_from_modelopt_state(restored, mto.modelopt_state(model))
+            with pytest.raises(NotImplementedError, match="Upgrade Megatron-Core"):
+                forward(restored)
+    mtq.disable_quantizer(model, "*")
+    with torch.no_grad():
+        torch.testing.assert_close(forward(model, decode_aware=False), baseline, rtol=0, atol=0)
+
+
+def test_gdn_missing_serving_hooks(compiled_gdn_workers):
+    compiled_gdn_workers.run(_test_missing_serving_hooks)

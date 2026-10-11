@@ -30,8 +30,6 @@ def gdn_state_qat(
     beta,
     *,
     policy: LinearAttentionConfig,
-    state_qdq=False,
-    state_format="fp8_e4m3",
     state_quantizer=None,
     scale=None,
     initial_state=None,
@@ -56,7 +54,8 @@ def gdn_state_qat(
     Validate prepared scalar log gates and promote inputs to FP32 working values.
     The shared training forward runs the chunked prefix and recurrent suffix with
     native forward values and configured state QDQ. FLA supplies the prefix backward;
-    a Torch recurrence supplies the suffix adjoint.
+    a Torch recurrence supplies the suffix adjoint. ``state_quantizer`` owns state
+    QDQ; passing None or a disabled quantizer retains the unquantized native path.
     """
     if policy.precision == "vllm_kimi_k3":
         raise ValueError("vllm_kimi_k3 is a KDA-only precision profile")
@@ -83,8 +82,6 @@ def gdn_state_qat(
         g,
         beta,
         policy=policy,
-        state_qdq=state_qdq,
-        state_format=state_format,
         state_quantizer=state_quantizer,
         scale=scale,
         initial_state=initial_state,
