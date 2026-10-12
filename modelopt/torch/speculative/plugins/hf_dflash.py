@@ -500,8 +500,19 @@ class HFDFlashModel(DFlashModel):
         return DFlashModule(dflash_config)
 
     def _build_objective(self, config):
-        """The block objective, ``[(name, weight, term)]``: KD from the base model, or CE."""
-        return [objective_term("kd" if config.dflash_self_logit_distillation else "ce", 1.0)]
+        """The block objective, ``[(name, weight, term)]``, from ``dflash_loss_terms`` if set."""
+        terms = config.dflash_loss_terms
+        if terms is None:
+            terms = self._default_loss_terms(config)
+        blend = {"scale": config.dflash_lk_ce_scale, "decay": config.dflash_lk_ce_decay}
+        return [
+            objective_term(name, weight, **(blend if name == "lambda" else {}))
+            for name, weight in terms.items()
+        ]
+
+    def _default_loss_terms(self, config):
+        """The variant's ``{term: weight}`` without ``dflash_loss_terms``: KD from the base, or CE."""
+        return {"kd" if config.dflash_self_logit_distillation else "ce": 1.0}
 
     def _base_device(self):
         """Device the frozen base model sits on. ``meta`` during a from_pretrained restore."""

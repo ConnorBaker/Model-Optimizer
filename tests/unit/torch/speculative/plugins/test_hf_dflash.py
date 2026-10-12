@@ -24,6 +24,7 @@ import logging
 import os
 import warnings
 from types import SimpleNamespace
+from typing import get_args
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -49,7 +50,9 @@ import modelopt.torch.opt as mto
 import modelopt.torch.speculative as mtsp
 import modelopt.torch.speculative.plugins.dflash_flex_attention as dflash_flex_attention
 import modelopt.torch.speculative.plugins.hf_dflash as hf_dflash
+from modelopt.torch.speculative.config import DFlashConfig, DFlashLossTerm
 from modelopt.torch.speculative.plugins.dflash_losses import (
+    DIVERGENCES,
     DraftLogits,
     _block_position_weights,
     _block_targets,
@@ -367,6 +370,189 @@ class TestDPaceLossIntegration:
             weights.view(-1),
         )
         assert torch.equal(loss, legacy)
+
+
+# What each variant's conversion requires beyond get_dflash_config(), sized for the tiny
+# model: its dflash_architecture_config fields, then its other config fields.
+_VARIANTS = {
+    "dflash": ({}, {}),
+    "dflash2": (
+        {"conv_kernel_size": 2, "conv_group_size": 4, "selector_rank": 8, "selector_top_k": 5},
+        {},
+    ),
+    "lilicorr": (
+        {
+            "lilicorr_candidate_topk": 4,
+            "lilicorr_num_layers": 1,
+            "lilicorr_num_heads": 4,
+            "lilicorr_mlp_ratio": 2.0,
+            "lilicorr_factor_dim": 8,
+            "lilicorr_vector_eps": 1e-4,
+            "lilicorr_logit_scale": 8.0,
+        },
+        {
+            "dflash_lilicorr_w_ce": 0.25,
+            "dflash_lilicorr_w_margin": 0.0,
+            "dflash_lilicorr_w_pen": 0.25,
+        },
+    ),
+    "dspark": ({"markov_rank": 16}, {}),
+    # lambda_base below 1, so that Domino's corrected logits train too.
+    "domino": ({"emb_dim": 16, "gru_hidden_dim": 32}, {"dflash_lambda_base_start": 0.5}),
+}
+
+
+def _variant_model(projector_type, offline=False, arch=None, **overrides):
+    """A tiny model converted to ``projector_type``, with ``arch`` and ``overrides`` applied."""
+    arch_fields, fields = _VARIANTS[projector_type]
+    config = get_dflash_config(offline=offline)
+    config["dflash_architecture_config"].update(
+        projector_type=projector_type, **arch_fields, **(arch or {})
+    )
+    config.update(fields, **overrides)
+    model = get_tiny_llama(num_hidden_layers=4)
+    model.config.num_orig_hidden_layers = 4
+    mtsp.convert(model, [("dflash", config)])
+    return model
+
+
+def _objective_spec(model):
+    """The objective as data: each term's name, weight, class and bound parameters."""
+    return [(name, weight, type(term), vars(term)) for name, weight, term in model._objective]
+
+
+class TestLossTerms:
+    """``dflash_loss_terms`` composes the block objective of any variant from the registry."""
+
+    def test_every_configurable_term_is_implemented(self):
+        assert set(get_args(DFlashLossTerm)) == set(DIVERGENCES)
+
+    @pytest.mark.parametrize(
+        ("terms", "match"),
+        [
+            ({"ce": 1.0, "l1": 1.0}, "'ce', 'kd', 'tvd', 'tv' or 'lambda'"),
+            ({"ce": -0.5}, "greater than or equal to 0"),
+            ({"ce": 0.0}, "weight > 0"),
+        ],
+        ids=["unknown", "negative", "all-zero"],
+    )
+    def test_bad_terms_are_rejected(self, terms, match):
+        with pytest.raises(ValueError, match=match):
+            DFlashConfig(dflash_loss_terms=terms)
+
+    @pytest.mark.parametrize(
+        ("selector", "value"),
+        [
+            ("dflash_self_logit_distillation", False),
+            ("dflash_lk_loss_type", "tv"),
+            ("dflash_ce_loss_alpha", 0.5),
+            ("dflash_l1_loss_alpha", 0.5),
+        ],
+    )
+    def test_terms_and_a_legacy_selector_are_rejected(self, selector, value):
+        """One source for the objective."""
+        with pytest.raises(ValueError, match=selector):
+            DFlashConfig(dflash_loss_terms={"ce": 1.0}, **{selector: value})
+
+    @pytest.mark.parametrize(
+        ("projector_type", "legacy", "terms"),
+        [
+            ("dflash", {}, {"kd": 1.0}),
+            ("dflash", {"dflash_self_logit_distillation": False}, {"ce": 1.0}),
+            (
+                "dflash2",
+                {"dflash_self_logit_distillation": False, "dflash_lk_loss_type": "tv"},
+                {"tv": 1.0},
+            ),
+            (
+                "dflash2",
+                {"dflash_self_logit_distillation": False, "dflash_lk_loss_type": "lambda"},
+                {"lambda": 1.0},
+            ),
+            ("lilicorr", {}, {"kd": 1.0}),
+            ("dspark", {"dflash_ce_loss_alpha": 0.3}, {"ce": 0.3, "tvd": 0.9}),
+            ("domino", {}, {"ce": 1.0}),
+        ],
+        ids=[
+            "dflash-kd",
+            "dflash-ce",
+            "dflash2-tv",
+            "dflash2-lambda",
+            "lilicorr",
+            "dspark",
+            "domino",
+        ],
+    )
+    def test_unset_terms_keep_each_variants_objective(self, projector_type, legacy, terms):
+        """Unset, each variant builds its own objective, which the same terms reproduce."""
+        blend = {"dflash_lk_ce_scale": 0.8, "dflash_lk_ce_decay": 2.0}
+        model = _variant_model(projector_type, **legacy, **blend)
+        assert [(name, weight) for name, weight, _ in model._objective] == list(terms.items())
+        explicit = _variant_model(projector_type, dflash_loss_terms=terms, **blend)
+        assert _objective_spec(explicit) == _objective_spec(model)
+
+    def test_terms_survive_the_config_round_trips(self):
+        """main.py converts from a model_dump() and a restore reads one back: all fields set."""
+        config = DFlashConfig(**get_dflash_config(), dflash_loss_terms={"tvd": 0.5, "ce": 0.5})
+        model = get_tiny_llama(num_hidden_layers=4)
+        mtsp.convert(model, [("dflash", config.model_dump())])
+        restored = mto.restore_from_modelopt_state(
+            get_tiny_llama(num_hidden_layers=4), mto.modelopt_state(model)
+        )
+        assert [name for name, _, _ in restored._objective] == ["tvd", "ce"]
+        assert _objective_spec(restored) == _objective_spec(model)
+
+    @pytest.mark.parametrize(
+        ("projector_type", "terms"),
+        [
+            ("dflash", {"ce": 0.5, "tvd": 0.5}),
+            ("dflash2", {"tv": 0.5, "kd": 0.5}),
+            ("lilicorr", {"tvd": 1.0}),
+            ("dspark", {"kd": 1.0}),
+            ("domino", {"kd": 0.5, "lambda": 0.5, "tvd": 0.0}),
+        ],
+        ids=["dflash", "dflash2", "lilicorr", "dspark", "domino"],
+    )
+    def test_a_composed_objective_trains_every_variant(self, projector_type, terms):
+        """Online, the teacher every variant now has; every draft parameter gets a gradient.
+
+        Every term is reported, one of weight 0 too.
+        """
+        model = _variant_model(projector_type, dflash_loss_terms=terms).float()
+        model.train()
+        out = model(**_dflash_batch(model.config.vocab_size))
+        assert torch.isfinite(out.loss)
+        assert {f"loss_{name}" for name in terms} <= out.draft_metrics.keys()
+        out.loss.backward()
+        ungraded = [
+            name
+            for name, p in model.dflash_module.named_parameters()
+            if p.requires_grad and (p.grad is None or not torch.isfinite(p.grad).all())
+        ]
+        assert not ungraded, ungraded
+
+    @pytest.mark.parametrize(
+        ("projector_type", "terms", "confidence", "needs"),
+        [
+            ("dspark", {"ce": 1.0}, 0.0, False),
+            ("dspark", {"ce": 1.0}, 0.5, True),
+            ("domino", None, 0.0, False),
+            ("domino", {"kd": 1.0}, 0.0, True),
+        ],
+        ids=["dspark-ce", "dspark-ce-confidence", "domino", "domino-kd"],
+    )
+    def test_offline_needs_the_teacher_only_for_terms_that_read_it(
+        self, projector_type, terms, confidence, needs
+    ):
+        """Objective terms and variant terms declare it; nothing else does."""
+        model = _variant_model(
+            projector_type,
+            offline=True,
+            arch={"use_confidence_head": bool(confidence)},
+            dflash_loss_terms=terms,
+            dflash_confidence_head_alpha=confidence,
+        )
+        assert model._needs_base_logits is needs
 
 
 class TestDFlashSaveRestore:
