@@ -27,17 +27,16 @@ def _kernels(precision):
         from .replay import _prefill_kernels
 
         return _prefill_kernels()
+    import vllm
+
+    if vllm.__version__ != "0.30.0":
+        raise ImportError("Linear-attention vLLM profiles require vllm==0.30.0")
+    from vllm.third_party.flash_linear_attention import ops as gdn_ops
+
+    if precision == "vllm_kimi_k3":
+        from vllm.models.kimi_k3.nvidia.ops.third_party import kda as kda_ops
     else:
-        import vllm
-
-        if vllm.__version__ != "0.30.0":
-            raise ImportError("Linear-attention vLLM profiles require vllm==0.30.0")
-        from vllm.third_party.flash_linear_attention import ops as gdn_ops
-
-        if precision == "vllm_kimi_k3":
-            from vllm.models.kimi_k3.nvidia.ops.third_party import kda as kda_ops
-        else:
-            from vllm.third_party.flash_linear_attention.ops import kda as kda_ops
+        from vllm.third_party.flash_linear_attention.ops import kda as kda_ops
     return gdn_ops, kda_ops
 
 
@@ -48,6 +47,7 @@ def _state_layout(state):
 
 def prefill(q, k, v, g, beta, state, scale, normalize=False, gate_inputs=None, *, precision="vllm"):
     """Run native chunk prefill, including the selected profile's raw-gate preparation."""
+    # Match BF16 projection outputs; A_log and bias retain their parameter precision.
     gdn, kda = _kernels(precision)
     kimi_k3 = precision == "vllm_kimi_k3"
     channel = g.ndim == 3
@@ -55,10 +55,10 @@ def prefill(q, k, v, g, beta, state, scale, normalize=False, gate_inputs=None, *
         raw_g, raw_beta, rate, bias = gate_inputs
         q, k, v, g, beta = gdn.fused_post_conv_prep(
             torch.cat([x.flatten(1) for x in (q, k, v)], dim=-1),
-            raw_g.flatten(0, -2),
-            raw_beta.flatten(0, -2),
-            rate,
-            bias,
+            raw_g.flatten(0, -2).bfloat16().contiguous(),
+            raw_beta.flatten(0, -2).bfloat16().contiguous(),
+            rate.reshape(-1).contiguous(),
+            bias.contiguous(),
             q.shape[-2],
             q.shape[-1],
             v.shape[-1],
@@ -78,14 +78,16 @@ def prefill(q, k, v, g, beta, state, scale, normalize=False, gate_inputs=None, *
     if channel and gate_inputs is not None:
         raw_g, raw_beta, rate, bias = gate_inputs
         # Kimi fuses beta activation; standalone KDA takes already activated beta.
-        beta_arg = {"raw_beta": raw_beta[None].contiguous()} if kimi_k3 else {"beta": beta}
+        beta_arg = (
+            {"raw_beta": raw_beta[None].bfloat16().contiguous()} if kimi_k3 else {"beta": beta}
+        )
         out, final = kda.chunk_kda_with_fused_gate(
             q,
             k,
             v,
-            raw_g=raw_g[None].contiguous(),
-            A_log=rate,
-            g_bias=bias,
+            raw_g=raw_g[None].bfloat16().contiguous(),
+            A_log=rate.reshape(-1).contiguous(),
+            g_bias=bias.contiguous() if bias is not None else None,
             **beta_arg,
             **kwargs,
         )
@@ -102,16 +104,19 @@ def step(q, k, v, g, beta, state, scale, normalize=False, gate_inputs=None, *, p
     kimi_k3 = precision == "vllm_kimi_k3"
     channel = g.ndim == 2
     cu, indices = _decode_metadata(q.device)
-    native_state = _state_layout(state.unsqueeze(0))
     if channel or gate_inputs is not None:
-        # Slot zero is reserved by vLLM's paged-cache kernels.
-        native_state = torch.cat((torch.zeros_like(native_state), native_state), dim=0)
+        # Only slot one is read/written; slot zero is reserved and needs no initialization.
+        native_state = state.new_empty(2, state.shape[0], state.shape[2], state.shape[1])
+        native_state[1].copy_(state.transpose(-1, -2))
+    else:
+        native_state = _state_layout(state.unsqueeze(0))
     if kimi_k3:
+        # The Kimi kernel always normalizes Q/K; validate_profile enforces normalize=True.
         raw_g, raw_beta, rate, bias = gate_inputs
         out, final = kda.fused_recurrent_kda_packed_decode(
             mixed_qkv=torch.cat([x.flatten() for x in (q, k, v)])[None],
-            raw_g=raw_g[None, None].contiguous(),
-            raw_beta=raw_beta[None, None].contiguous(),
+            raw_g=raw_g[None, None].bfloat16().contiguous(),
+            raw_beta=raw_beta[None, None].bfloat16().contiguous(),
             A_log=rate.reshape(-1).contiguous(),
             dt_bias=(torch.zeros_like(raw_g).flatten() if bias is None else bias.contiguous()),
             lower_bound=None,
@@ -133,13 +138,13 @@ def step(q, k, v, g, beta, state, scale, normalize=False, gate_inputs=None, *, p
         raw_g, raw_beta, rate, bias = gate_inputs
         out, final = gdn.fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=torch.cat([x.flatten() for x in (q, k, v)])[None],
-            a=raw_g[None].contiguous(),
-            b=raw_beta[None].contiguous(),
+            a=raw_g[None].bfloat16().contiguous(),
+            b=raw_beta[None].bfloat16().contiguous(),
             A_log=rate.reshape(-1).contiguous(),
             dt_bias=bias.contiguous(),
             scale=scale,
             initial_state=native_state,
-            out=torch.empty_like(v)[None, None],
+            out=torch.empty_like(v, memory_format=torch.contiguous_format)[None, None],
             ssm_state_indices=indices,
             use_qk_l2norm_in_kernel=normalize,
         )
@@ -152,6 +157,7 @@ def step(q, k, v, g, beta, state, scale, normalize=False, gate_inputs=None, *, p
             use_qk_l2norm_in_kernel=normalize,
             cu_seqlens=cu,
         )
+    # Indexed kernels update slot 1; the non-in-place fallback returns one state.
     return out[0, 0], _state_layout(final[-1])
 
 

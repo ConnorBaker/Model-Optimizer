@@ -39,8 +39,8 @@ if vllm.__version__ != "0.30.0":
 from modelopt.torch.quantization.plugins.megatron import _QuantGatedDeltaNet
 
 SEED = 1234
-HAS_SERVING_HOOKS = all(
-    hasattr(GatedDeltaNet, name) for name in ("_compute_gates", "_forward_compute")
+HAS_SERVING_HOOKS = hasattr(GatedDeltaNet, "_compute_gates") and any(
+    hasattr(GatedDeltaNet, name) for name in ("_forward_compute", "forward_pre_attn_and_core_attn")
 )
 
 
@@ -128,7 +128,7 @@ def _test_gdn_qat_helper(rank, size, checkpoint_path):
     before = restored_gdn.in_proj.weight.detach().clone()
     torch.optim.SGD(restored.parameters(), lr=1e-3).step()
     assert not torch.equal(restored_gdn.in_proj.weight, before)
-    _check_packed_recompute(restored_gdn)
+    _check_packed_forward(restored_gdn)
 
     for name, value, restore in (
         ("context_parallel_size", 2, True),
@@ -161,10 +161,7 @@ def _test_gdn_qat_helper(rank, size, checkpoint_path):
             setattr(layer.config, name, original)
 
 
-def _check_packed_recompute(module):
-    # Older Megatron releases lack selective GDN recompute and its native core hook.
-    if not hasattr(module, "recompute_gdn") or not hasattr(GatedDeltaNet, "_forward_compute"):
-        return
+def _check_packed_forward(module):
     hidden = torch.randn(128, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     packed = PackedSeqParams(
         qkv_format="thd",
@@ -176,13 +173,19 @@ def _check_packed_recompute(module):
         max_seqlen_kv=64,
         total_tokens=128,
     )
-    original = module.recompute_gdn
+    original = getattr(module, "recompute_gdn", None)
     was_training = module.training
     module.train()
     try:
         results = []
-        for recompute, lengths in ((False, [60, 58]), (False, None), (True, None)):
-            module.recompute_gdn = recompute
+        cases = [(False, [60, 58], False), (False, None, False)]
+        if original is not None and hasattr(GatedDeltaNet, "_forward_compute"):
+            cases.append((True, None, False))
+        if hasattr(GatedDeltaNet, "forward_pre_attn_and_core_attn"):
+            cases.append((False, None, True))
+        for recompute, lengths, two_stage in cases:
+            if original is not None:
+                module.recompute_gdn = recompute
             module.zero_grad(set_to_none=True)
             hidden.grad = None
             with (
@@ -194,9 +197,19 @@ def _check_packed_recompute(module):
                 ),
                 torch.autocast("cuda", dtype=torch.bfloat16),
             ):
-                output = module(hidden, attention_mask=None, packed_seq_params=packed)[0]
+                if two_stage:
+                    norm = module.forward_pre_attn_and_core_attn(
+                        hidden, attention_mask=None, packed_seq_params=packed
+                    )
+                    output = module.forward_post_core_attn(norm)[0]
+                else:
+                    output = module(hidden, attention_mask=None, packed_seq_params=packed)[0]
+            # Exclude padding from the loss: trained output norms may have a bias.
             # Backward runs after the phase exits, as in pipeline schedules.
-            output.float().square().sum().backward()
+            valid_output = torch.cat((output[:60], output[64:122]))
+            valid_output.float().square().sum().backward()
+            assert not hidden.grad[60:64].count_nonzero()
+            assert not hidden.grad[122:].count_nonzero()
             results.append(
                 (output.detach(), hidden.grad.clone(), module.in_proj.weight.grad.clone())
             )
@@ -204,7 +217,8 @@ def _check_packed_recompute(module):
             for value, expected in zip(actual, results[0]):
                 torch.testing.assert_close(value, expected, rtol=0, atol=0)
     finally:
-        module.recompute_gdn = original
+        if original is not None:
+            module.recompute_gdn = original
         module.train(was_training)
 
 
@@ -225,7 +239,7 @@ def _compile_gdn_qat_kernels(rank, size):
         forward(model)
     model.train()
     forward(model).sum().backward()
-    _check_packed_recompute(next(m for m in model.modules() if isinstance(m, _QuantGatedDeltaNet)))
+    _check_packed_forward(next(m for m in model.modules() if isinstance(m, _QuantGatedDeltaNet)))
     torch.cuda.synchronize()
 
 
@@ -259,11 +273,12 @@ def _test_missing_serving_hooks(rank, size):
         pytest.raises(NotImplementedError, match="raw gates captured"),
     ):
         layer.gated_delta_rule()
-    for name in ("_compute_gates", "_forward_compute"):
+    for names in (("_compute_gates",), ("_forward_compute", "forward_pre_attn_and_core_attn")):
         with pytest.MonkeyPatch.context() as patch:
             for cls in GatedDeltaNet.__mro__:
-                if name in vars(cls):
-                    patch.delattr(cls, name)
+                for name in names:
+                    if name in vars(cls):
+                        patch.delattr(cls, name)
             restored = _make_model(size)
             mto.restore_from_modelopt_state(restored, mto.modelopt_state(model))
             with pytest.raises(NotImplementedError, match="Upgrade Megatron-Core"):

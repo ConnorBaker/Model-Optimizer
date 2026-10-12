@@ -15,15 +15,23 @@
 
 """Minimal native-cache and backward checks for the optional ReplaySSM serving fork."""
 
+from importlib import import_module
+
 import pytest
 import torch
 
 from modelopt.torch.quantization.config import QuantizerAttributeConfig
 from modelopt.torch.quantization.linear_attention import LinearAttentionConfig, gdn_state_qat
 from modelopt.torch.quantization.linear_attention.decode import _replay_decode
+from modelopt.torch.quantization.linear_attention.training import _validate_training_device
 from modelopt.torch.quantization.nn import TensorQuantizer
 
 pytest.importorskip("vllm")
+
+try:
+    _validate_training_device(torch.device("cuda"))
+except NotImplementedError as error:
+    pytest.skip(str(error), allow_module_level=True)
 
 
 @pytest.fixture(scope="module")
@@ -46,7 +54,7 @@ def state_quantizer():
 )
 def compiled_replay(request, state_quantizer):
     try:
-        from vllm.model_executor.layers.fla.ops import fused_recurrent_replayssm as native
+        native = import_module("vllm.model_executor.layers.fla.ops.fused_recurrent_replayssm")
     except ModuleNotFoundError as error:
         if error.name and "vllm.model_executor.layers.fla.ops.fused_recurrent_replayssm".startswith(
             error.name

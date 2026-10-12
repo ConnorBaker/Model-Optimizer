@@ -108,8 +108,9 @@ The tested GDN/KDA profiles pass bit-exact native forward comparisons on vLLM 0.
 The existing sm_120+/Triton <3.7 training guard also applies to custom ReplaySSM
 environments; changing the public profile does not remove that hardware restriction.
 
-Megatron state QAT requires native `_compute_gates` and `_forward_compute` hooks
-for raw gates and packed padding; Megatron-Core 0.19.2 lacks these hooks and is
+Megatron state QAT requires native `_compute_gates` and either
+`forward_pre_attn_and_core_attn` or `_forward_compute` for raw gates and packed
+padding; Megatron-Core 0.19.2 lacks these hooks and is
 rejected before an active QAT forward. Loading checkpoints and running the original
 module with state quantizers disabled outside a phase remain supported.
 

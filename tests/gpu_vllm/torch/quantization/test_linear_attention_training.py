@@ -141,13 +141,8 @@ def compiled_serving_case(request):
     kda = request.param != "gdn"
     kimi_k3 = request.param == "kimi_k3"
     torch.manual_seed(73)
-    keys = 32  # Share the smallest supported KDA shape across both native profiles.
-    args = [
-        torch.randn(1, 67, 1, dim, device="cuda", dtype=torch.bfloat16)
-        # Rectangular GDN state catches transposes; equal padded tile widths also
-        # satisfy the fused post-conv kernel's tile-width constraint.
-        for dim in (keys, keys, keys if kda else 24)
-    ]
+    keys = 32  # Share one head shape across GDN/KDA to reuse native and FLA compilation.
+    args = [torch.randn(1, 67, 1, keys, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
     args += [
         torch.randn((1, 67, 1, keys) if kda else (1, 67, 1), device="cuda", dtype=torch.bfloat16),
         torch.randn(1, 67, 1, device="cuda", dtype=torch.bfloat16),
@@ -242,21 +237,85 @@ def test_serving_state_qdq_and_handoff_gradient(compiled_serving_case):
             quantizer.enable()
 
 
-@pytest.mark.parametrize("compiled_serving_case", ["kimi_k3"], indirect=True, scope="module")
+@pytest.fixture(scope="module")
+@torch.no_grad()
+def compiled_gdn_layout_case():
+    """Compile a two-head case so strided head/value axes are observable."""
+    torch.manual_seed(732)
+    q, k, v = [torch.randn(1, 2, 2, 32, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    raw_g, raw_beta = [torch.randn(1, 2, 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    gates = (raw_g, raw_beta, torch.full((2,), -3.0, device="cuda"), torch.randn(2, device="cuda"))
+    initial = torch.randn(1, 2, 32, 32, device="cuda")
+
+    def forward(values, gate_inputs):
+        raw_g, raw_beta, rate, bias = gate_inputs
+        return gdn_state_qat(
+            q,
+            k,
+            values,
+            -rate.exp() * torch.nn.functional.softplus(raw_g.float() + bias),
+            raw_beta.float().sigmoid(),
+            policy=LinearAttentionConfig(backend="serving"),
+            initial_state=initial,
+            prefill_lengths=[1],
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            gate_inputs=gate_inputs,
+        )
+
+    expected = forward(v, gates)
+    torch.cuda.synchronize()
+    return v, gates, initial, forward, expected
+
+
+@pytest.mark.parametrize("strided", ["values", "gates"])
+@torch.no_grad()
+def test_gdn_strided_inputs_match_contiguous(compiled_gdn_layout_case, strided):
+    v, gates, initial, forward, expected = compiled_gdn_layout_case
+    original_state = initial.clone()
+    if strided == "values":
+        v = v.transpose(-1, -2).contiguous().transpose(-1, -2)
+    else:
+        gates = tuple(torch.stack((x, torch.zeros_like(x)), dim=-1)[..., 0] for x in gates)
+    actual = forward(v, gates)
+    for value, reference in zip(actual, expected):
+        torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    torch.testing.assert_close(initial, original_state, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
-    ("overrides", "message"),
+    ("compiled_serving_case", "overrides", "message"),
     [
+        ("gdn", {"gate_inputs": None}, "raw gate_inputs"),
         (
+            "kimi_k3",
             {"gate_inputs": None, "use_gate_in_kernel": False, "use_beta_sigmoid_in_kernel": False},
             "raw gate_inputs",
         ),
-        ({"use_qk_l2norm_in_kernel": False}, "normalization"),
+        ("kimi_k3", {"use_qk_l2norm_in_kernel": False}, "normalization"),
     ],
+    indirect=["compiled_serving_case"],
+    scope="module",
 )
 def test_rejects_silent_serving_mismatches(compiled_serving_case, overrides, message):
     _, _, forward, _, _ = compiled_serving_case
     with pytest.raises(ValueError, match=message):
         forward(**overrides)
+
+
+@pytest.mark.parametrize("compiled_serving_case", ["gdn", "kimi_k3"], indirect=True, scope="module")
+@torch.no_grad()
+def test_raw_projections_match_bf16_serving(compiled_serving_case):
+    args, quantizer, forward, _, kimi_k3 = compiled_serving_case
+    inputs = [x.detach() for x in args]
+    inputs[3:5] = [x.float() + 0.0007 for x in inputs[3:5]]
+    # Rates and biases keep their FP32 precision, independent of projection rounding.
+    inputs[5:] = [x + 0.0123 for x in inputs[5:]]
+    rounded = [*inputs[:3], *[x.bfloat16() for x in inputs[3:5]], *inputs[5:]]
+    expected = _native_forward(rounded, quantizer, kimi_k3, kimi_k3)
+    actual = forward(inputs=inputs)
+    for value, reference in zip(actual, expected):
+        torch.testing.assert_close(value, reference, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

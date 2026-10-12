@@ -1209,7 +1209,18 @@ class _MegatronLinearAttentionMixin(_LinearAttentionQuantMixin):
                 self.recompute_gdn = recompute
 
     def _forward_compute(self, hidden_states, *args, **kwargs):
-        compute = super()._forward_compute
+        return self._run_linear_attention_compute(
+            super()._forward_compute, hidden_states, *args, **kwargs
+        )
+
+    def forward_pre_attn_and_core_attn(self, hidden_states, *args, **kwargs):
+        # Core's two-stage schedules can call this entry point without forward().
+        self.validate_linear_attention_execution()
+        return self._run_linear_attention_compute(
+            super().forward_pre_attn_and_core_attn, hidden_states, *args, **kwargs
+        )
+
+    def _run_linear_attention_compute(self, compute, hidden_states, *args, **kwargs):
         if not self._serving_arithmetic:
             return compute(hidden_states, *args, **kwargs)
         lengths = self._linear_attention_prefill_lengths
@@ -1217,11 +1228,13 @@ class _MegatronLinearAttentionMixin(_LinearAttentionQuantMixin):
         if lengths is None:
             raise ValueError("State quantization requires explicit prefill lengths")
         arguments = inspect.signature(compute).bind(hidden_states, *args, **kwargs)
-        boundaries = self._linear_attention_cu_seqlens.resolve(
-            arguments.arguments.get("cu_seqlens_q")
-        )
         packed = arguments.arguments.get("packed_seq_params")
+        cu_seqlens = arguments.arguments.get("cu_seqlens_q")
         if packed is not None and packed.qkv_format == "thd":
+            if cu_seqlens is None:
+                cu_seqlens = packed.cu_seqlens_q_padded
+                if cu_seqlens is None:
+                    cu_seqlens = packed.cu_seqlens_q
             actual = packed.cu_seqlens_q
             if actual is None:
                 if sequence_lengths is None:
@@ -1237,6 +1250,7 @@ class _MegatronLinearAttentionMixin(_LinearAttentionQuantMixin):
                     length > end for length, end in zip(sequence_lengths, valid)
                 ):
                     raise ValueError("Sequence lengths exceed the packed valid token counts")
+        boundaries = self._linear_attention_cu_seqlens.resolve(cu_seqlens)
         if self._linear_attention_recompute:
             # Packed metadata may refer to buffers reused by a later pipeline microbatch.
             for name, value in list(arguments.arguments.items()):
@@ -1281,11 +1295,16 @@ class _MegatronLinearAttentionMixin(_LinearAttentionQuantMixin):
                 "State QAT supports selective GDN recompute, not full-layer recompute"
             )
         if serving and (
-            not hasattr(super(), "_compute_gates") or not hasattr(super(), "_forward_compute")
+            not hasattr(super(), "_compute_gates")
+            or not (
+                hasattr(super(), "_forward_compute")
+                or hasattr(super(), "forward_pre_attn_and_core_attn")
+            )
         ):
             raise NotImplementedError(
-                "Serving state QAT requires Megatron-Core's _compute_gates and _forward_compute "
-                "hooks to preserve raw gates and packed sequence lengths. Upgrade Megatron-Core."
+                "Serving state QAT requires Megatron-Core's _compute_gates and either "
+                "_forward_compute or forward_pre_attn_and_core_attn to preserve raw gates and "
+                "packed sequence lengths. Upgrade Megatron-Core."
             )
 
     def _validate_linear_attention_config(self):

@@ -56,9 +56,13 @@ def gdn_state_qat(
     native forward values and configured state QDQ. FLA supplies the prefix backward;
     a Torch recurrence supplies the suffix adjoint. ``state_quantizer`` owns state
     QDQ; passing None or a disabled quantizer retains the unquantized native path.
+    ``precision="vllm"`` requires ``gate_inputs=(raw_g, raw_beta, A_log, bias)``
+    for native gate preparation; the prepared ``g`` and ``beta`` supply the adjoint.
     """
     if policy.precision == "vllm_kimi_k3":
         raise ValueError("vllm_kimi_k3 is a KDA-only precision profile")
+    if policy.precision == "vllm" and gate_inputs is None:
+        raise ValueError("vllm GDN requires raw gate_inputs=(raw_g, raw_beta, A_log, bias)")
     if cp_context is not None:
         raise NotImplementedError("GDN state QAT does not support context parallelism")
     _validate_gate_inputs(g, beta, gate_inputs)
