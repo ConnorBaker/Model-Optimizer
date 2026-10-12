@@ -102,6 +102,20 @@ class DFlashConfig(ModeloptBaseConfig):
         default=True, description="Whether to use logit distillation from base model."
     )
 
+    dflash_teacher_softcap: bool = ModeloptField(
+        default=False,
+        description=(
+            "Cap the teacher's logits the way the base model caps its own, "
+            "``cap * tanh(logits / cap)`` with ``cap`` the base config's "
+            "``final_logit_softcapping`` (Gemma family). The teacher is the base's ``lm_head`` "
+            "applied to its final hidden state for every batch, text or multimodal, online or "
+            "offline, which leaves that cap out unless this is set. Other scaling a base applies "
+            "at its ``lm_head``, such as ``logits_scaling`` or ``logit_scale``, stays out; "
+            "conversion warns about it. Requires a base config that sets "
+            "``final_logit_softcapping``. The draft's own logits are never capped."
+        ),
+    )
+
     dflash_loss_decay_factor: float = ModeloptField(
         default=0.0,
         description="Gamma for exponential loss decay weighting (paper Eq.4). "

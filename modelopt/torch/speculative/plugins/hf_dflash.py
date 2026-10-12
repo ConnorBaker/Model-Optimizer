@@ -82,6 +82,8 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config as _Qwen3C
 from transformers.trainer_pt_utils import LabelSmoother
 from transformers.utils import ModelOutput
 
+from modelopt.torch.utils import warn_rank_0
+
 from ..dflash.conversion import DFlashDMRegistry
 from ..dflash.dflash_model import DFlashModel
 from .dflash_flex_attention import build_draft_block_mask
@@ -105,6 +107,7 @@ from .modeling_fakebase import (
     _BASE_MODEL_PATHS,
     _EMBED_TOKENS_PATHS,
     _LM_HEAD_PATHS,
+    _LOGIT_SCALING_FIELDS,
     find_final_norm_path,
 )
 from .modeling_final_norm import _apply_base_final_norm
@@ -228,9 +231,12 @@ class HFDFlashModel(DFlashModel):
         path = getattr(self, "base_model_norm_path", None)
         return self.get_submodule(path) if path else None
 
-    @property
-    def _needs_base_logits(self) -> bool:
-        """Whether the loss reads the target's logits; offline training then reconstructs them."""
+    def _reads_teacher(self, config) -> bool:
+        """Whether a loss term reads the base distribution; offline batches must then carry it.
+
+        Becomes ``_needs_base_logits`` at convert time. A variant that adds a term reading the
+        teacher declares it here, from ``config``.
+        """
         return any(term.needs_teacher for _, _, term in self._objective)
 
     @property
@@ -282,6 +288,14 @@ class HFDFlashModel(DFlashModel):
         self.dflash_fp32_master_weights = config.dflash_fp32_master_weights
 
         base_config = self._base_llm_config
+        base_softcap = getattr(base_config, "final_logit_softcapping", None)
+        if config.dflash_teacher_softcap and base_softcap is None:
+            raise ValueError(
+                "dflash_teacher_softcap=True, but the base config sets no "
+                "final_logit_softcapping to cap the teacher's logits with."
+            )
+        self._teacher_softcap = base_softcap if config.dflash_teacher_softcap else None
+
         # Use Qwen3Config (not generic PretrainedConfig) so rope_parameters is
         # auto-populated from rope_theta. DFlash draft uses Qwen3 components.
         self.dflash_config = _Qwen3Config(**config.dflash_architecture_config)
@@ -462,6 +476,18 @@ class HFDFlashModel(DFlashModel):
             self.dflash_module.compile_body()
 
         self._objective = self._build_objective(config)
+        self._needs_base_logits = self._reads_teacher(config)
+        scaling = {
+            name: getattr(base_config, name)
+            for name in _LOGIT_SCALING_FIELDS
+            if getattr(base_config, name, None) not in (None, 1.0)
+        }
+        if self._needs_base_logits and scaling:
+            warn_rank_0(
+                f"The base config sets {', '.join(f'{k}={v}' for k, v in scaling.items())}, "
+                "which the distillation teacher does not apply: the teacher is lm_head's raw "
+                "projection of the base model's final hidden state."
+            )
         # Compiling fuses the TVD chunk's six vocab-wide elementwise passes.
         self._tvd_chunk_fn = (
             torch.compile(_tvd_chunk, dynamic=False, fullgraph=True)
@@ -819,7 +845,8 @@ class HFDFlashModel(DFlashModel):
         Next-token logits: the ones that predict the token at position ``i`` sit at ``i - 1``.
         Only those rows of the base hidden go through the final norm and lm_head, so no
         full-sequence logits are built from it; ``token_ids`` ([B, ..., k]) narrows the
-        projection to just those vocab entries.
+        projection to just those vocab entries. ``dflash_teacher_softcap`` caps what is
+        projected; logits handed over in ``base_outputs`` are the model's own and only gathered.
         """
         positions = (label_positions - 1).clamp(min=0)
         if base_outputs.logits is not None:
@@ -839,10 +866,15 @@ class HFDFlashModel(DFlashModel):
         rows = _gather_rows(base_outputs.base_hidden, positions).to(lm_head.weight.dtype)
         rows = _apply_base_final_norm(rows, base_outputs.base_hidden_prenorm, self._base_model_norm)
         if token_ids is None:
-            return lm_head(rows)
-        logits = torch.einsum("...h,...kh->...k", rows, lm_head.weight[token_ids])
-        bias = getattr(lm_head, "bias", None)
-        return logits if bias is None else logits + bias[token_ids]
+            logits = lm_head(rows)
+        else:
+            logits = torch.einsum("...h,...kh->...k", rows, lm_head.weight[token_ids])
+            bias = getattr(lm_head, "bias", None)
+            if bias is not None:
+                logits = logits + bias[token_ids]
+        cap = self._teacher_softcap
+        # In the base model's op order, so the cap rounds as the base's own does.
+        return logits if cap is None else torch.tanh(logits / cap) * cap
 
     def _online_base_outputs(
         self,

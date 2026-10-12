@@ -18,9 +18,11 @@
 GPU-dependent tests (training forward, module forward) are in tests/gpu/.
 """
 
+import copy
 import json
 import logging
 import os
+import warnings
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -34,7 +36,13 @@ from _test_utils.torch.transformers_models import (
     tf_modelopt_state_and_output_tester,
 )
 from torch.nn.attention.flex_attention import create_mask
-from transformers import AutoModelForCausalLM, Gemma4Config, Gemma4ForConditionalGeneration
+from transformers import (
+    AutoModelForCausalLM,
+    Gemma4Config,
+    Gemma4ForConditionalGeneration,
+    GraniteConfig,
+    GraniteForCausalLM,
+)
 from transformers.modeling_layers import GradientCheckpointingLayer
 
 import modelopt.torch.opt as mto
@@ -65,7 +73,8 @@ from modelopt.torch.speculative.plugins.master_weight_adamw import (
     MasterWeightAdamW,
     VerifyMasterWeightsCallback,
 )
-from modelopt.torch.speculative.utils import AcceptanceRateValidation
+from modelopt.torch.speculative.plugins.modeling_fakebase import FakeBaseModel
+from modelopt.torch.speculative.utils import AcceptanceRateValidation, load_vlm_or_llm
 from modelopt.torch.utils.plugins.transformers_dataset import LanguageDataCollator
 
 BLOCK_SIZE = 4
@@ -1623,9 +1632,14 @@ class TestTeacherLogits:
     """
 
     @staticmethod
-    def _model():
+    def _model(softcap=None):
+        """A converted tiny model; ``softcap`` sets the base's cap and turns the switch on."""
         model = get_tiny_llama(num_hidden_layers=4)
-        mtsp.convert(model, [("dflash", get_dflash_config())])
+        config = get_dflash_config()
+        if softcap is not None:
+            model.config.final_logit_softcapping = softcap
+            config["dflash_teacher_softcap"] = True
+        mtsp.convert(model, [("dflash", config)])
         return model
 
     @staticmethod
@@ -1668,8 +1682,28 @@ class TestTeacherLogits:
             model._teacher_logits(outputs, labels, token_ids), rows.gather(-1, token_ids)
         )
 
-    def test_handed_over_logits_are_gathered_not_recomputed(self):
-        model = self._model()
+    @pytest.mark.parametrize("narrow", [False, True], ids=["full", "token_ids"])
+    def test_softcap_caps_the_projected_teacher(self, narrow):
+        cap = 0.5
+        model = self._model(softcap=cap).float()
+        hidden = 10 * self._hidden(model)
+        labels = self._labels()
+        rows = self._rows(model._base_model_lm_head(hidden), labels - 1)
+        assert rows.abs().max() > cap, "fixture does not reach the cap"
+        want = cap * torch.tanh(rows / cap)
+        token_ids = None
+        if narrow:
+            token_ids = torch.randint(0, model.config.vocab_size, (*labels.shape, 5))
+            want = want.gather(-1, token_ids)
+        got = model._teacher_logits(
+            DFlashBaseModelOutput(None, base_hidden=hidden), labels, token_ids
+        )
+        torch.testing.assert_close(got, want)
+
+    @pytest.mark.parametrize("softcap", [None, 0.5], ids=["uncapped", "capped"])
+    def test_handed_over_logits_are_gathered_not_recomputed(self, softcap):
+        """Handed-over logits are the model's own: gathered as they are, never capped again."""
+        model = self._model(softcap)
         logits = torch.randn(2, SEQ_LEN, model.config.vocab_size)
         outputs = DFlashBaseModelOutput(None, logits=logits)
         labels = self._labels()
@@ -1763,12 +1797,19 @@ class TestTeacherLogits:
 _VISION_START, _IMAGE = 28, 30
 
 
-def _tiny_vlm(arch=None):
-    """A tiny Qwen3-VL converted online, in fp32; ``arch`` updates the draft's architecture."""
+def _tiny_vlm(arch=None, softcap=None):
+    """A tiny Qwen3-VL converted online, in fp32; ``arch`` updates the draft's architecture.
+
+    ``softcap`` names a cap in its text config, which Qwen3-VL's own forward never applies, and
+    turns ``dflash_teacher_softcap`` on.
+    """
     model = get_tiny_qwen3vl(num_hidden_layers=4)
     model.config.vision_start_token_id, model.config.image_token_id = _VISION_START, _IMAGE
     config = get_dflash_config()
     config["dflash_architecture_config"].update(arch or {})
+    if softcap is not None:
+        model.config.text_config.final_logit_softcapping = softcap
+        config["dflash_teacher_softcap"] = True
     mtsp.convert(model, [("dflash", config)])
     return model.float()
 
@@ -1896,6 +1937,18 @@ class TestMultimodalTeacher:
         text = model._online_base_outputs(batch["input_ids"], batch["attention_mask"]).base_hidden
         torch.testing.assert_close(image[:, :4], text[:, :4])
 
+    def test_softcap_caps_the_image_batch_teacher(self):
+        cap = 0.1
+        model = _tiny_vlm(softcap=cap)
+        batch = _image_batch()
+        outputs = model._online_base_outputs(**batch)
+        labels = self._labels()
+        rows = self._own_rows(model, batch, labels - 1)
+        assert rows.abs().max() > cap, "fixture does not reach the cap"
+        torch.testing.assert_close(
+            model._teacher_logits(outputs, labels), cap * torch.tanh(rows / cap)
+        )
+
     @pytest.mark.parametrize(
         "arch",
         [
@@ -1980,3 +2033,112 @@ class TestMultimodalTeacher:
         with pytest.raises(RuntimeError, match="once over the whole sequence"):
             model._online_base_outputs(**batch)
         assert base._forward_hooks == hooks
+
+
+class TestTeacherSoftcapAtConvert:
+    """``dflash_teacher_softcap`` alone decides the cap, checked against the base at build time."""
+
+    @staticmethod
+    def _base(multimodal=True, cap=30.0):
+        """A tiny base capping its logits at ``cap``; a nested text config marks a multimodal one."""
+        model = get_tiny_llama(num_hidden_layers=4)
+        model.config.num_orig_hidden_layers = 4
+        text_config = model.config
+        if multimodal:
+            text_config = model.config.text_config = copy.deepcopy(model.config)
+        text_config.final_logit_softcapping = cap
+        return model
+
+    def test_a_base_without_a_cap_is_rejected(self):
+        config = get_dflash_config()
+        config["dflash_teacher_softcap"] = True
+        with pytest.raises(ValueError, match="final_logit_softcapping"):
+            mtsp.convert(get_tiny_llama(num_hidden_layers=4), [("dflash", config)])
+
+    @pytest.mark.parametrize("switch", [False, True], ids=["switch-off", "switch-on"])
+    @pytest.mark.parametrize("multimodal", [False, True], ids=["text-only", "multimodal"])
+    def test_a_capping_base_converts_with_the_cap_the_switch_sets(self, multimodal, switch):
+        """Online, with KD reading the teacher: a multimodal base gets the same rule."""
+        model = self._base(multimodal)
+        config = get_dflash_config()
+        config["dflash_teacher_softcap"] = switch
+        mtsp.convert(model, [("dflash", config)])
+        assert model.dflash_self_logit_distillation
+        assert model._teacher_softcap == (30.0 if switch else None)
+
+    @pytest.mark.parametrize(
+        ("saved", "cap"),
+        [(True, 30.0), (False, None), (None, None)],
+        ids=["on", "off", "saved-before-the-switch"],
+    )
+    def test_restore_reads_the_switch_from_the_saved_config(self, saved, cap):
+        """A checkpoint saved before the switch existed restores with it off."""
+        model = self._base()
+        config = get_dflash_config()
+        config["dflash_teacher_softcap"] = bool(saved)
+        mtsp.convert(model, [("dflash", config)])
+        state = mto.modelopt_state(model)
+        if saved is None:
+            del state["modelopt_state_dict"][0][1]["config"]["dflash_teacher_softcap"]
+        restored = mto.restore_from_modelopt_state(self._base(), state)
+        assert restored._teacher_softcap == cap
+
+
+class TestLogitScalingWarning:
+    """Conversion names the logit scaling that the teacher, lm_head's raw projection, leaves out.
+
+    Once, on rank 0, and only when a loss term reads the teacher.
+    """
+
+    @staticmethod
+    def _granite(logits_scaling):
+        """A tiny Granite, whose CausalLM divides its logits by ``logits_scaling``."""
+        config = GraniteConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            logits_scaling=logits_scaling,
+        )
+        return GraniteForCausalLM(config)
+
+    @staticmethod
+    def _warnings(model, kd=True, offline=None):
+        config = get_dflash_config(offline=offline)
+        config["dflash_self_logit_distillation"] = kd
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mtsp.convert(model, [("dflash", config)])
+        return [str(w.message) for w in caught if "teacher does not apply" in str(w.message)]
+
+    def test_a_scaling_base_warns_once(self):
+        (message,) = self._warnings(self._granite(8.0))
+        assert "logits_scaling=8.0" in message
+
+    def test_an_offline_fake_base_warns_too(self, tmp_path):
+        """Offline VLMs always train on a fake base, which carries the scaling fields over."""
+        self._granite(8.0).save_pretrained(tmp_path)
+        model = load_vlm_or_llm(str(tmp_path), use_fake_base=True, use_offline_training=True)
+        assert isinstance(model, FakeBaseModel)
+        (message,) = self._warnings(model, offline=True)
+        assert "logits_scaling=8.0" in message
+
+    @pytest.mark.parametrize(
+        ("base", "kd"),
+        [("llama", True), ("granite-unscaled", True), ("granite", False)],
+        ids=["llama", "identity-scaling", "teacher-unread"],
+    )
+    def test_no_warning_otherwise(self, base, kd):
+        model = {
+            "llama": lambda: get_tiny_llama(num_hidden_layers=4),
+            "granite-unscaled": lambda: self._granite(1.0),
+            "granite": lambda: self._granite(8.0),
+        }[base]()
+        assert not self._warnings(model, kd)
+
+    def test_only_rank_0_warns(self, monkeypatch):
+        monkeypatch.setattr("modelopt.torch.utils.distributed.is_master", lambda group=None: False)
+        assert not self._warnings(self._granite(8.0))
