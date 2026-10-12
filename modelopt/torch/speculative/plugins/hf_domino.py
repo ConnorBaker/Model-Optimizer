@@ -67,7 +67,6 @@ from transformers.trainer_callback import TrainerCallback
 from ..dflash.conversion import DominoDMRegistry
 from .dflash_losses import DraftLogits, LossOutput, _block_tokens, objective_loss, objective_term
 from .hf_dflash import HFDFlashModel
-from .modeling_dflash import DFlashBaseModelOutput
 from .modeling_domino import DominoModule
 
 logger = logging.getLogger(__name__)
@@ -142,16 +141,6 @@ class HFDominoModel(HFDFlashModel):
     def _position_weighting(self):
         # dflash_loss_objective is not wired for Domino yet: it always decays.
         return "decay"
-
-    def _online_base_outputs(self, input_ids, attention_mask, **kwargs):
-        """The target hidden states; Domino does not use target-logit KD."""
-        with torch.no_grad():
-            base_out = self._base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-            )
-        return DFlashBaseModelOutput(target_hidden=self._target_hidden(base_out.hidden_states))
 
     def _draft_logits(self, batch):
         """The backbone's logits with the GRU causal correction added to each block's suffix."""

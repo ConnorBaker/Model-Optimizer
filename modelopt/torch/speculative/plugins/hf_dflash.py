@@ -120,6 +120,8 @@ _MULTIMODAL_FORWARD_KWARGS = frozenset(
         "pixel_values_videos",
         "image_grid_thw",
         "video_grid_thw",
+        "image_position_ids",
+        "video_position_ids",
         "mm_token_type_ids",
         "image_sizes",
         "images",
@@ -853,13 +855,32 @@ class HFDFlashModel(DFlashModel):
         cache_position=None,
         **kwargs,
     ):
-        """Run the frozen base model: the target hidden states, and its logits for KD."""
-        # Multimodal models need the top-level conditional-generation forward so their
-        # image/video features are inserted before the language model runs.  Keep the
-        # long-standing narrow call for text-only models.
+        """Run the frozen base model: the target hidden states, and its final hidden state.
+
+        The final hidden state is the inner model's output for every batch, and
+        ``_teacher_logits`` projects it only at the rows the loss reads. A text batch runs the
+        inner model once. A multimodal batch needs the top-level forward to insert its
+        image/video features, and a hook on the inner model reads its output during it.
+        """
         base_forward_kwargs = _multimodal_forward_kwargs(kwargs)
-        with torch.no_grad():
-            if base_forward_kwargs:
+        if not base_forward_kwargs:
+            with torch.no_grad():
+                base_out = self._base_model(
+                    input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True
+                )
+            return DFlashBaseModelOutput(
+                target_hidden=self._target_hidden(base_out.hidden_states),
+                base_hidden=base_out.last_hidden_state,
+            )
+
+        # Read where a text batch reads it, not at lm_head's input, which a CausalLM may rescale
+        # first (Inkling divides it by a multiplier).
+        base_hidden = []
+        hook = self._base_model.register_forward_hook(
+            lambda _module, _args, output: base_hidden.append(output[0])
+        )
+        try:
+            with torch.no_grad():
                 raw_outputs = super().forward(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -873,20 +894,22 @@ class HFDFlashModel(DFlashModel):
                     return_dict=True,
                     **base_forward_kwargs,
                 )
-            else:
-                raw_outputs = super().forward(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                )
-
+        finally:
+            hook.remove()
         if not getattr(raw_outputs, "hidden_states", None):
             raise RuntimeError(
                 "The base model did not return hidden states required for DFlash training. "
                 "Ensure its top-level multimodal forward supports output_hidden_states=True."
             )
+        if len(base_hidden) != 1 or base_hidden[0].shape[:2] != input_ids.shape:
+            raise RuntimeError(
+                "The teacher reads the base model's final hidden state off its inner model, so the "
+                "multimodal forward must run that once over the whole sequence; it ran it on "
+                f"{[tuple(h.shape) for h in base_hidden]} for input_ids {tuple(input_ids.shape)}."
+            )
         return DFlashBaseModelOutput(
-            target_hidden=self._target_hidden(raw_outputs.hidden_states), logits=raw_outputs.logits
+            target_hidden=self._target_hidden(raw_outputs.hidden_states),
+            base_hidden=base_hidden[0],
         )
 
     def _draft_logits(self, batch):
@@ -974,8 +997,8 @@ class HFDFlashModel(DFlashModel):
         - Label alignment: position k predicts the token at anchor + k + ``_label_shift``
         - Position weighting by D-PACE or exponential decay
 
-        A variant changes the step only through its hooks: ``_online_base_outputs``,
-        ``_draft_logits`` (its head), ``_position_weighting`` and ``_compute_loss``.
+        A variant changes the step only through its hooks: ``_draft_logits`` (its head),
+        ``_position_weighting`` and ``_compute_loss``.
         """
         if not self.training:
             if self.dflash_offline:
