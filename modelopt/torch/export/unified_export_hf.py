@@ -81,7 +81,7 @@ from modelopt.torch.quantization.utils import (
 from modelopt.torch.quantization.utils.core_utils import has_accelerate_offload
 from modelopt.torch.utils import print_rank_0
 from modelopt.torch.utils.dataset_utils import _disable_use_cache
-from modelopt.torch.utils.distributed import is_fsdp2_model
+from modelopt.torch.utils.distributed import get_active_mo_session, is_fsdp2_model
 from modelopt.torch.utils.perf import maybe_clear_cuda_cache
 
 try:
@@ -129,6 +129,7 @@ from .quant_utils import (
     maybe_transpose_expert_weight_dimensions,
     postprocess_state_dict,
     preprocess_linear_fusion,
+    recorded_source_fact,
     sync_tied_input_amax,
     to_quantized_weight,
 )
@@ -1646,14 +1647,13 @@ def _revert_quant_config_names_best_effort(
 def _source_checkpoint(model: nn.Module) -> str | None:
     """Where the model's original checkpoint lives, or ``None`` if nothing is known.
 
-    Prefers ``_modelopt_source_checkpoint`` (recorded at load time by
-    ``record_unplaced_source_keys``). A model that reached export without going through that path
-    still knows its own provenance via ``config._name_or_path``, and the several places this is
-    asked must agree on the answer -- otherwise, for instance, a weight is carried but its off-index
-    tensors never reach ``exclude_modules`` because the two halves disagreed about where the
-    checkpoint was.
+    Prefers the checkpoint recorded at load time (:func:`recorded_source_fact`). A model that
+    reached export without going through that path still knows its own provenance via
+    ``config._name_or_path``, and the several places this is asked must agree on the answer --
+    otherwise, for instance, a weight is carried but its off-index tensors never reach
+    ``exclude_modules`` because the two halves disagreed about where the checkpoint was.
     """
-    return getattr(model, "_modelopt_source_checkpoint", None) or getattr(
+    return recorded_source_fact(model, "source_checkpoint") or getattr(
         getattr(model, "config", None), "_name_or_path", None
     )
 
@@ -1725,8 +1725,9 @@ def unplaced_keys_for(model: nn.Module, ckpt: "str | Path") -> list[str]:
     scope. Where those are absent an unrecorded model carries nothing, with a warning; a recorded
     one needs neither.
     """
-    if hasattr(model, "_modelopt_unplaced_source_keys"):
-        return list(model._modelopt_unplaced_source_keys)
+    recorded = recorded_source_fact(model, "unplaced_source_keys")
+    if recorded is not None:
+        return list(recorded)
     try:
         from modelopt.torch.utils.plugins.model_load_utils import record_unplaced_source_keys
 
@@ -1772,7 +1773,7 @@ def read_unplaced_weights(model: nn.Module, *, keys_only: bool = False) -> dict[
         # when nothing was recorded, because there is no reason to think anything is missing. But
         # if the loader DID record unplaced keys, they are about to be dropped, and dropping them
         # silently is the failure this whole path exists to prevent.
-        recorded = getattr(model, "_modelopt_unplaced_source_keys", None) or []
+        recorded = recorded_source_fact(model, "unplaced_source_keys") or []
         if recorded:
             warnings.warn(
                 f"Could not copy {len(recorded)} unplaced source weight(s) into the export: "
@@ -1846,7 +1847,8 @@ def export_hf_checkpoint(
 
     Under ``torch.distributed`` (e.g. FSDP2), all ranks participate in the
     collective state-dict gather inside ``_export_transformers_checkpoint``;
-    only rank 0 writes files. A final barrier syncs the other ranks.
+    only rank 0 writes files. A final barrier syncs the other ranks; in a distributed
+    ``ModelOptSession`` every rank raises if any rank's export failed.
 
     Args:
         model: The full torch model to export. The actual quantized model may be a submodule.
@@ -1889,6 +1891,9 @@ def export_hf_checkpoint(
     # that, and because only this point knows what was actually written rather than what was
     # merely unplaced.
     model._modelopt_carried_over_names = sorted({*_carried, *off_index_tensor_names(model)})
+    record = get_active_mo_session(required=False).record_for(model)
+    if record is not None:
+        record.carried_over_names = model._modelopt_carried_over_names
 
     from .layerwise_export import LAYERWISE_EXPORTER_ATTR
 
@@ -1931,6 +1936,7 @@ def export_hf_checkpoint(
     # buffer instead of the whole quantized state dict.
     _offloaded = has_accelerate_offload(model)
 
+    error: Exception | None = None
     try:
         if _offloaded:
             # Imported here rather than at module scope: the streaming exporter imports the
@@ -2047,6 +2053,7 @@ def export_hf_checkpoint(
                 _copy_non_model_files_from_source(model, export_dir)
 
     except Exception as e:
+        error = e
         warnings.warn(
             "Cannot export model to the model_config. The modelopt-optimized model state_dict"
             " can be saved with torch.save for further inspection."
@@ -2054,4 +2061,25 @@ def export_hf_checkpoint(
         raise e
     finally:
         if is_fsdp2_sharded:
-            torch.distributed.barrier()
+            _finish_export_together(error)
+
+
+def _finish_export_together(error: Exception | None) -> None:
+    """Wait for every rank to finish writing; in a session, raise on all of them if any failed.
+
+    A barrier alone lets the ranks whose writes succeeded return, and the run carries on as if the
+    checkpoint were whole while another rank's export raised. A distributed
+    :class:`~modelopt.torch.utils.distributed.ModelOptSession` collects every rank's outcome instead
+    (``export_ok``), and every rank raises with the failing rank's error.
+    """
+    session = get_active_mo_session(required=False)
+    if not (session.initialized and session.distributed):
+        torch.distributed.barrier()
+        return
+
+    def exported() -> bool:
+        if error is not None:
+            raise error
+        return True
+
+    session.decide("export_ok", exported)

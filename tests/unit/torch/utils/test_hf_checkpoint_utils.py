@@ -976,3 +976,48 @@ def test_ensure_local_checkpoint_downloads_once_per_group(tmp_path, fail, group_
     job = partial(_ensure_local_checkpoint_job, tmp_path, fail, group_ranks)
     spawn_multiprocess_job(2, job, backend="gloo")
     assert [p.name for p in tmp_path.glob("downloaded-by-*")] == [f"downloaded-by-{downloader}"]
+
+
+def _ensure_local_checkpoint_in_session_job(tmp_path, rank, size):
+    from modelopt.torch.utils.distributed import get_active_mo_session
+
+    utils = hf_checkpoint_utils
+    snapshot = tmp_path / "snapshot"
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        with open(tmp_path / f"downloads-by-rank{rank}", "a") as downloads:
+            downloads.write(f"{repo_id}\n")
+        snapshot.mkdir(exist_ok=True)
+        return str(snapshot)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("a checkpoint the session resolved was resolved again")
+
+    utils.snapshot_download = fake_snapshot_download
+    utils.HfApi = _FakeHfApi
+    os.environ.pop("HF_HUB_OFFLINE", None)  # inherited from tests/unit/conftest.py
+    session = get_active_mo_session(required=False)
+    session.initialize(
+        distributed=True,
+        rank=rank,
+        world_size=size,
+        local_rank=rank,
+        device=torch.device("cpu"),
+        is_main=rank == 0,
+    )
+    try:
+        assert utils.ensure_local_checkpoint("org/model") == ("org/model", str(snapshot))
+        dist.broadcast_object_list = dist.all_gather_object = dist.new_group = fail
+        assert utils.ensure_local_checkpoint("org/model") == ("org/model", str(snapshot))
+        assert session.checkpoints == {"org/model": ("org/model", str(snapshot))}
+    finally:
+        session._reset()
+
+
+def test_a_session_resolves_each_checkpoint_once_per_run(tmp_path):
+    """The caller and the loaders each ask for the checkpoint; rank 0 resolves it on the first ask,
+    and every later one is answered from the session without communicating."""
+    job = partial(_ensure_local_checkpoint_in_session_job, tmp_path)
+    spawn_multiprocess_job(2, job, backend="gloo")
+    assert [p.name for p in tmp_path.glob("downloads-by-*")] == ["downloads-by-rank0"]
+    assert (tmp_path / "downloads-by-rank0").read_text() == "org/model\n"

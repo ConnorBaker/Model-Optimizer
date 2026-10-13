@@ -17,6 +17,7 @@
 
 import copy
 import functools
+import importlib.metadata
 import inspect
 import io
 import os
@@ -38,6 +39,7 @@ __all__ = [
     "DistributedProcessGroup",
     "DistributionPlan",
     "ModelOptSession",
+    "ModelRecord",
     "ParallelState",
     "Synced",
     "backend",
@@ -368,6 +370,40 @@ class _SyncedHolder:
         return name
 
 
+class ModelRecord(_SyncedHolder):
+    """One model of the run, held on its :class:`ModelOptSession` under a role, ``"target"`` say.
+
+    ``model`` is this rank's own instance, never communicated: each rank holds its own, or its shard of
+    the weights. Every other fact is the same on every rank: the synced facts are kept so, as the
+    session's are, and the others are derived from values that already are. The loaders and the export
+    also record these facts on the model itself, as ``_modelopt_<fact>``, which is all a model loaded
+    outside a session has.
+    """
+
+    #: The checkpoint tensors the model has no parameter for, which the export carries over
+    #: unchanged. Decided once, by rank 0, when the model is loaded.
+    unplaced_source_keys: Synced[list[str]]
+
+    def __init__(
+        self, session: "ModelOptSession", role: str, model, source_checkpoint: str | None = None
+    ) -> None:
+        """Hold ``model`` for ``session`` as its ``role`` model, loaded from ``source_checkpoint``."""
+        self._session = session
+        self._synced: dict[str, Any] = {}
+        self.role = role
+        self.model = model
+        #: The local checkpoint directory the model was loaded from.
+        self.source_checkpoint = source_checkpoint
+        #: The tensors the export wrote straight from the source checkpoint, recorded by the export.
+        self.carried_over_names: list[str] | None = None
+
+    def _sync_session(self) -> "ModelOptSession":
+        return self._session
+
+    def _label(self, name: str) -> str:
+        return f"models[{self.role!r}].{name}"
+
+
 class ModelOptSession(_SyncedHolder):
     """The live distributed session of a PTQ run: this process's identity, plus the model's EP mesh.
 
@@ -381,7 +417,8 @@ class ModelOptSession(_SyncedHolder):
     * ``ep_mesh`` -- the expert-parallel device mesh of the loaded model, set by ``load_and_prepare_ep``
       (``None`` until then, and for a model loaded without expert parallelism).
 
-    Facts annotated :class:`Synced`, such as ``plan``, hold the same value on every rank.
+    Facts annotated :class:`Synced`, such as ``plan``, hold the same value on every rank. The models
+    of the run are held in ``models``, a :class:`ModelRecord` each, by role.
     """
 
     #: The :class:`DistributionPlan` of the model this session runs, the same on every rank.
@@ -391,6 +428,7 @@ class ModelOptSession(_SyncedHolder):
         """Create an empty (uninitialized) session; populate identity with :meth:`initialize`."""
         self._values: dict[str, Any] | None = None
         self._synced: dict[str, Any] = {}
+        self.models: dict[str, ModelRecord] = {}
         self.ep_mesh = None
 
     def initialize(
@@ -416,7 +454,31 @@ class ModelOptSession(_SyncedHolder):
     def _reset(self) -> None:
         self._values = None
         self._synced = {}
+        self.models = {}
         self.ep_mesh = None
+
+    @property
+    def model(self):
+        """This rank's instance of the run's ``"target"`` model, or ``None`` before one is held."""
+        record = self.models.get("target")
+        return None if record is None else record.model
+
+    def register_model(
+        self, model, role: str = "target", source_checkpoint: str | None = None
+    ) -> ModelRecord:
+        """Hold ``model`` as the run's ``role`` model, loaded from ``source_checkpoint``.
+
+        Returns its :class:`ModelRecord`. The loaders register what they load as the target model. The
+        session keeps it alive until it resets or another model takes the role, so release a model no
+        longer needed with ``session.models.pop(role)``.
+        """
+        record = ModelRecord(self, role, model, source_checkpoint)
+        self.models[role] = record
+        return record
+
+    def record_for(self, model) -> ModelRecord | None:
+        """The record holding ``model`` itself, or ``None``: a wrapper or a copy has none."""
+        return next((record for record in self.models.values() if record.model is model), None)
 
     def _sync_session(self) -> "ModelOptSession":
         return self
@@ -565,6 +627,23 @@ def get_active_mo_session(required: bool = True) -> ModelOptSession:
     return _active_mo_session
 
 
+def _environment() -> dict[str, Any]:
+    """The versions a run's ranks must share: Python, torch and its CUDA, and the libraries."""
+    import modelopt
+
+    versions: dict[str, Any] = {
+        "python": sys.version_info[:2],
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "modelopt": modelopt.__version__,
+    }
+    try:
+        versions["transformers"] = importlib.metadata.version("transformers")
+    except importlib.metadata.PackageNotFoundError:
+        versions["transformers"] = None
+    return versions
+
+
 @contextmanager
 def modelopt_session(timeout: timedelta | None = None, device=None):
     """Populate the active session for the block, then tear down.
@@ -574,6 +653,8 @@ def modelopt_session(timeout: timedelta | None = None, device=None):
     DESTROYS the group on exit even if the body raises. Single-process records the trivial single-rank
     topology -- with ``device`` as the device (the caller's default, e.g. the ``--device`` CLI value, since
     there is no local rank to derive one) -- and enter/exit are no-ops around the body.
+
+    Every rank must run the same library versions: entering raises on every rank when one differs.
 
     Yields the session (also reachable via :func:`get_active_mo_session`); it is reset on exit.
     """
@@ -598,6 +679,7 @@ def modelopt_session(timeout: timedelta | None = None, device=None):
             is_main=True,
         )
     try:
+        _active_mo_session.agree("environment", _environment)
         yield _active_mo_session
     finally:
         # If the body is unwinding due to an exception, PRINT it here BEFORE cleanup()'s collective

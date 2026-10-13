@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """Unit tests for the distributed PTQ session: the distribution plan, the session handle, its synced
-facts and one-off collectives, launch detection."""
+facts and one-off collectives, the models it holds, launch detection."""
 
 import pytest
 import torch.distributed
@@ -25,6 +25,7 @@ from modelopt.torch.utils.distributed import (
     Synced,
     get_active_mo_session,
     is_distributed_launch,
+    modelopt_session,
 )
 
 # --------------------------------------------------------------------------------- DistributionPlan
@@ -313,6 +314,76 @@ def test_reset_clears_synced_facts():
     session.plan.broadcast_from(lambda: DistributionPlan(world_size=1))
     session._reset()
     assert session.plan.value is None
+
+
+def test_entering_a_session_checks_every_rank_runs_the_same_versions(monkeypatch):
+    """Ranks running different versions can disagree inside a collective and hang instead of failing."""
+    agreed = []
+
+    def agree(self, label, value_fn, combine=None):
+        agreed.append((label, value_fn(), combine))
+
+    monkeypatch.setattr(ModelOptSession, "agree", agree)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    with modelopt_session():
+        pass
+
+    ((label, versions, combine),) = agreed
+    assert (label, combine) == ("environment", None), "every rank must pass the same versions"
+    assert versions["torch"] == torch.__version__
+    assert set(versions) == {"python", "torch", "cuda", "modelopt", "transformers"}
+
+
+# ------------------------------------------------------------------------------------- model records
+
+
+def test_the_session_holds_this_ranks_model_by_role():
+    session, model = _session(), torch.nn.Linear(2, 2)
+
+    record = session.register_model(model, source_checkpoint="/ckpt")
+
+    assert session.model is model
+    assert session.models == {"target": record}
+    assert (record.role, record.source_checkpoint) == ("target", "/ckpt")
+    assert session.record_for(model) is record
+    assert session.record_for(torch.nn.Linear(2, 2)) is None, "found by identity, not equality"
+
+
+def test_registering_a_role_again_replaces_only_its_record():
+    session, model = _session(), torch.nn.Linear(2, 2)
+    session.register_model(torch.nn.Linear(2, 2))
+    teacher = session.register_model(torch.nn.Linear(2, 2), role="teacher")
+
+    session.register_model(model)
+
+    assert session.model is model
+    assert session.models["teacher"] is teacher
+
+
+def test_a_records_synced_fact_is_decided_on_rank0(monkeypatch):
+    """Every rank holds rank 0's list instead of scanning the checkpoint for its own."""
+    _as_rank(monkeypatch, 1, decided=("models['target'].unplaced_source_keys", ["mtp.w"], None))
+    record = _session(rank=1).register_model(torch.nn.Linear(2, 2))
+
+    keys = record.unplaced_source_keys.decide(lambda: pytest.fail("a non-zero rank scanned"))
+
+    assert keys == record.unplaced_source_keys.value == ["mtp.w"]
+
+
+def test_records_decided_out_of_step_fail(monkeypatch):
+    """Rank 0 deciding the target's keys while rank 1 decides a draft model's would cross the two."""
+    _as_rank(monkeypatch, 1, decided=("models['target'].unplaced_source_keys", [], None))
+    record = _session(rank=1).register_model(torch.nn.Linear(2, 2), role="draft")
+    with pytest.raises(RuntimeError, match="out of step"):
+        record.unplaced_source_keys.decide(list)
+
+
+def test_reset_releases_the_models():
+    session = _session()
+    session.register_model(torch.nn.Linear(2, 2))
+    session._reset()
+    assert session.models == {}
+    assert session.model is None
 
 
 # ------------------------------------------------------------------------------------ launch detect

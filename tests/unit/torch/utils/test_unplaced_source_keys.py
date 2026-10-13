@@ -32,6 +32,8 @@ pytest.importorskip("transformers")
 
 from transformers import LlamaConfig, LlamaForCausalLM
 
+from modelopt.torch.utils.distributed import get_active_mo_session
+from modelopt.torch.utils.plugins import model_load_utils
 from modelopt.torch.utils.plugins.model_load_utils import load_pretrained
 
 # A layer past ``num_hidden_layers``: genuinely stray, so it must always be recorded.
@@ -80,6 +82,55 @@ def test_records_the_stray_tensors_and_the_checkpoint(tmp_path):
     assert model._modelopt_unplaced_source_keys == sorted(extra), "sorted, for a stable export"
     assert model._modelopt_source_checkpoint == str(tmp_path)
     assert model.dtype == torch.bfloat16, "from_pretrained kwargs must pass through"
+
+
+@pytest.fixture
+def session():
+    """The active session, entered as rank 0 of a single process."""
+    active = get_active_mo_session(required=False)
+    active.initialize(
+        distributed=False, rank=0, world_size=1, local_rank=0, device=None, is_main=True
+    )
+    yield active
+    active._reset()
+
+
+def test_a_session_holds_the_loaded_model_and_its_facts(tmp_path, session):
+    config = _tiny_llama_config()
+    _save(
+        tmp_path, config, {**LlamaForCausalLM(config).state_dict(), "mtp.fc.weight": torch.ones(2)}
+    )
+
+    model = _load(tmp_path)
+
+    record = session.record_for(model)
+    assert session.model is model
+    assert record.source_checkpoint == str(tmp_path)
+    assert record.unplaced_source_keys == model._modelopt_unplaced_source_keys == ["mtp.fc.weight"]
+
+
+def test_rank0_alone_works_out_the_unplaced_keys(tmp_path, session, monkeypatch):
+    """Every rank loads the model, but the checkpoint is scanned once, and all hold rank 0's list."""
+    config = _tiny_llama_config()
+    _save(tmp_path, config, LlamaForCausalLM(config).state_dict())
+    session.initialize(
+        distributed=True, rank=1, world_size=2, local_rank=1, device=None, is_main=False
+    )
+    rank0_keys = ["mtp.fc.weight"]
+
+    def broadcast_object_list(message, group=None, group_src=None):
+        message[0] = ("models['target'].unplaced_source_keys", rank0_keys, None)
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", broadcast_object_list)
+    monkeypatch.setattr(
+        model_load_utils, "unplaced_source_keys", lambda *a: pytest.fail("rank 1 scanned")
+    )
+
+    model = load_pretrained(str(tmp_path))
+
+    assert session.record_for(model).unplaced_source_keys == rank0_keys
+    assert model._modelopt_unplaced_source_keys == rank0_keys
 
 
 def test_records_an_empty_list_when_every_tensor_was_placed(tmp_path):

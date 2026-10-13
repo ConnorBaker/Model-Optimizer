@@ -17,10 +17,12 @@
 
 import importlib.util
 import json
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
+from _test_utils.torch.distributed.utils import spawn_multiprocess_job
 from _test_utils.torch.quantization.tied_modules import (
     make_tied_linear_pair,
     wrap_in_parent_with_tied_keys,
@@ -1008,3 +1010,76 @@ def test_an_unrecorded_model_derives_its_unplaced_keys_once(tmp_path, monkeypatc
         assert torch.equal(carried[mtp], torch.full((2,), 5.0))
     assert derived_from == [str(tmp_path)], "derived once, then read back"
     assert model._modelopt_unplaced_source_keys == [mtp]
+
+
+def _hold_in_session():
+    """The active session, entered as rank 0 of a single process."""
+    from modelopt.torch.utils.distributed import get_active_mo_session
+
+    session = get_active_mo_session(required=False)
+    session.initialize(
+        distributed=False, rank=0, world_size=1, local_rank=0, device=None, is_main=True
+    )
+    return session
+
+
+def test_a_model_held_by_the_session_is_answered_from_its_record(tmp_path):
+    """The session's record is where a session-loaded model's facts live; the model's own copy is
+    only for a model loaded without one."""
+    from modelopt.torch.export.quant_utils import recorded_source_fact
+
+    model = _ProvenanceModel(keys=["model.stale.weight"], ckpt="/elsewhere")
+    session = _hold_in_session()
+    try:
+        record = session.register_model(model, source_checkpoint=str(tmp_path))
+        record.unplaced_source_keys = ["model.mtp.eh_proj.weight"]
+
+        assert recorded_source_fact(model, "unplaced_source_keys") == ["model.mtp.eh_proj.weight"]
+        assert recorded_source_fact(model, "source_checkpoint") == str(tmp_path)
+        unheld = _ProvenanceModel(keys=["model.stale.weight"])
+        assert recorded_source_fact(unheld, "unplaced_source_keys") == ["model.stale.weight"]
+    finally:
+        session._reset()
+    assert recorded_source_fact(model, "unplaced_source_keys") == ["model.stale.weight"]
+
+
+def _finish_export_job(failing_rank, rank, size):
+    from modelopt.torch.export.unified_export_hf import _finish_export_together
+    from modelopt.torch.utils.distributed import get_active_mo_session
+
+    session = get_active_mo_session(required=False)
+    session.initialize(
+        distributed=True,
+        rank=rank,
+        world_size=size,
+        local_rank=rank,
+        device=torch.device("cpu"),
+        is_main=rank == 0,
+    )
+    try:
+        if failing_rank is None:
+            _finish_export_together(None)
+            assert session.export_ok is True
+        elif rank == failing_rank:
+            with pytest.raises(OSError, match="disk full"):
+                _finish_export_together(OSError("disk full"))
+        else:
+            with pytest.raises(RuntimeError, match=rf"rank {failing_rank} failed.*disk full"):
+                _finish_export_together(None)
+    finally:
+        session._reset()
+
+
+@pytest.mark.parametrize("failing_rank", [None, 0, 1])
+def test_every_rank_fails_an_export_that_any_rank_failed(failing_rank):
+    """A barrier alone lets the ranks that wrote their shards carry on as if the export succeeded."""
+    spawn_multiprocess_job(2, partial(_finish_export_job, failing_rank), backend="gloo")
+
+
+def test_an_export_outside_a_session_ends_on_a_barrier(monkeypatch):
+    from modelopt.torch.export.unified_export_hf import _finish_export_together
+
+    calls = []
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: calls.append("barrier"))
+    _finish_export_together(None)
+    assert calls == ["barrier"]

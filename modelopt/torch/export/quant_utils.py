@@ -1681,6 +1681,20 @@ def seed_carried_over_exclusions(model: nn.Module, quant_config: dict) -> list[s
     return added
 
 
+def recorded_source_fact(model: nn.Module, fact: str) -> Any:
+    """What the load or the export recorded about ``model`` and its source checkpoint, or ``None``.
+
+    ``fact`` is ``"source_checkpoint"``, ``"unplaced_source_keys"`` or ``"carried_over_names"``. In
+    a :class:`~modelopt.torch.utils.distributed.ModelOptSession` the model's record holds it, the
+    same on every rank; otherwise the model itself does, as ``_modelopt_<fact>``.
+    """
+    from modelopt.torch.utils.distributed import get_active_mo_session
+
+    record = get_active_mo_session(required=False).record_for(model)
+    value = None if record is None else getattr(record, fact)
+    return getattr(model, f"_modelopt_{fact}", None) if value is None else value
+
+
 def _get_carried_over_module_names(model: nn.Module) -> list[str]:
     """Return module names for checkpoint weights carried over without a module.
 
@@ -1695,23 +1709,24 @@ def _get_carried_over_module_names(model: nn.Module) -> list[str]:
     This is the same failure the MoE-router pass above exists to prevent -- only the reason the
     module is invisible differs (no quantizer there, no module at all here).
 
-    Prefers ``_modelopt_carried_over_names``, which the export records once it knows what it
-    actually wrote -- carried tensors plus the off-index weight files copied verbatim. Those files
-    are never among the unplaced source keys, so the unplaced list alone would miss GLM-4.7's
-    ``mtp.safetensors`` and leave its tensors in the export with nothing in ``exclude_modules``.
+    Prefers the carried-over names (:func:`recorded_source_fact`), which the export records once it
+    knows what it actually wrote -- carried tensors plus the off-index weight files copied verbatim.
+    Those files are never among the unplaced source keys, so the unplaced list alone would miss
+    GLM-4.7's ``mtp.safetensors`` and leave its tensors in the export with nothing in
+    ``exclude_modules``.
 
     A state-dict key is ``<module path>.<parameter name>``, so the owning module is the key with
     its last component removed. Keys without a dot are top-level tensors with no module and are
     skipped.
     """
-    keys = getattr(model, "_modelopt_carried_over_names", None)
+    keys = recorded_source_fact(model, "carried_over_names")
     if keys is None:
         # Export has not recorded yet (or this model never went through it). The recorded unplaced
         # list is the best available answer; it is wider than what gets written, so it can name a
         # module the export did not emit. That way round is harmless -- a deployment framework
         # ignores an exclusion it finds no weight for, but fails loading one it was never told
         # about.
-        keys = getattr(model, "_modelopt_unplaced_source_keys", None) or []
+        keys = recorded_source_fact(model, "unplaced_source_keys") or []
     return sorted({key.rsplit(".", 1)[0] for key in keys if "." in key})
 
 

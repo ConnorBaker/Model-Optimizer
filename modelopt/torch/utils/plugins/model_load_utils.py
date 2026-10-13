@@ -37,6 +37,7 @@ from modelopt.torch.utils.distributed import (
     barrier,
     broadcast_state_dict,
     fsdp2_wrap,
+    get_active_mo_session,
     is_initialized,
 )
 from modelopt.torch.utils.logging import print_rank_0
@@ -365,6 +366,26 @@ def record_unplaced_source_keys(
     return keys
 
 
+def _hold_on_session(
+    model: nn.Module, ckpt_path: str, keys: "Iterable[str] | None" = None
+) -> list[str]:
+    """Record the loaded ``model``'s unplaced keys, and hold it as the active session's target model.
+
+    In a session the record is the model's :class:`~modelopt.torch.utils.distributed.ModelRecord`,
+    and on a distributed run rank 0 alone works the keys out, for every rank to hold the same list.
+    The model keeps them too (:func:`record_unplaced_source_keys`), for code that has only the model.
+    Collective in a distributed session.
+    """
+    session = get_active_mo_session(required=False)
+    if session.initialized:
+        record = session.register_model(model, source_checkpoint=str(ckpt_path))
+        keys = record.decide(
+            "unplaced_source_keys",
+            lambda: sorted(unplaced_source_keys(model, ckpt_path) if keys is None else keys),
+        )
+    return record_unplaced_source_keys(model, ckpt_path, keys)
+
+
 def load_pretrained(
     ckpt_path: str,
     auto_class: Any = None,
@@ -385,6 +406,8 @@ def load_pretrained(
       when omitted.
     * The checkpoint tensors the model has no parameter for are recorded
       (:func:`record_unplaced_source_keys`), so the export carries them over unchanged.
+    * In a :class:`~modelopt.torch.utils.distributed.ModelOptSession` the model is held as the
+      session's target model (``session.model``), and rank 0 alone works out the unplaced keys.
     """
     # Importing modelopt.torch.models registers every model spec; only callers of this need them.
     from modelopt.torch.models.hf import prepare_model_for_loading
@@ -403,7 +426,7 @@ def load_pretrained(
         model_class=None if auto_class in (AutoModel, AutoModelForCausalLM) else auto_class,
     ):
         model = auto_class.from_pretrained(ckpt_path, **kwargs)
-    unplaced = record_unplaced_source_keys(model, ckpt_path)
+    unplaced = _hold_on_session(model, ckpt_path)
     if unplaced:
         print_rank_0(
             f"{len(unplaced)} checkpoint tensor(s) the model has no parameter for "
