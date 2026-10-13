@@ -19,6 +19,10 @@ harvesting requirements beyond the task YAML fragment.
   it unless you have a memory reason to.
 - **Parallelism:** set task-level `parallelism: 8` exactly. Use the same value
   for baseline and candidate.
+- **Problem set: set `dataset_split: test`.** nemo-skills' default split
+  `test_aai` is the 15 dev + 65 test problems (80); AA's current set, and the
+  NeMo Gym SciCode benchmark, is the 65 test problems. Without it, scores are not
+  comparable with Gym or with a 65-problem baseline.
 - **Repeats: separate runs, not `num_repeats: 8`.** Keep `num_repeats: 1` —
   in-run repeats multiply code-execution sandbox exposure — and submit the task
   8+ times instead. See [At least 8 runs](#at-least-8-runs-mandatory).
@@ -65,6 +69,7 @@ Use this inside the top-level `evaluation.tasks` list:
         parallelism: 8
         extra:
           args: ++prompt_config=eval/scicode/default ++with_background=true
+          dataset_split: test # 65 test problems; the default test_aai adds 15 dev problems
           num_repeats: 1 # keep at 1; submit this config 8x and average (see above)
 ```
 
