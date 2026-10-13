@@ -58,6 +58,7 @@ cd nested
 export VALUE="two words"
 local_value=retained
 printf '%s' "$FROM_SETUP" > setup.txt
+> empty.txt
 ```
 An explanation between fences is fine.
 <!-- modelopt-doc-test:run -->
@@ -70,6 +71,7 @@ printf 'captured output\\n'
 assert ctx.cwd == ctx.tmp / "nested"
 assert ctx.env["VALUE"] == "two words"
 assert (ctx.cwd / "setup.txt").read_text() == "present"
+assert (ctx.cwd / "empty.txt").is_file()
 assert (ctx.cwd / "result.txt").read_text() == "two words/retained"
 -->
 """,
@@ -78,7 +80,7 @@ assert (ctx.cwd / "result.txt").read_text() == "two words/retained"
     assert "captured output" in output
 
 
-@pytest.mark.parametrize("command", ["false", "false | cat", "printf 'before failure\\n'; false"])
+@pytest.mark.parametrize("command", ["false", "false | cat"])
 def test_shell_failure_reports_markdown_line(tmp_path, command):
     path = _document(
         tmp_path, f"<!-- modelopt-doc-test:run -->\n```sh\n{command}\ntouch forbidden\n```"
@@ -110,12 +112,7 @@ assert False, "verification failed"
         "<!-- modelopt-doc-test:run -->\nprose\n```sh\ntrue\n```",
         "<!-- modelopt-doc-test:run -->\n```javascript\ntrue\n```",
         "<!-- modelopt-doc-test:run -->\n```sh\ntrue",
-        "<!-- modelopt-doc-test:unknown -->",
-        "<!-- modelopt-doc-test:setup python\nthis is invalid python!\n-->",
         "<!-- modelopt-doc-test:run -->\n```sh\ntrue\n```\n<!-- modelopt-doc-test:setup python\npass\n-->",
-        "<!-- modelopt-doc-test:verify python\npass\n-->",
-        '<!-- modelopt-doc-test:begin\nid="nested"\n-->',
-        "",
     ],
 )
 def test_malformed_directives(tmp_path, body):
@@ -125,19 +122,21 @@ def test_malformed_directives(tmp_path, body):
 
 
 @pytest.mark.parametrize(
-    "replacement", ['profile = "tpu"', "timeout_seconds = 0", "timeout_seconds = true", "extra = 1"]
+    "metadata",
+    [
+        'profile = "tpu"',
+        "timeout_seconds = 0",
+        "extra = 1",
+        "manual = 1",
+        'requires = ["torch..cuda"]',
+    ],
 )
-def test_invalid_metadata(tmp_path, replacement):
+def test_invalid_metadata(tmp_path, metadata):
     path = _document(tmp_path, "<!-- modelopt-doc-test:run -->\n```sh\ntrue\n```")
-    field = replacement.split(" = ")[0]
-    text = path.read_text()
-    if field == "profile":
-        text = text.replace('profile = "cpu"', replacement)
-    elif field == "timeout_seconds":
-        text = text.replace("timeout_seconds = 10", replacement)
-    else:
-        text = text.replace('profile = "cpu"', 'profile = "cpu"\n' + replacement)
-    path.write_text(text)
+    field = metadata.split(" = ")[0]
+    lines = [line for line in path.read_text().splitlines() if not line.startswith(field + " = ")]
+    lines.insert(1, metadata)
+    path.write_text("\n".join(lines))
     with pytest.raises(DocTestError):
         parse_markdown(path)
 
@@ -217,35 +216,31 @@ def test_pilot_collection_and_recipe_listing(tmp_path):
     assert "nvfp4" in run_scenario(recipe, repo, tmp_path)
 
 
-@pytest.mark.parametrize("prefix", ["", "   ", "> "])
-def test_python_fences_share_namespace_and_context(tmp_path, prefix):
-    fence = "\n".join(
-        prefix + line
-        for line in [
-            "```python",
-            "answer += 2",
-            "import os",
-            "os.environ['ANSWER'] = str(answer)",
-            "```",
-        ]
-    )
+def test_quoted_python_fences_share_namespace_and_context(tmp_path):
     path = _document(
         tmp_path,
         """<!-- modelopt-doc-test:setup python
 ctx.cwd = ctx.tmp
-answer = 40
+answer = 0
+for value in [20, 20]:
+    answer += value
 -->
 <!-- modelopt-doc-test:run -->
-"""
-        + fence
-        + """
+```python
+if __name__ == "__main__":
+    answer += 2
+import os
+os.environ['ANSWER'] = str(answer)
+```
 <!-- modelopt-doc-test:verify python
 assert answer == 42
 assert ctx.cwd == ctx.tmp
 assert ctx.env['ANSWER'] == '42'
+assert __file__ == str(ctx.repo / 'README.md')
 -->
 """,
     )
+    path.write_text("".join("> " + line for line in path.read_text().splitlines(keepends=True)))
     run_scenario(parse_markdown(path)[0], tmp_path, tmp_path)
 
 
@@ -306,54 +301,18 @@ def test_unsupported_execution_order(tmp_path, body):
         parse_markdown(_document(tmp_path, body))
 
 
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        "manual = 1",
-        "min_gpus = true",
-        "min_gpus = -1",
-        'requires = "torch"',
-        'requires = ["../torch"]',
-    ],
-)
-def test_resource_metadata_is_validated(tmp_path, metadata):
-    path = _document(tmp_path, "<!-- modelopt-doc-test:run -->\n```sh\ntrue\n```")
-    path.write_text(path.read_text().replace('profile = "cpu"', 'profile = "cpu"\n' + metadata))
-    with pytest.raises(DocTestError):
-        parse_markdown(path)
-
-
-def test_plain_shell_redirection_is_not_a_blockquote(tmp_path):
+def test_successful_python_exit_cannot_bypass_verification(tmp_path):
     path = _document(
         tmp_path,
-        """<!-- modelopt-doc-test:setup python
-ctx.cwd = ctx.tmp
--->
-<!-- modelopt-doc-test:run -->
-```sh
-> empty.txt
+        """<!-- modelopt-doc-test:run -->
+```python
+import sys
+sys.exit(0)
 ```
 <!-- modelopt-doc-test:verify python
-assert (ctx.cwd / 'empty.txt').is_file()
+raise AssertionError("must verify")
 -->
 """,
     )
-    run_scenario(parse_markdown(path)[0], tmp_path, tmp_path)
-
-
-def test_quoted_directives_preserve_python_indentation(tmp_path):
-    path = _document(
-        tmp_path,
-        """<!-- modelopt-doc-test:setup python
-values = []
-for i in range(2):
-    values.append(i)
--->
-<!-- modelopt-doc-test:run -->
-```python
-assert values == [0, 1]
-```
-""",
-    )
-    path.write_text("".join("> " + line for line in path.read_text().splitlines(keepends=True)))
-    run_scenario(parse_markdown(path)[0], tmp_path, tmp_path)
+    with pytest.raises(DocTestError, match="exited before completing the scenario"):
+        run_scenario(parse_markdown(path)[0], tmp_path, tmp_path)

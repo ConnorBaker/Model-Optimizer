@@ -20,9 +20,19 @@ import shutil
 import subprocess
 from pathlib import Path
 
+__all__ = [
+    "prepare_bridge_full_scale",
+    "prepare_bridge_smoke",
+    "run_bridge_distill_prerequisite",
+    "verify_bridge_distilled",
+    "verify_bridge_hf_export",
+    "verify_bridge_pruned",
+    "verify_bridge_quantized",
+]
 
-def prepare_bridge(ctx):
-    """Keep command flags visible; reduce only inputs through documented variables."""
+
+def prepare_bridge_smoke(ctx):
+    """Prepare reduced Bridge inputs through documented variables, preserving command flags."""
     from _test_utils.torch.transformers_models import create_tiny_qwen3_dir
 
     ctx.cwd = ctx.tmp / "megatron_bridge"
@@ -68,7 +78,7 @@ def prepare_bridge(ctx):
     )
 
 
-def verify_quantized(ctx):
+def verify_bridge_quantized(ctx):
     from _test_utils.torch.megatron.modelopt_state import assert_has_modelopt_state
 
     output = Path(ctx.env["OUTPUT_ROOT"])
@@ -80,7 +90,7 @@ def verify_quantized(ctx):
     assert config["quantization"]["quant_algo"] == "NVFP4"
 
 
-def verify_distilled(ctx):
+def verify_bridge_distilled(ctx):
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -94,7 +104,7 @@ def verify_distilled(ctx):
         assert all(torch.isfinite(value).all() for value in weights.values())
 
 
-def verify_pruned(ctx):
+def verify_bridge_pruned(ctx):
     from transformers import AutoModelForCausalLM
 
     output = Path(ctx.env["OUTPUT_ROOT"]) / "Qwen3-8B-Pruned-6B-manual"
@@ -103,14 +113,14 @@ def verify_pruned(ctx):
     assert model.config.hidden_size == 512
 
 
-def prepare_full_scale(ctx):
-    """Opt-in integration runs use real remote models and user-provided data."""
+def prepare_bridge_full_scale(ctx):
+    """Set the Bridge working/output directories; callers supply full-scale inputs."""
     ctx.cwd = ctx.repo / "examples/megatron_bridge"
     ctx.env["OUTPUT_ROOT"] = str(ctx.tmp / "outputs")
     Path(ctx.env["OUTPUT_ROOT"]).mkdir()
 
 
-def run_distill_prerequisite(ctx):
+def run_bridge_distill_prerequisite(ctx):
     """Build real checkpoints using the README's training fence, in the same process group."""
     from _test_utils.doc_tests.parser import parse_markdown
 
@@ -123,8 +133,8 @@ def run_distill_prerequisite(ctx):
     subprocess.run(["bash", "-euo", "pipefail", "-c", code], cwd=ctx.cwd, env=ctx.env, check=True)
 
 
-def verify_full_export(path):
-    """Require a parseable architecture and nonempty saved weights in a full-scale export."""
+def verify_bridge_hf_export(path):
+    """Check config and weight-file presence for full-scale Bridge HF exports."""
     assert json.loads((path / "config.json").read_text())["model_type"]
     weights = list(path.glob("*.safetensors"))
     assert weights and all(weight.stat().st_size > 0 for weight in weights)

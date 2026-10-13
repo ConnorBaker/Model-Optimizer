@@ -168,7 +168,8 @@ def parse_markdown(path: Path, *, require_coverage: bool = False) -> list[Scenar
                 fail("min_gpus must be a nonnegative integer", line)
             dependencies = metadata.get("requires", [])
             if not isinstance(dependencies, list) or not all(
-                isinstance(name, str) and re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_.]*", name)
+                isinstance(name, str)
+                and re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*", name)
                 for name in dependencies
             ):
                 fail("requires must be a list of Python module names", line)

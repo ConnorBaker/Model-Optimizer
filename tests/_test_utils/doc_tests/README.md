@@ -5,6 +5,16 @@ pytest adapter. Example-specific code only prepares inputs and verifies results.
 The visible commands execute without command rewriting or mocked model operations.
 These are trusted repository tests with the same privileges as pytest.
 
+## Fixture scope
+
+The parser, runner and pytest adapter are generic. Helpers under `fixtures/`
+implement example-specific inputs and output checks: use `llm_qat` or `bridge`
+in helper names, and prefix standalone QAT fixture modules with `llm_qat_`.
+Installation copies QAT requirements and checks its dependencies; serving expects
+the QAT README's QLoRA checkpoint layout and adapter name. These are not general
+installation or serving APIs. Add a shared abstraction only when another example
+needs the same behavior with a clear parameter contract.
+
 ## Directive contract
 
 Directives occupy their own lines outside code fences. Metadata is TOML:
@@ -36,23 +46,29 @@ assert (ctx.cwd / "result.txt").read_text() == "hello"
   and `requires = ["megatron.bridge"]` for importable modules.
 - Setup precedes all selected fences; verification follows them. Both share a
   namespace with `ctx.repo`, `ctx.tmp`, `ctx.cwd` and mutable `ctx.env`.
+  `ctx.repo` and `ctx.tmp` are absolute paths; `ctx.cwd` initially points to the
+  repository. Setup must select the temporary workspace when isolation is needed.
 - Each `run` selects one immediately following `bash`, `sh`, or `python` fence;
   only blank lines may intervene. Backtick, tilde, list-indented and single-level
   blockquoted fences are supported. Nested scenarios and duplicate IDs fail.
 - Shell fences share one Bash process with `set -Eeuo pipefail`; shell variables,
   directory changes and exported environment persist. Verification sees the final
   `ctx.cwd` and `ctx.env`. Setup/verification Python uses those explicit fields.
-- Python fences share the setup namespace. Before execution the worker applies
+- Python fences share the setup namespace, with `__name__ = "__main__"` and
+  `__file__` set to the README path. Before execution the worker applies
   `ctx.cwd` and `ctx.env`; afterward it records their final values. Keep Python
   and shell fences in separate scenarios to avoid ambiguous shared state.
 - `run background` starts the final shell fence asynchronously. Verification must
   check readiness and behavior; `ctx.background_pid` identifies its shell process.
-  The serving test checks HTTP health and requests a real adapter completion.
+  Background-fence changes to the directory or environment do not propagate back;
+  configure server settings in setup. The serving test checks HTTP health and
+  requests a real adapter completion.
 - The deadline covers setup, commands and verification. The parent kills the
   process group on success, failure or timeout. Commands must not detach, disable
   error checking, or replace/exit the shell. Workspace artifacts remain in pytest's
   temporary directory; internal control files are removed. Failures include output
-  and Markdown source locations.
+  and Markdown source locations. A zero exit status is insufficient: the worker
+  must reach the end of verification. Early exits such as `sys.exit(0)` fail.
 - The runner prepends the checkout and test utilities to `PYTHONPATH`. The separate
   installation test deliberately removes it and uses a disposable virtualenv so
   the installed package can be tested without replacing the checkout environment.
@@ -92,6 +108,9 @@ A copied FSDP2 config test checks the copy, not the subsequent human edit.
 
 ## Run and collect
 
+Name README test modules `test_<example>_readme.py` so different examples can be
+collected together without module-name collisions.
+
 Run inside the appropriate example environment: PyTorch 26.07 with the QAT
 requirements, or NeMo 26.08 for Megatron Bridge, as in the example CI workflow.
 Keep the container's matching Torch/FlashAttention binaries when installing test
@@ -102,21 +121,21 @@ dependencies. Install the checkout and its `dev-test` dependencies first.
 python -m pytest tests/unit/doc_tests --confcutdir=tests/unit/doc_tests -o addopts='' -q
 
 # Collect and inspect skip reasons in the normal test environment.
-python -m pytest tests/examples/llm_qat/test_readme.py --collect-only --no-cov
+python -m pytest tests/examples/llm_qat/test_llm_qat_readme.py --collect-only --no-cov
 python -m pytest tests/examples/megatron_bridge/test_megatron_bridge_readme.py --collect-only --no-cov
 
 # Bounded defaults; manual integrations are skipped.
-CUDA_VISIBLE_DEVICES=0 python -m pytest tests/examples/llm_qat/test_readme.py --no-cov -rs
+CUDA_VISIBLE_DEVICES=0 python -m pytest tests/examples/llm_qat/test_llm_qat_readme.py --no-cov -rs
 CUDA_VISIBLE_DEVICES=0,1 MODELOPT_DOC_TEST_GPUS=2 \
-  python -m pytest tests/examples/llm_qat/test_readme.py --no-cov -k quickstart -rs
+  python -m pytest tests/examples/llm_qat/test_llm_qat_readme.py --no-cov -k quickstart -rs
 CUDA_VISIBLE_DEVICES=0,1 \
   python -m pytest tests/examples/megatron_bridge/test_megatron_bridge_readme.py --no-cov -rs
 
 # Select ONE manual integration with its prerequisites already supplied.
 # MODELOPT_DOC_QLORA_CHECKPOINT: exported adapter directory containing base_model/.
-python -m pytest tests/examples/llm_qat/test_readme.py --no-cov --run-manual -k llm-qlora-serve
+python -m pytest tests/examples/llm_qat/test_llm_qat_readme.py --no-cov --run-manual -k llm-qlora-serve
 # MODELOPT_DOC_EVAL_CHECKPOINT: fake-quantized QAT checkpoint; lm_eval and dataset access required.
-python -m pytest tests/examples/llm_qat/test_readme.py --no-cov --run-manual -k llm-qat-evaluation
+python -m pytest tests/examples/llm_qat/test_llm_qat_readme.py --no-cov --run-manual -k llm-qat-evaluation
 ```
 
 Installation downloads packages into a temporary virtualenv and may compile GPU
@@ -146,10 +165,10 @@ CLI-help scenarios still execute on the single-GPU runner.
 | `pytest_utils.py` | Common collection, manual markers and resource checks, independent of the example. |
 | `fixtures/llm_qat.py` | Reduced QAT/QAD/QLoRA/Llama inputs, real prerequisite quantization, Python API inputs and artifact assertions. |
 | `fixtures/megatron_bridge.py` | Local Bridge inputs, real distillation prerequisites and quantization/pruning/export assertions. |
-| `fixtures/installation.py` | Disposable package-installation environment and import verification. |
-| `fixtures/serving.py` | Adapter-server prerequisites, readiness and a real completion request. |
+| `fixtures/llm_qat_installation.py` | QAT requirements in a disposable venv and QAT dependency import verification. |
+| `fixtures/llm_qat_serving.py` | QAT QLoRA checkpoint layout, adapter-server readiness and a real completion request. |
 | `tests/unit/doc_tests/test_markdown.py` | CPU regression tests for the shared execution contract and complete fence accounting in both READMEs. |
-| `tests/examples/llm_qat/test_readme.py` | Collect QAT scenarios through the common pytest adapter. |
+| `tests/examples/llm_qat/test_llm_qat_readme.py` | Collect QAT scenarios through the common pytest adapter. |
 | `tests/examples/megatron_bridge/test_megatron_bridge_readme.py` | Collect Bridge scenarios through the same adapter. |
 | `examples/llm_qat/README.md` | Annotate the remaining snippets; correct QAD teacher construction and incomplete training commands. |
 | `examples/megatron_bridge/README.md` | Annotate smoke/manual scenarios, expose input/scale overrides and account for non-executable templates. |

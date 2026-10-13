@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in package installation in a disposable environment, separate from checkout tests."""
+"""QAT README installation checks in a disposable environment."""
 
 import json
 import os
@@ -22,9 +22,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+__all__ = ["prepare_llm_qat_installation", "verify_llm_qat_installation"]
 
-def prepare_installation(ctx):
-    """Run the installation fence without altering the active pytest environment."""
+
+def prepare_llm_qat_installation(ctx):
+    """Prepare the QAT requirements in a disposable venv without altering pytest."""
     venv = ctx.tmp / "venv"
     subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
     ctx.cwd = ctx.tmp
@@ -36,8 +38,8 @@ def prepare_installation(ctx):
     ctx.env.pop("VIRTUAL_ENV", None)
 
 
-def verify_installation(ctx):
-    """Require imports from the new environment, rather than the source checkout."""
+def verify_llm_qat_installation(ctx):
+    """Import the QAT dependencies and require ModelOpt to come from the new venv."""
     result = subprocess.run(
         [
             str(ctx.tmp / "venv/bin/python"),

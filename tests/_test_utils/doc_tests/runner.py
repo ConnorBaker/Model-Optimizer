@@ -33,6 +33,7 @@ __all__ = ["run_scenario"]
 
 def run_scenario(scenario, repo: Path, tmp: Path) -> str:
     """Execute one scenario and return captured output; terminate its group on every exit."""
+    repo = Path(repo).resolve()
     tmp = Path(tmp).resolve()
     tmp.mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
@@ -80,6 +81,7 @@ def run_scenario(scenario, repo: Path, tmp: Path) -> str:
                     time.sleep(0.05)
                 os.killpg(process.pid, signal.SIGKILL)
             process.wait()
+        completed = (Path(control_dir) / "completed").is_file()
         output.seek(0)
         text = output.read().decode(errors="replace")
         for index, step in enumerate(scenario.steps):
@@ -87,19 +89,20 @@ def run_scenario(scenario, repo: Path, tmp: Path) -> str:
                 text = text.replace(
                     str(Path(control_dir) / f"fence-{index}.sh"), str(scenario.path)
                 )
-    if timed_out or process.returncode:
-        reason = (
-            f"timed out after {scenario.timeout_seconds}s"
-            if timed_out
-            else f"exit {process.returncode}"
-        )
-        raise DocTestError(f"{scenario.path}:{scenario.line}: {scenario.id}: {reason}\n{text}")
-    return text
+    if timed_out:
+        reason = f"timed out after {scenario.timeout_seconds}s"
+    elif process.returncode:
+        reason = f"exit {process.returncode}"
+    elif not completed:
+        reason = "worker exited before completing the scenario"
+    else:
+        return text
+    raise DocTestError(f"{scenario.path}:{scenario.line}: {scenario.id}: {reason}\n{text}")
 
 
 def _execute(scenario, repo, tmp, control):
     ctx = SimpleNamespace(repo=repo, tmp=tmp, cwd=repo, env=dict(os.environ))
-    namespace = {"ctx": ctx}
+    namespace = {"ctx": ctx, "__name__": "__main__", "__file__": str(scenario.path)}
 
     def python_step(step):
         print(f"{scenario.path}:{step.line}: {step.kind}", flush=True)
@@ -162,3 +165,4 @@ if __name__ == "__main__":
     markdown, scenario_id, root, workspace, control_dir = sys.argv[1:]
     selected = next(s for s in parse_markdown(Path(markdown)) if s.id == scenario_id)
     _execute(selected, Path(root), Path(workspace), Path(control_dir))
+    (Path(control_dir) / "completed").touch()

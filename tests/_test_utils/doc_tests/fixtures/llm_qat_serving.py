@@ -13,20 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real, opt-in vLLM adapter serving verification."""
+"""QAT README QLoRA checkpoint setup and vLLM adapter verification."""
 
 import json
-import os
 import socket
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
+__all__ = ["prepare_llm_qat_adapter_server", "verify_llm_qat_adapter_server"]
 
-def prepare_adapter_server(ctx):
-    """Link an existing QLoRA export into an isolated example workspace."""
-    checkpoint = Path(os.environ["MODELOPT_DOC_QLORA_CHECKPOINT"]).resolve()
+
+def prepare_llm_qat_adapter_server(ctx):
+    """Link the QLoRA export under the checkpoint name used by the QAT README."""
+    checkpoint = Path(ctx.env["MODELOPT_DOC_QLORA_CHECKPOINT"]).resolve()
     assert (checkpoint / "adapter_config.json").is_file()
     assert (checkpoint / "base_model/config.json").is_file()
     ctx.cwd = ctx.tmp
@@ -36,8 +37,8 @@ def prepare_adapter_server(ctx):
         ctx.env["PORT"] = str(sock.getsockname()[1])
 
 
-def verify_adapter_server(ctx):
-    """Wait for readiness and require an actual completion from the served adapter."""
+def verify_llm_qat_adapter_server(ctx):
+    """Require readiness and a completion from the QAT README's "adapter" model."""
     url = f"http://127.0.0.1:{ctx.env['PORT']}"
     deadline = time.monotonic() + 600
     while True:

@@ -93,8 +93,8 @@ requires = ["megatron.bridge"]
 -->
 <!-- modelopt-doc-test:setup python
 from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_full_scale, verify_full_export
-prepare_full_scale(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale, verify_bridge_hf_export
+prepare_bridge_full_scale(ctx)
 output = Path(ctx.env["OUTPUT_ROOT"])
 -->
 <!-- modelopt-doc-test:run -->
@@ -136,8 +136,8 @@ min_gpus = 2
 requires = ["megatron.bridge"]
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge
-prepare_bridge(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_smoke
+prepare_bridge_smoke(ctx)
 -->
 <!-- modelopt-doc-test:run -->
 ```bash
@@ -167,8 +167,8 @@ torchrun --nproc_per_node 2 export_quantized_megatron_to_hf.py \
 ```
 
 <!-- modelopt-doc-test:verify python
-from _test_utils.doc_tests.fixtures.megatron_bridge import verify_quantized
-verify_quantized(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import verify_bridge_quantized
+verify_bridge_quantized(ctx)
 -->
 <!-- modelopt-doc-test:end -->
 
@@ -204,8 +204,8 @@ requires = ["megatron.bridge", "mlflow"]
 -->
 <!-- modelopt-doc-test:setup python
 from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_full_scale
-prepare_full_scale(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale
+prepare_bridge_full_scale(ctx)
 -->
 <!-- modelopt-doc-test:run -->
 ```bash
@@ -277,8 +277,8 @@ min_gpus = 8
 requires = ["megatron.bridge"]
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_full_scale
-prepare_full_scale(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale
+prepare_bridge_full_scale(ctx)
 -->
 <!-- modelopt-doc-test:run -->
 ```bash
@@ -345,8 +345,8 @@ min_gpus = 2
 requires = ["megatron.bridge"]
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge
-prepare_bridge(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_smoke
+prepare_bridge_smoke(ctx)
 -->
 <!-- modelopt-doc-test:run -->
 ```bash
@@ -427,9 +427,9 @@ min_gpus = 2
 requires = ["megatron.bridge"]
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge, verify_distilled, run_distill_prerequisite
-prepare_bridge(ctx)
-run_distill_prerequisite(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_smoke, verify_bridge_distilled, run_bridge_distill_prerequisite
+prepare_bridge_smoke(ctx)
+run_bridge_distill_prerequisite(ctx)
 -->
 <!-- modelopt-doc-test:run -->
 ```bash
@@ -441,7 +441,7 @@ torchrun --nproc_per_node 1 export_distilled_megatron_to_hf.py \
 ```
 
 <!-- modelopt-doc-test:verify python
-verify_distilled(ctx)
+verify_bridge_distilled(ctx)
 -->
 <!-- modelopt-doc-test:end -->
 
@@ -479,8 +479,8 @@ min_gpus = 8
 requires = ["megatron.bridge"]
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_full_scale
-prepare_full_scale(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale
+prepare_bridge_full_scale(ctx)
 -->
 <!-- modelopt-doc-test:run -->
 ```bash
@@ -548,8 +548,8 @@ requires = ["megatron.bridge"]
 -->
 <!-- modelopt-doc-test:setup python
 from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_full_scale, verify_full_export
-prepare_full_scale(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale, verify_bridge_hf_export
+prepare_bridge_full_scale(ctx)
 output = Path(ctx.env["OUTPUT_ROOT"])
 -->
 <!-- modelopt-doc-test:run -->
@@ -562,7 +562,7 @@ torchrun --nproc_per_node 2 prune_minitron.py \
     --output_hf_path "${OUTPUT_ROOT:-/tmp}/Qwen3-8B-Pruned-6B"
 ```
 <!-- modelopt-doc-test:verify python
-verify_full_export(output / "Qwen3-8B-Pruned-6B")
+verify_bridge_hf_export(output / "Qwen3-8B-Pruned-6B")
 -->
 <!-- modelopt-doc-test:end -->
 
@@ -578,8 +578,8 @@ requires = ["megatron.bridge"]
 -->
 <!-- modelopt-doc-test:setup python
 from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_full_scale, verify_full_export
-prepare_full_scale(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale, verify_bridge_hf_export
+prepare_bridge_full_scale(ctx)
 output = Path(ctx.env["OUTPUT_ROOT"])
 -->
 <!-- modelopt-doc-test:run -->
@@ -591,7 +591,7 @@ torchrun --nproc_per_node 2 prune_minitron.py \
     --output_hf_path "${OUTPUT_ROOT:-/tmp}/Nemotron-3-Nano-30B-A3B-BF16-Pruned-3B-Active"
 ```
 <!-- modelopt-doc-test:verify python
-verify_full_export(output / "Nemotron-3-Nano-30B-A3B-BF16-Pruned-3B-Active")
+verify_bridge_hf_export(output / "Nemotron-3-Nano-30B-A3B-BF16-Pruned-3B-Active")
 -->
 <!-- modelopt-doc-test:end -->
 
@@ -607,8 +607,8 @@ requires = ["megatron.bridge"]
 -->
 <!-- modelopt-doc-test:setup python
 from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_full_scale, verify_full_export
-prepare_full_scale(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale, verify_bridge_hf_export
+prepare_bridge_full_scale(ctx)
 output = Path(ctx.env["OUTPUT_ROOT"])
 -->
 <!-- modelopt-doc-test:run -->
@@ -622,7 +622,7 @@ torchrun --nproc_per_node 2 prune_minitron.py \
     --output_hf_path "${OUTPUT_ROOT:-/tmp}/Qwen3-8B-Pruned-12GB"
 ```
 <!-- modelopt-doc-test:verify python
-verify_full_export(output / "Qwen3-8B-Pruned-12GB")
+verify_bridge_hf_export(output / "Qwen3-8B-Pruned-12GB")
 -->
 <!-- modelopt-doc-test:end -->
 
@@ -636,8 +636,8 @@ min_gpus = 2
 requires = ["megatron.bridge"]
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge
-prepare_bridge(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_smoke
+prepare_bridge_smoke(ctx)
 -->
 <!-- modelopt-doc-test:run -->
 ```bash
@@ -653,8 +653,8 @@ torchrun --nproc_per_node 2 prune_minitron.py \
 ```
 
 <!-- modelopt-doc-test:verify python
-from _test_utils.doc_tests.fixtures.megatron_bridge import verify_pruned
-verify_pruned(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import verify_bridge_pruned
+verify_bridge_pruned(ctx)
 -->
 <!-- modelopt-doc-test:end -->
 
@@ -704,8 +704,8 @@ requires = ["megatron.bridge"]
 -->
 <!-- modelopt-doc-test:setup python
 from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_full_scale, verify_full_export
-prepare_full_scale(ctx)
+from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale, verify_bridge_hf_export
+prepare_bridge_full_scale(ctx)
 output = Path(ctx.env["OUTPUT_ROOT"])
 -->
 <!-- modelopt-doc-test:run -->
@@ -717,7 +717,7 @@ torchrun --nproc_per_node 2 prune_minitron.py \
     --output_hf_path "${OUTPUT_ROOT:-/tmp}/Qwen3.5-4B-Pruned-3B"
 ```
 <!-- modelopt-doc-test:verify python
-verify_full_export(output / "Qwen3.5-4B-Pruned-3B")
+verify_bridge_hf_export(output / "Qwen3.5-4B-Pruned-3B")
 -->
 <!-- modelopt-doc-test:end -->
 

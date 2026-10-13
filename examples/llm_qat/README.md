@@ -35,8 +35,8 @@ manual = true
 min_gpus = 0
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.installation import prepare_installation, verify_installation
-prepare_installation(ctx)
+from _test_utils.doc_tests.fixtures.llm_qat_installation import prepare_llm_qat_installation, verify_llm_qat_installation
+prepare_llm_qat_installation(ctx)
 -->
 <!-- modelopt-doc-test:run -->
 ```bash
@@ -44,7 +44,7 @@ pip install -U nvidia-modelopt[hf]
 pip install --no-build-isolation -r examples/llm_qat/requirements.txt
 ```
 <!-- modelopt-doc-test:verify python
-verify_installation(ctx)
+verify_llm_qat_installation(ctx)
 -->
 <!-- modelopt-doc-test:end -->
 
@@ -296,8 +296,8 @@ manual = true
 requires = ["vllm"]
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.serving import prepare_adapter_server, verify_adapter_server
-prepare_adapter_server(ctx)
+from _test_utils.doc_tests.fixtures.llm_qat_serving import prepare_llm_qat_adapter_server, verify_llm_qat_adapter_server
+prepare_llm_qat_adapter_server(ctx)
 -->
 <!-- modelopt-doc-test:run background -->
 ```sh
@@ -308,7 +308,7 @@ vllm serve qwen3-8b-fp4-qlora-hf/base_model --enable-lora \
 ```
 
 <!-- modelopt-doc-test:verify python
-verify_adapter_server(ctx)
+verify_llm_qat_adapter_server(ctx)
 -->
 <!-- modelopt-doc-test:end -->
 
@@ -324,8 +324,8 @@ profile = "gpu"
 timeout_seconds = 900
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.llm_qat import prepare_python_api, verify_python_api
-globals().update(prepare_python_api(ctx, quantized=False))
+from _test_utils.doc_tests.fixtures.llm_qat import prepare_llm_qat_python_api, verify_llm_qat_python_api
+globals().update(prepare_llm_qat_python_api(ctx, quantized=False))
 -->
 <!-- modelopt-doc-test:run -->
 ```python
@@ -344,7 +344,7 @@ trainer.save_model()
 ```
 
 <!-- modelopt-doc-test:verify python
-verify_python_api(trainer, initial_weights)
+verify_llm_qat_python_api(trainer, initial_weights)
 -->
 <!-- modelopt-doc-test:end -->
 
@@ -358,8 +358,8 @@ profile = "gpu"
 timeout_seconds = 900
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.llm_qat import prepare_python_api, verify_python_api
-globals().update(prepare_python_api(ctx, quantized=True))
+from _test_utils.doc_tests.fixtures.llm_qat import prepare_llm_qat_python_api, verify_llm_qat_python_api
+globals().update(prepare_llm_qat_python_api(ctx, quantized=True))
 -->
 <!-- modelopt-doc-test:run -->
 ```python
@@ -376,7 +376,7 @@ trainer.save_model()
 ```
 
 <!-- modelopt-doc-test:verify python
-verify_python_api(trainer, initial_weights)
+verify_llm_qat_python_api(trainer, initial_weights)
 -->
 <!-- modelopt-doc-test:end -->
 
@@ -388,8 +388,8 @@ profile = "gpu"
 timeout_seconds = 900
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.llm_qat import prepare_python_api, verify_python_api
-globals().update(prepare_python_api(ctx, quantized=True))
+from _test_utils.doc_tests.fixtures.llm_qat import prepare_llm_qat_python_api, verify_llm_qat_python_api
+globals().update(prepare_llm_qat_python_api(ctx, quantized=True))
 -->
 <!-- modelopt-doc-test:run -->
 ```python
@@ -417,7 +417,7 @@ trainer.save_model()
 ```
 
 <!-- modelopt-doc-test:verify python
-verify_python_api(trainer, initial_weights)
+verify_llm_qat_python_api(trainer, initial_weights)
 -->
 <!-- modelopt-doc-test:end -->
 
@@ -436,8 +436,8 @@ You can either:
    timeout_seconds = 900
    -->
    <!-- modelopt-doc-test:setup python
-   from _test_utils.doc_tests.fixtures.llm_qat import prepare_quantized_input
-   prepare_quantized_input(ctx, llama=True)
+   from _test_utils.doc_tests.fixtures.llm_qat import prepare_llm_qat_quantized_input
+   prepare_llm_qat_quantized_input(ctx, llama=True)
    (ctx.cwd / "llama-quantized").symlink_to(ctx.cwd / "qwen3-8b-quantized", target_is_directory=True)
    -->
    <!-- modelopt-doc-test:run -->
@@ -502,8 +502,8 @@ profile = "gpu"
 timeout_seconds = 900
 -->
 <!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.llm_qat import prepare_quantized_input
-prepare_quantized_input(ctx)
+from _test_utils.doc_tests.fixtures.llm_qat import prepare_llm_qat_quantized_input
+prepare_llm_qat_quantized_input(ctx)
 -->
 <!-- modelopt-doc-test:run -->
 ```sh

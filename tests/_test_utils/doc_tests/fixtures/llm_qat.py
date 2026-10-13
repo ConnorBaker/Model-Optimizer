@@ -29,7 +29,13 @@ from _test_utils.torch.transformers_models import create_tiny_llama_dir, create_
 from datasets import Dataset
 from safetensors import safe_open
 
-__all__ = ["prepare_llm_qat_workspace", "verify_llm_qat_workspace"]
+__all__ = [
+    "prepare_llm_qat_python_api",
+    "prepare_llm_qat_quantized_input",
+    "prepare_llm_qat_workspace",
+    "verify_llm_qat_python_api",
+    "verify_llm_qat_workspace",
+]
 
 
 def prepare_llm_qat_workspace(repo: Path, tmp: Path, *, llama: bool = False) -> Path:
@@ -135,7 +141,7 @@ def verify_llm_qat_workspace(root: Path, variant="qat"):
         assert any(weights.get_tensor(key).dtype == torch.uint8 for key in exported_keys)
 
 
-def prepare_quantized_input(ctx, *, llama=False):
+def prepare_llm_qat_quantized_input(ctx, *, llama=False):
     """Produce a real prerequisite checkpoint for standalone training snippets."""
     root = prepare_llm_qat_workspace(ctx.repo, ctx.tmp, llama=llama)
     ctx.cwd = root / "examples/llm_qat"
@@ -159,7 +165,7 @@ def prepare_quantized_input(ctx, *, llama=False):
     return root
 
 
-def prepare_python_api(ctx, *, quantized):
+def prepare_llm_qat_python_api(ctx, *, quantized):
     """Supply the model, data and Trainer inputs omitted by the API fragments."""
     from transformers import (
         AutoModelForCausalLM,
@@ -223,7 +229,7 @@ def prepare_python_api(ctx, *, quantized):
     }
 
 
-def verify_python_api(trainer, initial_weights):
+def verify_llm_qat_python_api(trainer, initial_weights):
     """Assert optimization completed and checkpointing retained quantization state."""
     assert trainer.state.global_step == 2
     losses = [entry["loss"] for entry in trainer.state.log_history if "loss" in entry]
