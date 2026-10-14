@@ -2070,8 +2070,8 @@ def _finish_export_together(error: Exception | None) -> None:
     A barrier alone lets the ranks whose writes succeeded return, and the run carries on as if the
     checkpoint were whole while another rank's export raised. A distributed
     :class:`~modelopt.torch.utils.distributed.ModelOptSession` gathers every rank's outcome instead
-    (:meth:`~modelopt.torch.utils.distributed.ModelOptSession.agree`), and every rank raises with
-    the failing rank's error.
+    (:meth:`~modelopt.torch.utils.distributed.ModelOptSession.all_reduce`), and every rank raises
+    with the failing rank's error.
     """
     session = get_active_mo_session(required=False)
     if not (session.initialized and session.distributed):
@@ -2083,4 +2083,4 @@ def _finish_export_together(error: Exception | None) -> None:
             raise error
         return True
 
-    session.agree("export_ok", exported, all)
+    session.all_reduce("export_ok", exported, all)

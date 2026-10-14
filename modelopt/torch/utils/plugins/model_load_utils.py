@@ -379,7 +379,7 @@ def _hold_on_session(
     session = get_active_mo_session(required=False)
     if session.initialized:
         record = session.register_model(model, source_checkpoint=str(ckpt_path))
-        keys = record.unplaced_source_keys.decide(
+        keys = record.unplaced_source_keys.broadcast_from(
             lambda: sorted(unplaced_source_keys(model, ckpt_path) if keys is None else keys)
         )
     return record_unplaced_source_keys(model, ckpt_path, keys)

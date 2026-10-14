@@ -318,20 +318,24 @@ def test_reset_clears_synced_facts():
 
 def test_entering_a_session_checks_every_rank_runs_the_same_versions(monkeypatch):
     """Ranks running different versions can disagree inside a collective and hang instead of failing."""
-    agreed = []
+    reduced = []
 
-    def agree(self, label, value_fn, combine=None):
-        agreed.append((label, value_fn(), combine))
+    def all_reduce(self, label, fn, combine):
+        reduced.append((label, fn(), combine))
 
-    monkeypatch.setattr(ModelOptSession, "agree", agree)
+    monkeypatch.setattr(ModelOptSession, "all_reduce", all_reduce)
     monkeypatch.delenv("WORLD_SIZE", raising=False)
     with modelopt_session():
         pass
 
-    ((label, versions, combine),) = agreed
-    assert (label, combine) == ("environment", None), "every rank must pass the same versions"
+    ((label, versions, combine),) = reduced
+    assert label == "environment"
     assert versions["torch"] == torch.__version__
     assert set(versions) == {"python", "torch", "cuda", "modelopt", "transformers"}
+    assert combine([versions, dict(versions)]) == versions
+    # Every rank combines the same gathered list, so every rank raises.
+    with pytest.raises(RuntimeError, match=r"rank 1 has .*'torch': '0\.0'"):
+        combine([versions, {**versions, "torch": "0.0"}])
 
 
 # ------------------------------------------------------------------------------------- model records
@@ -360,22 +364,24 @@ def test_registering_a_role_again_replaces_only_its_record():
     assert session.models["teacher"] is teacher
 
 
-def test_a_records_synced_fact_is_decided_on_rank0(monkeypatch):
+def test_a_records_synced_fact_is_broadcast_from_rank0(monkeypatch):
     """Every rank holds rank 0's list instead of scanning the checkpoint for its own."""
-    _as_rank(monkeypatch, 1, decided=("models['target'].unplaced_source_keys", ["mtp.w"], None))
+    _as_rank(monkeypatch, 1, received=("models['target'].unplaced_source_keys", ["mtp.w"], None))
     record = _session(rank=1).register_model(torch.nn.Linear(2, 2))
 
-    keys = record.unplaced_source_keys.decide(lambda: pytest.fail("a non-zero rank scanned"))
+    keys = record.unplaced_source_keys.broadcast_from(
+        lambda: pytest.fail("a non-zero rank scanned")
+    )
 
     assert keys == record.unplaced_source_keys.value == ["mtp.w"]
 
 
-def test_records_decided_out_of_step_fail(monkeypatch):
-    """Rank 0 deciding the target's keys while rank 1 decides a draft model's would cross the two."""
-    _as_rank(monkeypatch, 1, decided=("models['target'].unplaced_source_keys", [], None))
+def test_records_broadcast_out_of_step_fail(monkeypatch):
+    """Rank 0 sending the target's keys while rank 1 expects a draft model's would cross the two."""
+    _as_rank(monkeypatch, 1, received=("models['target'].unplaced_source_keys", [], None))
     record = _session(rank=1).register_model(torch.nn.Linear(2, 2), role="draft")
     with pytest.raises(RuntimeError, match="out of step"):
-        record.unplaced_source_keys.decide(list)
+        record.unplaced_source_keys.broadcast_from(list)
 
 
 def test_reset_releases_the_models():

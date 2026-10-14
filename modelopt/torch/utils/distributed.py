@@ -381,7 +381,7 @@ class ModelRecord(_SyncedHolder):
     """
 
     #: The checkpoint tensors the model has no parameter for, which the export carries over
-    #: unchanged. Decided once, by rank 0, when the model is loaded.
+    #: unchanged. Computed once, by rank 0, when the model is loaded.
     unplaced_source_keys: Synced[list[str]]
 
     def __init__(
@@ -644,6 +644,20 @@ def _environment() -> dict[str, Any]:
     return versions
 
 
+def _same_environment(environments: list[dict[str, Any]]) -> dict[str, Any]:
+    """The environment every rank runs; raise if any rank runs another.
+
+    Adopting one rank's versions would hide the difference until a collective hangs on it.
+    """
+    for rank, environment in enumerate(environments):
+        if environment != environments[0]:
+            raise RuntimeError(
+                f"Ranks run different versions: rank 0 has {environments[0]}, rank {rank} has "
+                f"{environment}."
+            )
+    return environments[0]
+
+
 @contextmanager
 def modelopt_session(timeout: timedelta | None = None, device=None):
     """Populate the active session for the block, then tear down.
@@ -679,7 +693,7 @@ def modelopt_session(timeout: timedelta | None = None, device=None):
             is_main=True,
         )
     try:
-        _active_mo_session.agree("environment", _environment)
+        _active_mo_session.all_reduce("environment", _environment, _same_environment)
         yield _active_mo_session
     finally:
         # If the body is unwinding due to an exception, PRINT it here BEFORE cleanup()'s collective
