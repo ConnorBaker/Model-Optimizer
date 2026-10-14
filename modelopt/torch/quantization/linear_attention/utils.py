@@ -83,11 +83,11 @@ def validate_gdn_quantizer(
 
     if not isinstance(quantizer, TensorQuantizer):
         raise ValueError(f"{name} requires a single TensorQuantizer")
-    nvfp4 = quantizer.num_bits == (2, 1) and quantizer.block_sizes == {
-        -1: 16,
-        "type": "dynamic",
-        "scale_bits": (4, 3),
-    }
+    nvfp4 = (
+        quantizer.is_nvfp4_dynamic
+        and quantizer.block_sizes.get(-1) == 16
+        and quantizer.block_sizes.keys() == {-1, "type", "scale_bits"}
+    )
     if quantizer.num_bits == (2, 1) and not nvfp4:
         raise ValueError("NVFP4 state QDQ requires block16 with dynamic E4M3 block scales")
     if (

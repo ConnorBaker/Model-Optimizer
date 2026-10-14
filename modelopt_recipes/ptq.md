@@ -66,7 +66,6 @@ supported combinations.
 | `q8_0` | Q8_0 W8A16 (8.5 bpw), eligible linears | none | none (no calibration) |
 | `linear_attention_state_int8_block32_dynamic` | GDN/KDA state INT8, 32 value channels per key row; weights unchanged | none | none (dynamic scales; requires vLLM and a prefix/decode phase context) |
 | `linear_attention_state_int8_block32_dynamic_kimi_k3` | Kimi-K3/Kimi-Linear KDA state INT8, 32 value channels per key row | none | none (dynamic scales; explicit Triton Kimi profile) |
-
 | `linear_attention_state_nvfp4_dynamic` | GDN/KDA state NVFP4, block16 and E4M3 scales; weights unchanged | none | none (dynamic global and block scales) |
 
 </details>
