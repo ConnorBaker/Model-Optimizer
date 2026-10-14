@@ -144,9 +144,7 @@ def test_restore_uses_saved_quantizer_and_policy(tmp_path, monkeypatch):
     model[0].gdn_state_quantizer.set_from_attribute_config(
         {"num_bits": 8, "axis": (0, 1), "type": "dynamic", "narrow_range": True}
     )
-    model[0].linear_attention_config = LinearAttentionConfig(
-        backend="serving", precision="replayssm", replay_window=4
-    )
+    model[0].linear_attention_config = LinearAttentionConfig(backend="serving", state_block_v=32)
     sample = torch.randn(2, 4, 19)
     expected = model[0].gdn_state_quantizer(sample)
     path = tmp_path / "gdn.pth"

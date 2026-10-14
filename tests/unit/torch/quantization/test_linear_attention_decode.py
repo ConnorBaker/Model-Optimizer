@@ -48,10 +48,6 @@ def test_state_qdq_matches_tensor_quantizer(state_format):
         {"chunk_size": 32},
         {"solve": {"method": "neumann"}},
         {"state": {"mode": "token"}},
-        {"replay_window": 4},
-        {"precision": "replayssm", "replay_window": 0},
-        {"precision": "replayssm", "replay_window": 65},
-        {"precision": "replayssm", "state_block_v": 16},
     ],
 )
 def test_linear_attention_policy_rejects_invalid_settings(settings):

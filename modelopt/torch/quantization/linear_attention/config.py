@@ -17,7 +17,7 @@
 
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field
 
 from modelopt.torch.opt.config import ModeloptBaseConfig, ModeloptField
 
@@ -42,35 +42,16 @@ class LinearAttentionConfig(ModeloptBaseConfig):
     they do not configure or validate a remote server. Kimi serving must set both
     ``kda_prefill_backend`` and ``kda_decode_backend`` to ``triton``;
     the supported gate is unbounded softplus.
-    ``replayssm`` uses the serving fork's INT8/Hadamard checkpoint and ring kernels.
-    ``replay_window=1`` refreshes the state every token; larger windows enable replay.
     Fresh prefill has no internal state QDQ; incoming continuation state and
     the handoff to a nonempty suffix use the selected checkpoint encoding.
 
-    TensorQuantizer independently enables QDQ and owns its format and grouping.
+    TensorQuantizer enables QDQ and owns its format and grouping.
     ``state_block_v`` controls grouping only for legacy per-tile quantizers.
     """
 
     backend: Literal["fla", "serving"] = ModeloptField(default="fla")
-    precision: Literal["vllm", "vllm_kimi_k3", "replayssm"] = ModeloptField(default="vllm")
-    replay_window: int = Field(default=1, ge=1, le=64, strict=True)
+    precision: Literal["vllm", "vllm_kimi_k3"] = ModeloptField(default="vllm")
     state_block_v: Literal[16, 32, 64, 128] = ModeloptField(default=64)
-
-    @property
-    def state_codec(self):
-        """The native profile fixes the codec; it is not an independent setting."""
-        return "int8_hadamard32" if self.precision == "replayssm" else "tile"
-
-    @model_validator(mode="after")
-    def _validate_profile(self):
-        if self.precision == "replayssm":
-            if self.backend != "serving":
-                raise ValueError("replayssm requires backend='serving'")
-            if self.state_block_v < 32:
-                raise ValueError("int8_hadamard32 requires state_block_v >= 32")
-        elif self.replay_window != 1:
-            raise ValueError("Replay requires precision='replayssm'")
-        return self
 
 
 class LinearAttentionPolicyEntry(ModeloptBaseConfig):

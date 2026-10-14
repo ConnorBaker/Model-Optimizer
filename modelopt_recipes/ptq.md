@@ -28,7 +28,7 @@ supported combinations.
 ### The shipped recipes
 
 <details>
-<summary>All 35 <code>general/ptq/</code> recipes (click to expand)</summary>
+<summary>All 34 <code>general/ptq/</code> recipes (click to expand)</summary>
 
 | Recipe | Model body | KV cache | Calibration |
 |--------|-----------|----------|-------------|
@@ -64,7 +64,6 @@ supported combinations.
 | `iq2_xs` | IQ2_XS W2A16 (2.31 bpw), MLP + MoE weights only | none | GPTQ (layerwise) |
 | `iq2_s` | IQ2_S W2A16 (2.56 bpw), MLP + MoE weights only | none | GPTQ (layerwise) |
 | `q8_0` | Q8_0 W8A16 (8.5 bpw), eligible linears | none | none (no calibration) |
-| `linear_attention_state_int8_dynamic` | GDN/KDA decode state INT8 + Hadamard; requires a private ReplaySSM fork | none | none (dynamic scales; requires a prefix/decode phase context) |
 | `linear_attention_state_int8_block32_dynamic` | GDN/KDA state INT8, 32 value channels per key row; weights unchanged | none | none (dynamic scales; requires vLLM and a prefix/decode phase context) |
 | `linear_attention_state_int8_block32_dynamic_kimi_k3` | Kimi-K3/Kimi-Linear KDA state INT8, 32 value channels per key row | none | none (dynamic scales; explicit Triton Kimi profile) |
 
@@ -96,17 +95,8 @@ It never falls back to prepared-only arithmetic.
 The adapters use the fixed vLLM 0.30.0 value-first cache layout. Native-forward
 comparisons and independent recurrence checks validate it in GPU tests.
 
-The `linear_attention_state_int8_dynamic` recipe uses an optional private
-quantized-ReplaySSM fork; public vLLM releases do not provide those kernels.
-Its imports and kernel contract are isolated from the public 0.30.0 profiles;
-it requires the fork's `vllm.model_executor.layers.fla.ops` API. Without access
-to that fork, use a block32 recipe above. ReplaySSM native tests
-skip when the fork is absent, so the public CI images do not qualify this profile.
-
 The public profiles do not support vLLM 0.20 or arbitrary development builds.
 The tested GDN/KDA profiles pass bit-exact native forward comparisons on vLLM 0.30.0.
-The existing sm_120+/Triton <3.7 training guard also applies to custom ReplaySSM
-environments; changing the public profile does not remove that hardware restriction.
 
 Megatron state QAT requires native `_compute_gates` and either
 `forward_pre_attn_and_core_attn` or `_forward_compute` for raw gates and packed
