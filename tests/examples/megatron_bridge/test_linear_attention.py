@@ -227,7 +227,9 @@ def test_state_training_checkpoint_roundtrip(compiled_state_training, qad, tmp_p
 
     # Export starts from disk, as in export_quantized_megatron_to_hf.py.
     reset_megatron_global_state()
-    dist.setup()
+    torch.distributed.init_process_group(
+        "cpu:gloo,cuda:nccl", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1
+    )
     request.addfinalizer(dist.cleanup)
     request.addfinalizer(reset_megatron_global_state)
     bridge, _, models, student, _ = load_mbridge_model_from_hf(
