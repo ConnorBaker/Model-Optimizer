@@ -34,6 +34,7 @@ from modelopt.torch.quantization.config import (
 from modelopt.torch.quantization.model_calib import lsq, max_calibrate
 from modelopt.torch.quantization.nn import QuantLinear
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import (
+    _FP8_E4M3_MAX,
     _FP8_E4M3_MIN_POSITIVE,
     StaticBlockScaleQuantizer,
     TensorQuantizer,
@@ -446,8 +447,29 @@ class TestFakeQuantizeLSQ:
         out = q._fake_quantize(torch.randn(4, 16))
 
         assert out.shape == (4, 16)
-        assert torch.equal(min_values[0], torch.tensor([_FP8_E4M3_MIN_POSITIVE]))
+        assert torch.equal(min_values[0], torch.tensor([_FP8_E4M3_MIN_POSITIVE / _FP8_E4M3_MAX]))
         assert min_values[1] == 1e-8
+
+    def test_small_fp8_block_scale_is_not_floored(self):
+        """Representable small FP8 block scales must survive LSQ init and keep their gradient.
+
+        global_amax = maxbound * 448 maps per-tensor scale P to E4M3 code 448, so the
+        block scales below are E4M3 codes. The floor must be the smallest E4M3 code
+        (2**-9), not 2**-9 * P (code 0.875).
+        """
+        q = self._make_lsq_quantizer()
+        maxbound = q._quant_max_bound
+        expected = torch.tensor([2**-9, 1 / 32, 1.0, 448.0])
+        q._quantize_scales = True
+        q.global_amax = torch.tensor(maxbound * _FP8_E4M3_MAX)
+        q._amax_post.data.copy_(expected * maxbound)
+
+        scale = q._block_scale_from_amax(q.amax_post, quantize=True)
+        assert torch.equal(scale, expected)
+
+        # Blocks above the floor get the unclamped LSQ gradient d(amax / maxbound) / d(amax).
+        scale.sum().backward()
+        assert torch.allclose(q._amax_post.grad[1:], torch.full_like(expected[1:], 1 / maxbound))
 
 
 class TestLSQSharedGlobalAmax:
@@ -493,7 +515,7 @@ class TestLSQSharedGlobalAmax:
             expected = _amax_to_scale(torch.tensor(new_value), member._quant_max_bound)
             scale = member._block_scale_from_amax(member.amax_post, quantize=True)
             assert scale.shape == member.amax_post.shape
-            assert torch.all(scale >= _FP8_E4M3_MIN_POSITIVE * expected)
+            assert torch.all(scale >= _FP8_E4M3_MIN_POSITIVE * expected / _FP8_E4M3_MAX)
 
     def test_members_produce_identical_output_after_shared_update(self):
         members = self._make_tied_lsq_group(global_amax=3.0)

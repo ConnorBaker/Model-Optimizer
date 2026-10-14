@@ -69,6 +69,7 @@ from ..functional import normalized_hadamard_transform
 # torch.finfo(...).tiny gives the smallest normal E4M3 value; scale clamping needs
 # the smallest positive subnormal value representable by the 3-bit mantissa.
 _FP8_E4M3_MIN_POSITIVE = torch.finfo(torch.float8_e4m3fn).smallest_normal / (2**3)
+_FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 __all__ = [
     "GroupedQuantizer",
@@ -1729,7 +1730,7 @@ class StaticBlockScaleQuantizer(TensorQuantizer):
         """Compute the per-block scale from a per-block amax, optionally FP8-quantizing it."""
         if quantize:
             per_tensor_scale = _amax_to_scale(self.global_amax, self._quant_max_bound)
-            min_value = _FP8_E4M3_MIN_POSITIVE * per_tensor_scale.view(-1)
+            min_value = _FP8_E4M3_MIN_POSITIVE * per_tensor_scale.view(-1) / _FP8_E4M3_MAX
             scale = _amax_to_scale(amax, self._quant_max_bound, min_value=min_value)
             return scaled_e4m3(scale, per_tensor_scale, None, 4, 3)
         return _amax_to_scale(amax, self._quant_max_bound, min_value=1e-8)
