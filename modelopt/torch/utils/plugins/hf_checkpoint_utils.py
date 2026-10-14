@@ -853,10 +853,7 @@ def ensure_local_checkpoint(
     Under ``torch.distributed`` rank 0 of ``group`` resolves the checkpoint -- whether it is a local
     directory, and if not, downloading it once -- and the other ranks of ``group`` wait for its
     result, so every rank of ``group`` (and only those) must call this. The checkpoint, or the
-    Hugging Face cache it lands in, must then be on storage all of them can see. In a distributed
-    :class:`~modelopt.torch.utils.distributed.ModelOptSession` the session keeps the answer
-    (``checkpoints``), so each checkpoint is resolved once per run and later calls communicate
-    nothing.
+    Hugging Face cache it lands in, must then be on storage all of them can see.
 
     Args:
         model_name_or_path: Hub model ID or local checkpoint directory.
@@ -867,20 +864,10 @@ def ensure_local_checkpoint(
     Returns:
         ``(hub_model_id, local_checkpoint_path)``.
     """
-    from modelopt.torch.utils.distributed import get_active_mo_session
-
     if group is None and not (
         torch.distributed.is_available() and torch.distributed.is_initialized()
     ):
         return _make_local(model_name_or_path)
-    session = get_active_mo_session(required=False)
-    if group is None and session.initialized and session.distributed:
-        name, known = str(model_name_or_path), session.checkpoints or {}
-        if name not in known:
-            known = session.decide(
-                "checkpoints", lambda: {**known, name: _make_local(model_name_or_path)}
-            )
-        return _visible(model_name_or_path, *known[name])
 
     # Rank 0 decides even for a local path: ranks that each checked for themselves could disagree
     # (a directory on one node's local disk) and part of them would wait here forever. Without a
@@ -907,13 +894,6 @@ def ensure_local_checkpoint(
         raise RuntimeError(
             f"Rank 0 could not make {str(model_name_or_path)!r} local: {error_message}"
         )
-    return _visible(model_name_or_path, hub_model_id, local_checkpoint_path)
-
-
-def _visible(
-    model_name_or_path: str | os.PathLike, hub_model_id: str | None, local_checkpoint_path: str
-) -> tuple[str | None, str]:
-    """Rank 0's answer, once this rank has checked it can see the checkpoint there too."""
     if not os.path.isdir(local_checkpoint_path):
         raise RuntimeError(
             f"Rank 0 has {str(model_name_or_path)!r} at {local_checkpoint_path}, which this rank "

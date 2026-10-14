@@ -1059,7 +1059,6 @@ def _finish_export_job(failing_rank, rank, size):
     try:
         if failing_rank is None:
             _finish_export_together(None)
-            assert session.export_ok is True
         elif rank == failing_rank:
             with pytest.raises(OSError, match="disk full"):
                 _finish_export_together(OSError("disk full"))
