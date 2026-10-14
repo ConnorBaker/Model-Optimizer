@@ -3,8 +3,8 @@
 GDN/KDA state QAT must reproduce the state consumed by serving. This requires
 matching the quantization boundaries, scale groups, native arithmetic, and output
 read timing. The implementation combines a native chunked prefix with a recurrent
-suffix, using FLA's recurrence backward for the prefix and a Torch adjoint for
-the suffix.
+suffix. Each stage runs one native forward; prefix backward uses upstream FLA
+helpers, and decode uses an explicit recurrence backward.
 
 ## Why chunk-only quantization does not match decode
 
@@ -109,11 +109,26 @@ QDQ twice or comparing different kernel specializations.
 State QDQ uses TensorQuantizer. The block32 INT8 recipe uses one scale per key
 row and 32 value channels and encodes at handoff and every suffix token.
 
-The backward uses FLA's recurrence for the prefix, a Torch adjoint for the suffix,
-and identity STE through casts and QDQ. This approximation supplies gradients
-through the prefix, handoff, and token writes. It is not an exact derivative of the discontinuous quantizer.
+| Stage | Forward | Backward |
+| --- | --- | --- |
+| Prefix | One native vLLM chunked prefill | Reconstruct intra-chunk factors, then upstream FLA backward |
+| Suffix token | One native vLLM decode | Explicit recurrence adjoint |
+| State QDQ | ModelOpt TensorQuantizer | Identity STE |
+
+Backward reconstruction avoids retaining a second full FLA forward graph. Decode
+also has no second Torch recurrence in forward. These first-order approximations
+propagate gradients through the prefix, handoff and recurrent writes; they are
+not exact derivatives of floating-point rounding or a discontinuous quantizer.
+
+Matching the selected serving trajectory does not establish the best QAD training
+strategy. A controlled comparison with chunk-boundary QDQ training is deferred.
 
 ## Validation results
+
+The single-forward refactor passed 27 GPU tests on an H100 with vLLM 0.30.0 and
+FLA 0.5.1, including native output/state equality, independent backward
+comparisons, handoff gradients and padding. A fresh-cache run completed those
+tests in 9m32s; this is test runtime, not model throughput.
 
 The current public profile targets vLLM 0.30.0 and FLA 0.5.1. Twelve focused
 GDN/KDA kernel tests passed on an RTX A6000 for the parent implementation. They

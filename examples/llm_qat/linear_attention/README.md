@@ -311,7 +311,8 @@ tests use a GDN provider; a KDA trainer needs a compatible provider.
 Native-cache and gradient checks are summarized in
 [State quantization alignment](STATE_QUANTIZATION.md#validation-results).
 
-The recurrent suffix uses Python orchestration and a Torch adjoint, so long
-suffixes can be slow. Kernel/cache agreement does not establish pretrained-model
+The recurrent suffix uses Python orchestration and an explicit recurrence
+backward, so long suffixes can be slow. Each prefix and suffix token runs one
+native forward. Kernel/cache agreement does not establish pretrained-model
 quality recovery, full serving-engine equivalence, or training speed. Prefill
 GEMM quantization and approximate inverse are outside this example.
