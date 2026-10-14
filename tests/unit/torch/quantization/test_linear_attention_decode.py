@@ -19,7 +19,7 @@ import torch
 from modelopt.torch.quantization.config import QuantizeConfig, QuantizerAttributeConfig
 from modelopt.torch.quantization.linear_attention import LinearAttentionConfig, kda_state_qat
 from modelopt.torch.quantization.linear_attention import training as state_training
-from modelopt.torch.quantization.linear_attention.utils import _state_qdq
+from modelopt.torch.quantization.linear_attention.utils import _state_qdq, state_quantizer_config
 from modelopt.torch.quantization.nn import TensorQuantizer
 
 
@@ -37,6 +37,22 @@ def test_state_qdq_matches_tensor_quantizer(state_format):
     )
     actual = _state_qdq(value, quantizer, 16)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    probe = torch.randn_like(value)
+    (gradient,) = torch.autograd.grad((actual * probe).sum(), value)
+    torch.testing.assert_close(gradient, probe, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("block_size", [16, 32, 64, 128])
+def test_fp8_state_blocks_match_tensor_quantizer(block_size):
+    value = torch.randn(1, 2, 3, 133, requires_grad=True)
+    quantizer = TensorQuantizer(
+        QuantizerAttributeConfig(
+            num_bits=(4, 3), type="dynamic", block_sizes={-1: block_size}, pass_through_bwd=True
+        )
+    )
+    assert state_quantizer_config(quantizer) == ("fp8_e4m3", block_size)
+    actual = _state_qdq(value, quantizer)
+    torch.testing.assert_close(actual, quantizer(value), rtol=0, atol=0)
     probe = torch.randn_like(value)
     (gradient,) = torch.autograd.grad((actual * probe).sum(), value)
     torch.testing.assert_close(gradient, probe, rtol=0, atol=0)

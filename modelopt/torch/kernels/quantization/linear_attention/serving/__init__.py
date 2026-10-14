@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Optional vLLM forward kernels for linear-attention serving precision profiles."""
+"""Training adapter for native vLLM linear-attention forward kernels.
+
+ModelOpt owns the training state, QDQ and backward. This package imports the
+selected serving arithmetic; it does not modify the vLLM engine or scheduler.
+"""
 
 try:
     import vllm

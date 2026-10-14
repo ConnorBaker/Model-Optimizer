@@ -148,8 +148,27 @@ The tests qualify the selected native kernels, not arbitrary server dispatch.
 
 Packed boundaries must match the layer's actual (including padding) boundaries.
 Validation reads their values rather than trusting tensor versions, so it can synchronize
-CUDA metadata. Prefix backward still runs a separate FLA recurrence as an adjoint;
-this implementation is not an optimized fused training kernel.
+CUDA metadata. Forward runs one native vLLM prefix and one native decode per
+suffix token. Prefix backward reconstructs intermediates and calls upstream FLA
+backward; decode uses an explicit recurrence backward. QDQ uses an identity STE.
+The `linear_attention/serving` package is a training adapter for these kernels;
+it does not integrate with the vLLM engine or scheduler.
+
+State FP8 block size uses the existing TensorQuantizer settings in `quant_cfg`:
+
+```python
+state_fp8 = {
+    "num_bits": (4, 3),
+    "type": "dynamic",
+    "block_sizes": {-1: 32},  # 16, 32, 64 or 128 value channels per key row
+    "pass_through_bwd": True,
+}
+cfg["quant_cfg"].append({"quantizer_name": "*state_quantizer", "cfg": state_fp8})
+```
+
+These blocks each have their own dynamic scale. The legacy `axis=(0, 1)` setting
+instead shares a scale across a full-key tile; `state_block_v` only controls that
+legacy tile's width. NVFP4 state support is a separate extension.
 
 ---
 

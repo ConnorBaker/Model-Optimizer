@@ -95,10 +95,7 @@ def validate_gdn_quantizer(
         and (quantizer.num_bits != 8 or (not quantizer.unsigned and quantizer.narrow_range))
         and (
             quantizer.block_sizes is None
-            or (
-                quantizer.num_bits == 8
-                and quantizer.block_sizes in ({-1: size} for size in block_sizes)
-            )
+            or (quantizer.block_sizes in ({-1: size} for size in block_sizes))
         )
         and quantizer.fake_quant
         and quantizer._pass_through_bwd
@@ -110,7 +107,7 @@ def validate_gdn_quantizer(
     ):
         raise ValueError(
             f"{name} supports only dynamic fake quantization with num_bits in {num_bits}, "
-            f"INT8 block_sizes in {block_sizes} (or no blocks), "
+            f"block_sizes in {block_sizes} (or no blocks), "
             "pass_through_bwd=True, no rotation, pre-scaling, bias, constant "
             "amax, or custom backend. Other gradient rules and formats are not implemented."
         )
@@ -124,7 +121,7 @@ def state_quantizer_config(
     A zero group size retains the legacy policy's full-key state tiles.
     """
     validate_gdn_quantizer(
-        quantizer, name=name, num_bits=tuple(_STATE_FORMATS), block_sizes=(16, 32, 64)
+        quantizer, name=name, num_bits=tuple(_STATE_FORMATS), block_sizes=(16, 32, 64, 128)
     )
     if quantizer.block_sizes is not None:
         return _STATE_FORMATS[quantizer.num_bits], quantizer.block_sizes[-1]
