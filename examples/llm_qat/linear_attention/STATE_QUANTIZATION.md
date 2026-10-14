@@ -36,8 +36,7 @@ repair this forward mismatch.
 
 Matching the QDQ schedule alone is insufficient. BF16 casts, reduction order,
 normalization, and gate evaluation can change values near quantization thresholds.
-ReplaySSM also reconstructs state from a checkpoint and a weighted BF16 update
-ring. An algebraically equivalent FP32 recurrence can follow a different rounded
+An algebraically equivalent FP32 recurrence can follow a different rounded
 trajectory. Training therefore imports the selected serving forward kernels.
 
 ## Match each training phase to serving
@@ -47,7 +46,7 @@ selects native prefill followed by native recurrence:
 
 ```text
 prompt tokens                         completion tokens
-[native chunked prefill] -> encoded handoff -> [native token/replay updates]
+[native chunked prefill] -> encoded handoff -> [native token updates]
        training prefix                           training suffix
 ```
 
@@ -56,7 +55,7 @@ prompt tokens                         completion tokens
 | Fresh prefix | Native chunked prefill without internal state QDQ | One native prompt-prefill call |
 | Continuation prefix | Encode its incoming nonzero state | Quantize the state supplied to a continuation-prefill call |
 | Handoff | Encode final prefix state when the suffix is nonempty | Quantize incoming state before the first decode token |
-| Suffix | Native updates with token writes or replay checkpoint refreshes | The selected decode/cache implementation |
+| Suffix | Native updates with state QDQ after every token | The selected decode/cache implementation |
 
 The prefix stays chunked because it represents serving prefill. Adding QDQ after
 every 64-token training chunk would introduce boundaries absent from a single
@@ -105,32 +104,14 @@ This argument requires matching inputs, initial states, QDQ format/grouping,
 runtime settings, and update/readout arithmetic. It does not justify applying
 QDQ twice or comparing different kernel specializations.
 
-## INT8, Hadamard, and ReplaySSM
+## INT8 state QDQ and backward
 
-Ordinary state QDQ uses TensorQuantizer. The block32 INT8 recipe uses one scale
-per key row and 32 value channels and encodes at handoff and every suffix token.
-
-The native ReplaySSM profile instead rotates groups of 32 value channels into a
-Hadamard basis, then scales, rounds to INT8, and reconstructs the checkpoint.
-Hadamard rotation and quantization are separate operations. Checkpoints use a
-scale per key row and 32-value group, with FP16 scale metadata.
-
-With `replay_window=1`, every token refreshes the checkpoint. Larger windows keep
-that checkpoint and append each native key/update vector once in BF16, then
-refresh at the window boundary. GDN uses scalar decay; KDA's channel-dependent
-decay acts on the key axis while Hadamard rotates the value axis. The update ring,
-rounding, and checkpoint schedule all need to match serving.
-
-The adapter imports the native encoder and recurrent kernels from a compatible
-quantized-ReplaySSM fork. These interfaces, including KDA vector-gate support,
-are separate from the public vLLM profile and ordinary state-only fake quantization.
-Temporary native cache buffers protect tensors needed by backward. The persistent
-training carry remains floating fake-QDQ data.
+State QDQ uses TensorQuantizer. The block32 INT8 recipe uses one scale per key
+row and 32 value channels and encodes at handoff and every suffix token.
 
 The backward uses FLA's recurrence for the prefix, a Torch adjoint for the suffix,
 and identity STE through casts and QDQ. This approximation supplies gradients
-through the prefix, handoff, token writes, and checkpoint refreshes. It is not an
-exact derivative of the discontinuous quantizer.
+through the prefix, handoff, and token writes. It is not an exact derivative of the discontinuous quantizer.
 
 ## Validation results
 
@@ -157,9 +138,8 @@ HF weights alone do not enable state quantization in Transformers or vLLM. The
 exact numerical round-trip check restores ModelOpt metadata after reimporting
 those weights into Megatron.
 
-Older vLLM and private ReplaySSM results do not qualify this updated workflow.
-ReplaySSM requires its separate compatible fork and a fresh validation run;
-KDA Bridge training also requires a provider for the chosen checkpoint.
+Older vLLM results do not qualify this updated workflow. KDA Bridge training
+also requires a provider for the chosen checkpoint.
 
 Kernel agreement does not establish full-model serving equivalence. Model
 conversion, projections, convolution, normalization, engine-managed multi-call

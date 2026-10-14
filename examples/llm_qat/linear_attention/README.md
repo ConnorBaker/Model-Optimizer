@@ -52,9 +52,7 @@ pip install -r examples/llm_qat/linear_attention/requirements-vllm.txt
 ```
 
 The example pins `fla-core==0.5.1` and public `vllm==0.30.0`. vLLM supplies forward
-kernels; no running server is needed for training. INT8 + Hadamard and ReplaySSM
-require a compatible quantized-ReplaySSM fork instead of public vLLM, including
-its KDA vector-gate kernel when training KDA.
+kernels; no running server is needed for training.
 
 ## Run QAT or QAD
 
@@ -108,19 +106,13 @@ execution policy. They use dynamic quantization without a calibration pass.
 | Recipe | State quantization | Runtime |
 | --- | --- | --- |
 | `linear_attention_state_int8_block32_dynamic` (default) | INT8 QDQ at handoff and every suffix token; one scale per key row and 32 value channels | Public vLLM |
-| `linear_attention_state_int8_dynamic` | INT8 with Hadamard rotation over 32 value channels; checkpoint every suffix token | Compatible quantized-ReplaySSM fork |
-| Same Hadamard recipe with `replay_window=8` | Checkpoint at handoff and every eight suffix tokens; BF16 key/update ring between refreshes | Compatible quantized-ReplaySSM fork |
-
-Hadamard requires the value dimension to be divisible by 32. The state-only vLLM
-fake-quant adapter targets ordinary TensorQuantizer QDQ; the Hadamard/replay
-recipes target the separate native ReplaySSM implementation.
 
 ModelOpt separates quantization settings from execution and batch metadata:
 
 | Setting | Purpose | Where it belongs |
 | --- | --- | --- |
 | `TensorQuantizer` | Enable state QDQ; select format and scale grouping | Recipe `quant_cfg` |
-| `LinearAttentionConfig` | Select native arithmetic and checkpoint frequency | Recipe `linear_attention` rules |
+| `LinearAttentionConfig` | Select native arithmetic | Recipe `linear_attention` rules |
 | Prefix lengths | Specify where each sequence switches to recurrence | `linear_attention_training_phase` at runtime |
 
 For example, a complete recipe can select this execution policy:
@@ -130,8 +122,7 @@ linear_attention:
   - module_name: "*"
     cfg:
       backend: serving
-      precision: replayssm
-      replay_window: 8
+      precision: vllm
 ```
 
 `precision="vllm"` selects vLLM 0.30.0's Triton GDN kernels and standalone
@@ -140,26 +131,14 @@ KDA kernels. For GDN serving, select `gdn_prefill_backend="triton"` and enable
 batches are outside this profile. Standalone KDA has no model-level serving
 guarantee; Kimi-Linear/Kimi-K3 on vLLM 0.30 requires `precision="vllm_kimi_k3"`,
 both KDA backends set to `triton`, and an unbounded softplus gate.
-`precision="replayssm"` selects native INT8/Hadamard
-checkpoints. `replay_window=1` refreshes every token; values from 2 to 64 require
-ReplaySSM. The prefill chunk size of 64 is independent of this suffix window.
 
 `TensorQuantizer.block_sizes` owns blockwise scale grouping. `state_block_v`
 controls the execution tile width and legacy per-tile grouping; it does not
 replace `block_sizes`. An execution policy alone does not enable a quantizer.
 Importing only a recipe unit configures the quantizers without its full policy.
 
-To change the Hadamard checkpoint window in Python:
-
-```python
-from modelopt.recipe import load_recipe
-
-cfg = load_recipe("general/ptq/linear_attention_state_int8_dynamic").quantize.model_dump()
-cfg["linear_attention"][0]["cfg"]["replay_window"] = 8
-```
-
-For the CLI, put the modified recipe in a YAML file and pass its path to
-`--recipe`. State QAT requires `backend="serving"` and explicit prefix lengths.
+For a custom recipe, pass its YAML path to `--recipe`. State QAT requires
+`backend="serving"` and explicit prefix lengths.
 
 ## Supply prefill/decode boundaries in a training loop
 
