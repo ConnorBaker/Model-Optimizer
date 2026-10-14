@@ -100,7 +100,7 @@ def compiled_prefix(request):
     gate = -rate.exp() * torch.nn.functional.softplus(raw_gate + bias)
     beta = raw_beta.sigmoid()
     kwargs = {
-        "scale": 0.3,
+        "scale": 32**-0.5,
         "beta_dtype": torch.float32,
         "normalize": True,
         "gate_inputs": (raw_gate, raw_beta, rate, bias),
@@ -115,7 +115,7 @@ def compiled_prefix(request):
         beta[None],
         initial_state=state[None],
         output_final_state=True,
-        scale=0.3,
+        scale=kwargs["scale"],
         use_qk_l2norm_in_kernel=True,
     )
     torch.cuda.synchronize()
