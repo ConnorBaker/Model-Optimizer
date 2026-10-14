@@ -219,12 +219,14 @@ def test_serving_state_qdq_and_handoff_gradient(compiled_serving_case):
             assert not torch.equal(output[:, 65:], plain[:, 65:])
             # A nonzero nonsymmetric state checks layout against an independent oracle.
             initial = torch.randn(1, 1, args[0].shape[-1], args[2].shape[-1], device="cuda")
-            for prefix in (67, 65):
-                actual, final = forward(prefill_lengths=[prefix], initial_state=initial)
-                q, k, v, raw_g, raw_beta, rate, bias = [x.float() for x in args]
+            # Reuse the compiled 65-token prefix for full-prefill and suffix cases.
+            for tokens in (65, 67):
+                inputs = [x[:, :tokens] if i < 5 else x for i, x in enumerate(args)]
+                actual, final = forward(inputs=inputs, initial_state=initial)
+                q, k, v, raw_g, raw_beta, rate, bias = [x.float() for x in inputs]
                 q, k = [x / (x.square().sum(-1, keepdim=True) + 1e-6).sqrt() for x in (q, k)]
-                q[:, :prefix] = q[:, :prefix].bfloat16().float()
-                k[:, :prefix] = k[:, :prefix].bfloat16().float()
+                q[:, :65] = q[:, :65].bfloat16().float()
+                k[:, :65] = k[:, :65].bfloat16().float()
                 gate = -rate.exp().reshape(
                     (1, 1, -1, 1) if raw_g.ndim == 4 else (1, 1, -1)
                 ) * torch.nn.functional.softplus(raw_g + bias.reshape(raw_g.shape[2:]))
@@ -240,7 +242,7 @@ def test_serving_state_qdq_and_handoff_gradient(compiled_serving_case):
 @pytest.fixture(scope="module")
 @torch.no_grad()
 def compiled_gdn_layout_case():
-    """Compile a two-head case so strided head/value axes are observable."""
+    """Compile two-head decode so strided head/value axes are observable."""
     torch.manual_seed(732)
     q, k, v = [torch.randn(1, 2, 2, 32, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
     raw_g, raw_beta = [torch.randn(1, 2, 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
@@ -257,7 +259,7 @@ def compiled_gdn_layout_case():
             raw_beta.float().sigmoid(),
             policy=LinearAttentionConfig(backend="serving"),
             initial_state=initial,
-            prefill_lengths=[1],
+            prefill_lengths=[0],
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             gate_inputs=gate_inputs,
@@ -376,18 +378,15 @@ def test_padding_does_not_extend_decode(compiled_serving_case, packed):
 
     if not packed:
         with torch.no_grad():
-            prefill, prefill_state = forward(
-                inputs=trimmed, prefill_lengths=[valid], initial_state=initial[:1]
-            )
+            prefix_inputs = [x[:, :65] if i < 5 else x for i, x in enumerate(trimmed)]
+            prefill, prefill_state = forward(inputs=prefix_inputs, initial_state=initial[:1])
             padded_prefill, padded_state = forward(
                 inputs=padded,
-                prefill_lengths=[valid, 0],
-                sequence_lengths=[valid, 0],
+                prefill_lengths=[65, 0],
+                sequence_lengths=[65, 0],
                 initial_state=initial,
             )
-        torch.testing.assert_close(padded_prefill[:1, :valid], prefill, rtol=0, atol=0)
+        torch.testing.assert_close(padded_prefill[:1, :65], prefill, rtol=0, atol=0)
         torch.testing.assert_close(padded_state[:1], prefill_state, rtol=0, atol=0)
         torch.testing.assert_close(padded_state[1], initial[1], rtol=0, atol=0)
-        assert (
-            not padded_prefill[0, valid:].count_nonzero() and not padded_prefill[1].count_nonzero()
-        )
+        assert not padded_prefill[0, 65:].count_nonzero() and not padded_prefill[1].count_nonzero()
