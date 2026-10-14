@@ -54,7 +54,35 @@ pip install -r examples/llm_qat/linear_attention/requirements-vllm.txt
 The example pins `fla-core==0.5.1` and public `vllm==0.30.0`. vLLM supplies forward
 kernels; no running server is needed for training.
 
-## Run QAT or QAD
+## Use prompt boundaries from data
+
+For prompt-completion data, pass a directory containing `training.jsonl` records
+with `input` and `output` fields. `input` is the full rendered prompt, including
+chat-role delimiters and any earlier turns; `output` is the selected assistant
+continuation. Bridge tokenization supplies `context_lengths` and `token_count`.
+The phase uses those prompt lengths and excludes right padding using the valid
+input length (`token_count - 1`, accounting for the next-token label shift).
+Loss masks remain dataset-owned; their values are not used to guess lengths.
+
+```bash
+bash examples/llm_qat/linear_attention/with_vllm_defaults.sh \
+  torchrun --standalone --nproc-per-node=1 examples/llm_qat/linear_attention/train.py \
+  --model /path/to/local-model --sft-data /path/to/prompt-completion-data \
+  --output /path/to/qat-checkpoint --length 1024 --train-steps 10
+```
+
+Add `--teacher-model` for QAD. Omit `--prefill-tokens` to use each record's
+prompt boundary. This data-driven CLI currently supports TP/DP with PP=CP=1;
+fixed token splits below retain the existing PP support. Multi-turn conversations
+should be rendered into prompt/target pairs, selecting the assistant turn in
+preprocessing rather than scanning arbitrary token IDs during training.
+
+A custom packed collator can use `run_training(..., prefill_tokens=None)` and
+supply per-segment `prefill_lengths`, `sequence_lengths` and actual packed
+storage boundaries (`cu_seqlens_q_padded` when present). Padded boundaries alone
+do not identify real tokens. The example does not provide a chat packer.
+
+## Run QAT or QAD with a fixed split
 
 ```bash
 bash examples/llm_qat/linear_attention/with_vllm_defaults.sh \
@@ -82,7 +110,7 @@ bash examples/llm_qat/linear_attention/with_vllm_defaults.sh \
 Student and teacher must have matching tokenizer vocabularies and output
 vocabulary dimensions. QAD uses
 `kd_loss_alpha=1.0`, disabling the language-model loss. Both modes use Bridge
-`pretrain()`; QAD wraps the student in Bridge's `DistillationProvider`. Both modes
+`pretrain()`; QAD wraps the student in Bridge's `DistillationProvider`. Both fixed-split modes
 mask loss to positions after `--prefill-tokens`.
 
 Only the student's linear-attention parameters are trainable; the remaining

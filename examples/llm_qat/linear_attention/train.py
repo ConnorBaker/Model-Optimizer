@@ -18,14 +18,17 @@
 import argparse
 from contextlib import ExitStack
 from pathlib import Path
+from typing import Any
 
 import torch
+from batch import phase_lengths
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.distillation_provider import convert_to_distillation_provider
 from megatron.bridge.training.config import (
     CheckpointConfig,
     ConfigContainer,
     DistributedDataParallelConfig,
+    FinetuningDatasetConfig,
     GPTDatasetConfig,
     LoggerConfig,
     OptimizerConfig,
@@ -44,6 +47,7 @@ from megatron.bridge.training.post_training.distillation import ModelOptDistillC
 from megatron.bridge.training.pretrain import pretrain
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
+from megatron.core import parallel_state
 from megatron.core.ssm import gated_delta_net
 from megatron.core.utils import unwrap_model
 from transformers import AutoTokenizer
@@ -54,9 +58,14 @@ from modelopt.torch.quantization.linear_attention import linear_attention_traini
 from modelopt.torch.quantization.utils import is_quantized
 
 
-def run_training(config, quant_config, prefill_tokens, teacher_provider=None):
-    """Delegate optimization and checkpointing to Bridge, with a fixed phase per sequence."""
-    if not 0 <= prefill_tokens < config.dataset.seq_length:
+def run_training(config, quant_config, prefill_tokens=None, teacher_provider=None):
+    """Run Bridge with fixed smoke-test splits or collator-provided prompt boundaries."""
+    data_lengths = prefill_tokens is None or isinstance(config.dataset, FinetuningDatasetConfig)
+    if data_lengths and config.model.pipeline_model_parallel_size > 1:
+        raise ValueError(
+            "Data-derived state-QAT phases currently require PP=1; fixed splits support PP"
+        )
+    if prefill_tokens is not None and not 0 <= prefill_tokens < config.dataset.seq_length:
         raise ValueError("prefill-tokens must leave at least one suffix label")
     resume = config.checkpoint.load and has_modelopt_state(config.checkpoint.load)
     with ExitStack() as phases:
@@ -80,11 +89,12 @@ def run_training(config, quant_config, prefill_tokens, teacher_provider=None):
                     layer.requires_grad_(True)
                 if not is_quantized(student):
                     mtq.quantize(student, quant_config)
-                phases.enter_context(
-                    linear_attention_training_phase(
-                        student, [prefill_tokens] * config.train.micro_batch_size
+                if not data_lengths:
+                    phases.enter_context(
+                        linear_attention_training_phase(
+                            student, [prefill_tokens] * config.train.micro_batch_size
+                        )
                     )
-                )
             return models
 
         def masked_batch(data_iterator):
@@ -94,6 +104,34 @@ def run_training(config, quant_config, prefill_tokens, teacher_provider=None):
             yield batch
 
         def forward_step(state: GlobalState, data_iterator, model, return_schedule_plan=False):
+            if data_lengths:
+                # Read once on the TP source; broadcast metadata before Bridge broadcasts tensors.
+                group = parallel_state.get_tensor_model_parallel_group()
+                source = parallel_state.get_tensor_model_parallel_src_rank()
+                batch = None
+                metadata: list[Any] = [None]
+                if torch.distributed.get_rank() == source:
+                    try:
+                        batch = dict(next(data_iterator))
+                        metadata[0] = (phase_lengths(batch, prefill_tokens), None)
+                    except (ValueError, KeyError, StopIteration) as error:
+                        metadata[0] = (None, str(error))
+                torch.distributed.broadcast_object_list(metadata, src=source, group=group)
+                lengths, message = metadata[0]
+                if message is not None:
+                    raise ValueError(message)
+                prefix, valid, boundaries = lengths
+                if batch is not None and prefill_tokens is not None:
+                    batch["loss_mask"] = batch["loss_mask"].clone()
+                    if boundaries is None:
+                        batch["loss_mask"][..., :prefill_tokens] = 0
+                    else:
+                        for start, count in zip(boundaries, prefix):
+                            batch["loss_mask"].view(-1)[start : start + count] = 0
+                with linear_attention_training_phase(
+                    unwrap_model(model), prefix, sequence_lengths=valid, cu_seqlens=boundaries
+                ):
+                    return forward_step_modelopt(state, iter([batch]), model, return_schedule_plan)
             # Consume lazily: middle pipeline stages may not need any batch tensors.
             return forward_step_modelopt(
                 state, masked_batch(data_iterator), model, return_schedule_plan
@@ -130,10 +168,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--teacher-model", type=Path, help="Unquantized teacher; enables QAD")
-    parser.add_argument(
+    data = parser.add_mutually_exclusive_group(required=True)
+    data.add_argument(
+        "--sft-data", type=Path, help="Bridge prompt-completion directory with training.jsonl"
+    )
+    data.add_argument(
         "--train-data",
         type=Path,
-        required=True,
         help="Megatron tokenized dataset prefix (.bin/.idx)",
     )
     parser.add_argument(
@@ -145,7 +186,9 @@ def main():
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--train-steps", type=int, default=1)
     parser.add_argument("--length", type=int, default=128)
-    parser.add_argument("--prefill-tokens", type=int, default=64)
+    parser.add_argument(
+        "--prefill-tokens", type=int, help="Fixed split override; required for token-only data"
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--global-batch-size", type=int, default=1)
@@ -155,14 +198,25 @@ def main():
     options = parser.parse_args()
     if options.train_steps < 1 or options.length < 2:
         parser.error("train-steps must be positive and length must be at least two")
-    if not 0 <= options.prefill_tokens < options.length:
+    if options.train_data and options.prefill_tokens is None:
+        parser.error(
+            "Token-only --train-data needs --prefill-tokens; use --sft-data for prompt boundaries"
+        )
+    if options.prefill_tokens is not None and not 0 <= options.prefill_tokens < options.length:
         parser.error("prefill-tokens must leave at least one suffix label")
+    if options.sft_data and options.pp_size != 1:
+        parser.error("--sft-data state QAT currently requires --pp_size 1")
     if options.global_batch_size < 1:
         parser.error("global-batch-size must be positive")
     if min(options.tp_size, options.pp_size, options.ep_size) < 1:
         parser.error("Parallel sizes must be positive")
-    if any(not Path(f"{options.train_data}.{suffix}").is_file() for suffix in ("bin", "idx")):
+    if options.train_data and any(
+        not Path(f"{options.train_data}.{suffix}").is_file() for suffix in ("bin", "idx")
+    ):
         parser.error("train-data must name an existing Megatron .bin/.idx dataset prefix")
+
+    if options.sft_data and not (options.sft_data / "training.jsonl").is_file():
+        parser.error("--sft-data requires training.jsonl with input/output fields")
 
     recipe = load_recipe(options.recipe)
     if not isinstance(recipe, ModelOptPTQRecipe):
@@ -216,16 +270,36 @@ def main():
         ddp=DistributedDataParallelConfig(
             average_in_collective=False, use_distributed_optimizer=True
         ),
-        dataset=GPTDatasetConfig(
-            seq_length=options.length,
-            blend=([str(options.train_data)], None),
-            split="100,0,0",
-            random_seed=options.seed,
-            reset_position_ids=False,
-            reset_attention_mask=False,
-            eod_mask_loss=False,
-            dataloader_type="single",
-            num_workers=0,
+        dataset=(
+            FinetuningDatasetConfig(
+                seq_length=options.length,
+                dataset_root=str(options.sft_data),
+                seed=options.seed,
+                dataloader_type="batch",
+                do_validation=False,
+                do_test=False,
+                dataset_kwargs={
+                    "prompt_template": "{input}{output}",
+                    "label_key": "output",
+                    "answer_only_loss": True,
+                    "add_bos": False,
+                    "add_eos": True,
+                    "truncation_field": "input",
+                    "truncation_method": "left",
+                },
+            )
+            if options.sft_data
+            else GPTDatasetConfig(
+                seq_length=options.length,
+                blend=([str(options.train_data)], None),
+                split="100,0,0",
+                random_seed=options.seed,
+                reset_position_ids=False,
+                reset_attention_mask=False,
+                eod_mask_loss=False,
+                dataloader_type="single",
+                num_workers=0,
+            )
         ),
         tokenizer=TokenizerConfig(
             tokenizer_type="HuggingFaceTokenizer",

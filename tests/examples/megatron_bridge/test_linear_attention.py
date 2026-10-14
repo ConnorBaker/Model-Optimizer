@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import runpy
+import sys
 
 import pytest
 import torch
@@ -25,6 +27,7 @@ from megatron.bridge.training.config import (
     CheckpointConfig,
     ConfigContainer,
     DistributedDataParallelConfig,
+    FinetuningDatasetConfig,
     LoggerConfig,
     MockGPTDatasetConfig,
     OptimizerConfig,
@@ -48,12 +51,14 @@ from modelopt.torch.utils.plugins.mbridge import (
     load_modelopt_megatron_checkpoint,
 )
 
+sys.path.insert(0, str(MODELOPT_ROOT / "examples/llm_qat/linear_attention"))
 run_training = runpy.run_path(str(MODELOPT_ROOT / "examples/llm_qat/linear_attention/train.py"))[
     "run_training"
 ]
+sys.path.pop(0)
 
 
-def _train(qad, recipe, hf_model, checkpoint=None, train_iters=1):
+def _train(qad, recipe, hf_model, checkpoint=None, train_iters=1, prompt_data=None):
     captured = {}
 
     def provider(name):
@@ -76,6 +81,10 @@ def _train(qad, recipe, hf_model, checkpoint=None, train_iters=1):
                 def capture_loaded(attention, args):
                     # Bridge loads checkpoint weights after the model's wrapping hooks.
                     if "loaded" not in captured:
+                        captured["phase"] = (
+                            attention._linear_attention_prefill_lengths,
+                            attention._linear_attention_sequence_lengths,
+                        )
                         captured["loaded"] = attention.out_proj.weight.detach().clone()
 
                 module.decoder.layers[0].self_attention.register_forward_pre_hook(capture_loaded)
@@ -122,7 +131,26 @@ def _train(qad, recipe, hf_model, checkpoint=None, train_iters=1):
         rng=RNGConfig(seed=123),
         mixed_precision="bf16_mixed",
     )
-    run_training(config, recipe, 8, provider("teacher") if qad else None)
+    if prompt_data:
+        config.dataset = FinetuningDatasetConfig(
+            seq_length=16,
+            dataset_root=str(prompt_data),
+            seed=123,
+            dataloader_type="batch",
+            do_validation=False,
+            do_test=False,
+            dataset_kwargs={
+                "prompt_template": "{input}{output}",
+                "label_key": "output",
+                "answer_only_loss": True,
+                "add_bos": False,
+                "add_eos": True,
+            },
+        )
+        config.tokenizer = TokenizerConfig(
+            tokenizer_type="HuggingFaceTokenizer", tokenizer_model=str(hf_model)
+        )
+    run_training(config, recipe, None if prompt_data else 8, provider("teacher") if qad else None)
     return captured
 
 
@@ -258,3 +286,19 @@ def test_state_training_checkpoint_roundtrip(compiled_state_training, qad, tmp_p
     torch.testing.assert_close(
         _state_logits_and_gradients(reimported), expected_numerics, rtol=0, atol=0
     )
+
+
+def test_prompt_metadata_drives_qad_phase(compiled_state_training, tmp_path):
+    recipe, hf_model = compiled_state_training
+    (tmp_path / "training.jsonl").write_text(
+        json.dumps({"input": "a b c d ", "output": "e f g h"}) + "\n"
+    )
+    try:
+        captured = _train(True, recipe, hf_model, prompt_data=tmp_path)
+        prefix, valid = captured["phase"]
+        assert 0 < prefix[0] < valid[0] <= 16
+        attention = captured["student"].decoder.layers[0].self_attention
+        assert attention.gdn_state_quantizer.is_enabled
+        assert not torch.equal(attention.out_proj.weight, captured["before"])
+    finally:
+        reset_megatron_global_state()
