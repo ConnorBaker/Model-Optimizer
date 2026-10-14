@@ -1032,7 +1032,7 @@ def test_a_model_held_by_the_session_is_answered_from_its_record(tmp_path):
     session = _hold_in_session()
     try:
         record = session.register_model(model, source_checkpoint=str(tmp_path))
-        record.unplaced_source_keys = ["model.mtp.eh_proj.weight"]
+        record.unplaced_source_keys.decide(lambda: ["model.mtp.eh_proj.weight"])
 
         assert recorded_source_fact(model, "unplaced_source_keys") == ["model.mtp.eh_proj.weight"]
         assert recorded_source_fact(model, "source_checkpoint") == str(tmp_path)

@@ -106,7 +106,11 @@ def test_a_session_holds_the_loaded_model_and_its_facts(tmp_path, session):
     record = session.record_for(model)
     assert session.model is model
     assert record.source_checkpoint == str(tmp_path)
-    assert record.unplaced_source_keys == model._modelopt_unplaced_source_keys == ["mtp.fc.weight"]
+    assert (
+        record.unplaced_source_keys.value
+        == model._modelopt_unplaced_source_keys
+        == ["mtp.fc.weight"]
+    )
 
 
 def test_rank0_alone_works_out_the_unplaced_keys(tmp_path, session, monkeypatch):
@@ -129,7 +133,7 @@ def test_rank0_alone_works_out_the_unplaced_keys(tmp_path, session, monkeypatch)
 
     model = load_pretrained(str(tmp_path))
 
-    assert session.record_for(model).unplaced_source_keys == rank0_keys
+    assert session.record_for(model).unplaced_source_keys.value == rank0_keys
     assert model._modelopt_unplaced_source_keys == rank0_keys
 
 

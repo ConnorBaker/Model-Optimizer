@@ -1688,10 +1688,12 @@ def recorded_source_fact(model: nn.Module, fact: str) -> Any:
     a :class:`~modelopt.torch.utils.distributed.ModelOptSession` the model's record holds it, the
     same on every rank; otherwise the model itself does, as ``_modelopt_<fact>``.
     """
-    from modelopt.torch.utils.distributed import get_active_mo_session
+    from modelopt.torch.utils.distributed import Synced, get_active_mo_session
 
     record = get_active_mo_session(required=False).record_for(model)
     value = None if record is None else getattr(record, fact)
+    if isinstance(value, Synced):
+        value = value.value
     return getattr(model, f"_modelopt_{fact}", None) if value is None else value
 
 
