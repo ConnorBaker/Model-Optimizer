@@ -174,7 +174,9 @@ def _is_hf_format_checkpoint(checkpoint: str | None) -> bool:
     return any(os.path.isfile(os.path.join(checkpoint, f)) for f in hf_files)
 
 
-def setup_external_draft(recipe, training_args, base_model, draft=None, dry_run=False):
+def setup_external_draft(
+    recipe, training_args, base_model, draft=None, dry_run=False, base_tokenizer=None
+):
     """Convert an external draft and wire it to the base model.
 
     Runs on both the fresh-load and the HF-resume path. The base lm_head is never part
@@ -193,6 +195,8 @@ def setup_external_draft(recipe, training_args, base_model, draft=None, dry_run=
         draft: the already-loaded draft on the resume path; loaded here when None.
         dry_run: recipe validation only; skips the data-source requirement, as the
             ``data.data_path`` check in :func:`train` does.
+        base_tokenizer: the base's tokenizer when the caller already loaded it; the fresh
+            path has it, the resume path does not and leaves this None.
     """
     if recipe.draft_model_name_or_path is None:
         raise ValueError(
@@ -210,6 +214,12 @@ def setup_external_draft(recipe, training_args, base_model, draft=None, dry_run=
             "external draft training has no online path: the draft is scored against "
             "cached base outputs, which an online run does not produce. Set "
             "data.offline_data_path."
+        )
+    if training_args.cp_size > 1:
+        raise ValueError(
+            "external draft training does not support context parallelism: the draft is a "
+            "standalone model scored against cached base outputs, and nothing in this mode "
+            f"shards the sequence. Got cp_size={training_args.cp_size}; set it to 1."
         )
     base_vocab_size = base_model.config.vocab_size
     if draft is None:
@@ -238,10 +248,11 @@ def setup_external_draft(recipe, training_args, base_model, draft=None, dry_run=
     # with no acceptance. Equal sizes are not enough -- different tokenizers are
     # routinely padded to the same width -- so also check that the two agree on the ids.
     draft.validate_against_base(base_vocab_size)
-    base_tokenizer = transformers.AutoTokenizer.from_pretrained(
-        recipe.model.model_name_or_path,
-        trust_remote_code=recipe.model.trust_remote_code,
-    )
+    if base_tokenizer is None:
+        base_tokenizer = transformers.AutoTokenizer.from_pretrained(
+            recipe.model.model_name_or_path,
+            trust_remote_code=recipe.model.trust_remote_code,
+        )
     draft.validate_tokenizer_against_base(tokenizer, base_tokenizer)
     # The norm is not always at base_model.model.norm -- FakeBaseModel keeps it at .norm
     # -- so search the same paths the other offline modes use. It stays optional;
@@ -298,6 +309,14 @@ def train():
     checkpoint = training_args.resume_from_checkpoint or last_checkpoint
 
     use_offline_training = recipe.data.mode != "online"
+    if isinstance(recipe, ModelOptExternalDraftRecipe):
+        # This mode has no online path (see setup_external_draft), and the shipped recipe
+        # carries no data-source field, so mode resolves to "online" under --dry_run.
+        # Deriving the flag from it there would make load_vlm_or_llm ignore
+        # use_fake_base_for_offline and materialise every base decoder layer on every
+        # rank, and would route a VLM base to the real multimodal model, whose parent
+        # config has no vocab_size for validate_against_base to read.
+        use_offline_training = True
 
     # Resume path depends on the existing checkpoint's on-disk format: consolidated HF
     # weights load via from_pretrained; FSDP sharded checkpoints load the base model and
@@ -326,14 +345,12 @@ def train():
                     "model.model_name_or_path must be set to resume an external-draft run: "
                     "the base model supplies the lm_head the draft is scored against."
                 )
-            # Same arguments as the fresh path below. use_offline_training is True
-            # unconditionally because this mode has no online path -- and without it
-            # load_vlm_or_llm ignores use_fake_base and materialises every decoder
-            # layer, on every rank, to borrow an lm_head and a final norm.
+            # Same arguments as the fresh path below; use_offline_training is pinned
+            # True for this recipe above.
             base_model = load_vlm_or_llm(
                 recipe.model.model_name_or_path,
                 use_fake_base=recipe.model.use_fake_base_for_offline,
-                use_offline_training=True,
+                use_offline_training=use_offline_training,
                 dtype="auto",
                 device_map="cpu",
                 trust_remote_code=recipe.model.trust_remote_code,
@@ -392,7 +409,11 @@ def train():
             # This mode inverts the usual relationship: we train a pretrained draft, and
             # `model` loaded above is the base, kept only for its lm_head and vocabulary.
             model, tokenizer = setup_external_draft(
-                recipe, training_args, base_model=model, dry_run=dry_run
+                recipe,
+                training_args,
+                base_model=model,
+                dry_run=dry_run,
+                base_tokenizer=tokenizer,
             )
         else:
             raise ValueError(f"Unsupported speculative recipe type: {type(recipe).__name__}")

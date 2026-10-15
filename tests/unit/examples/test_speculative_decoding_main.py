@@ -101,7 +101,7 @@ def stub_tokenizers(monkeypatch, main_mod):
 
 
 def _training_args():
-    return types.SimpleNamespace(training_seq_len=128, device=torch.device("cpu"))
+    return types.SimpleNamespace(training_seq_len=128, device=torch.device("cpu"), cp_size=1)
 
 
 def test_resume_of_a_converted_checkpoint_does_not_reconvert(main_mod, stub_tokenizers, tmp_path):
@@ -196,3 +196,41 @@ def test_resume_honours_an_edited_external_section(main_mod, stub_tokenizers, tm
     assert out.external_loss == "tvd_deploy", (
         f"resume trained {out.external_loss!r} while the recipe asked for 'tvd_deploy'"
     )
+
+
+def test_context_parallelism_is_rejected(main_mod, stub_tokenizers):
+    """Nothing in this mode shards the sequence, so cp_size > 1 must refuse, not run.
+
+    main.py sets model.eagle_cp_size unconditionally further down, so without this the
+    draft trains with CP configured and silently ignored.
+    """
+    args = _training_args()
+    args.cp_size = 2
+    with pytest.raises(ValueError, match="context parallelism"):
+        main_mod.setup_external_draft(
+            _recipe(offline_data_path="/tmp/hidden"),
+            args,
+            base_model=_tiny_causal_lm(hidden=2 * HIDDEN),
+            draft=_tiny_causal_lm(),
+        )
+
+
+def test_caller_supplied_base_tokenizer_is_used(main_mod, monkeypatch):
+    """The fresh path already holds the base tokenizer; it must not be re-fetched."""
+    calls = []
+
+    def _from_pretrained(cls, *a, **k):
+        calls.append(a[0] if a else None)
+        return _FakeTok()
+
+    monkeypatch.setattr(
+        main_mod.transformers.AutoTokenizer, "from_pretrained", classmethod(_from_pretrained)
+    )
+    main_mod.setup_external_draft(
+        _recipe(offline_data_path="/tmp/hidden"),
+        _training_args(),
+        base_model=_tiny_causal_lm(hidden=2 * HIDDEN),
+        draft=_tiny_causal_lm(),
+        base_tokenizer=_FakeTok(),
+    )
+    assert calls == ["draft"], f"base tokenizer re-loaded: {calls}"
