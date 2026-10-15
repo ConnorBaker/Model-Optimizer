@@ -2041,7 +2041,7 @@ def sync_tied_input_amax(model: nn.Module, tied_map: "TiedWeightMap | None" = No
     for key, modules in by_group.items():
         if len(modules) < 2:
             continue
-        if key[0] == "moe":
+        if key[0] in ("moe", "moe_shared"):
             first_proj_attr = getattr(modules[0], "_first_proj_attr", "gate_up_proj")
             for q_name in (f"{first_proj_attr}_input_quantizer", "down_proj_input_quantizer"):
                 if _merge([getattr(m, q_name, None) for m in modules]):

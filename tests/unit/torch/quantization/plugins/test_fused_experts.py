@@ -28,9 +28,13 @@ from _test_utils.torch.quantization.tied_modules import tie_fused_experts_3d_par
 
 import modelopt.torch.quantization as mtq
 import modelopt.torch.quantization.nn.modules.tensor_quantizer as tensor_quantizer_module
-from modelopt.torch.export.model_utils import _release_exported_tensors
+from modelopt.torch.export.model_utils import TiedWeightMap, _release_exported_tensors
 from modelopt.torch.export.moe_utils import _export_fused_experts, _fallback_amax
-from modelopt.torch.export.quant_utils import get_quant_config, get_quantization_format
+from modelopt.torch.export.quant_utils import (
+    get_quant_config,
+    get_quantization_format,
+    sync_tied_input_amax,
+)
 from modelopt.torch.quantization.config import QuantizerAttributeConfig
 from modelopt.torch.quantization.conversion import _normalize_fused_experts_quantizer_name
 from modelopt.torch.quantization.model_calib import local_hessian_calibrate
@@ -947,6 +951,42 @@ class TestExportFusedExpertsTiedDedup:
                     enc_proj = getattr(enc_expert, proj_name)
                     dec_proj = getattr(dec_expert, proj_name)
                     assert enc_proj.weight.data_ptr() != dec_proj.weight.data_ptr()
+        finally:
+            self._cleanup_registry(expert_type)
+
+    @pytest.mark.parametrize("declared", [True, False], ids=["declared_tie", "undeclared_share"])
+    def test_sync_tied_input_amax_merges_tied_fused_experts(self, declared):
+        """FusedExperts sharing their 3-D weights end with one input amax per projection, whether
+        the tie is declared by name or only physical (grouped by the shared tensor's identity, which
+        used to fall into the dense branch and raise AttributeError on ``input_quantizer``)."""
+        parent = _build_two_moe_blocks(tie=True)
+        if declared:
+            # HF's expansion of the declared ties, which TiedWeightMap reads.
+            parent.all_tied_weights_keys = {
+                "encoder.experts.gate_up_proj": "decoder.experts.gate_up_proj",
+                "encoder.experts.down_proj": "decoder.experts.down_proj",
+            }
+        else:
+            del parent._tied_weights_keys  # the weights stay shared, but no tie is declared
+        expert_type = type(parent.encoder.experts)
+        self._cleanup_registry(expert_type)
+        try:
+            _calibrate_two_moe_blocks(parent)
+            enc, dec = parent.encoder.experts, parent.decoder.experts
+            assert enc.gate_up_proj is dec.gate_up_proj  # the share survives quantize
+            group = TiedWeightMap(parent).container_group_key("encoder.experts", "gate_up_proj")
+            assert (group is not None) == declared
+            amaxes = {"gate_up_proj": (2.0, 5.0), "down_proj": (3.0, 7.0)}
+            for proj, (enc_amax, dec_amax) in amaxes.items():
+                getattr(enc, f"{proj}_input_quantizer").amax = torch.tensor(enc_amax)
+                getattr(dec, f"{proj}_input_quantizer").amax = torch.tensor(dec_amax)
+
+            assert sync_tied_input_amax(parent) == 2  # one merge per projection
+
+            for proj, (_, dec_amax) in amaxes.items():
+                for experts in (enc, dec):
+                    amax = getattr(experts, f"{proj}_input_quantizer").amax
+                    assert torch.allclose(amax, torch.tensor(dec_amax))
         finally:
             self._cleanup_registry(expert_type)
 
