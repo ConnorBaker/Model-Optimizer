@@ -225,7 +225,7 @@ def setup_external_draft(recipe, training_args, base_model, draft=None, dry_run=
         model_max_length=training_args.training_seq_len,
         trust_remote_code=recipe.model.trust_remote_code,
     )
-    if not ModeloptStateManager.is_converted(draft):
+    if not ModeloptStateManager.has_state_for_mode_type("speculative", model=draft):
         mtsp.convert(draft, [("external", external_cfg)])
     # Fail before training: a vocab mismatch yields a plausible loss curve and a draft
     # with no acceptance. Equal sizes are not enough -- different tokenizers are
