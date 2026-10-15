@@ -57,7 +57,7 @@ from modelopt.recipe.config import (
     ModelOptMedusaRecipe,
     ModelOptSpeculativeRecipeBase,
 )
-from modelopt.torch.opt.conversion import ModeloptStateManager
+from modelopt.torch.opt.conversion import ModeloptStateManager, modelopt_state
 from modelopt.torch.speculative.config import ExternalDraftConfig
 from modelopt.torch.speculative.plugins.hf_dflash import HFDFlashModel
 from modelopt.torch.speculative.plugins.hf_domino import DominoLambdaCallback
@@ -236,14 +236,26 @@ def setup_external_draft(
         model_max_length=training_args.training_seq_len,
         trust_remote_code=recipe.model.trust_remote_code,
     )
-    if not ModeloptStateManager.has_state_for_mode_type("speculative", model=draft):
-        mtsp.convert(draft, [("external", external_cfg)])
+    restored_modes = {m for m, _ in modelopt_state(draft)["modelopt_state_dict"]}
+    if "external" in restored_modes:
+        # The restore replayed the config stored in the checkpoint, so modify() has already
+        # run with the values this draft was last trained under. Re-apply the recipe's:
+        # otherwise an edited external_loss / top_k / top_p is dropped while the banner and
+        # the recipe saved beside the checkpoint report the new one. The manager's config is
+        # updated alongside it because modify() writes only the live attributes -- without
+        # this the next save_pretrained records the objective the draft was never trained
+        # under, and a restore outside this script hands back that stale objective.
+        external_config = ExternalDraftConfig(**external_cfg)
+        draft.modify(external_config)
+        ModeloptStateManager(draft)._last_config = external_config
+    elif ModeloptStateManager.has_state_for_mode_type("speculative", model=draft):
+        raise ValueError(
+            f"the draft checkpoint carries speculative mode(s) {sorted(restored_modes)}, not "
+            "'external'. Skipping the convert would leave it as that mode's model type and "
+            "fail later with an unrelated error, so refuse here."
+        )
     else:
-        # The restore replayed the config stored in the checkpoint, so modify() has
-        # already run with the values this draft was last trained under. Re-apply the
-        # recipe's: otherwise an edited external_loss / top_k / top_p is dropped while
-        # the banner and the recipe saved beside the checkpoint report the new one.
-        draft.modify(ExternalDraftConfig(**external_cfg))
+        mtsp.convert(draft, [("external", external_cfg)])
     # Fail before training: a vocab mismatch yields a plausible loss curve and a draft
     # with no acceptance. Equal sizes are not enough -- different tokenizers are
     # routinely padded to the same width -- so also check that the two agree on the ids.

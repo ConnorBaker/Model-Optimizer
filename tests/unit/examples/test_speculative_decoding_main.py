@@ -197,6 +197,15 @@ def test_resume_honours_an_edited_external_section(main_mod, stub_tokenizers, tm
         f"resume trained {out.external_loss!r} while the recipe asked for 'tvd_deploy'"
     )
 
+    # modify() writes only the live attributes, so the stored state has to be updated too:
+    # otherwise the next checkpoint records the objective the draft was never trained under
+    # and a restore outside main.py hands that back.
+    out.save_pretrained(tmp_path / "out")
+    again = transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "out")
+    assert again.external_loss == "tvd_deploy", (
+        f"checkpoint recorded {again.external_loss!r}; the draft was trained with 'tvd_deploy'"
+    )
+
 
 def test_context_parallelism_is_rejected(main_mod, stub_tokenizers):
     """Nothing in this mode shards the sequence, so cp_size > 1 must refuse, not run.
@@ -234,3 +243,24 @@ def test_caller_supplied_base_tokenizer_is_used(main_mod, monkeypatch):
         base_tokenizer=_FakeTok(),
     )
     assert calls == ["draft"], f"base tokenizer re-loaded: {calls}"
+
+
+def test_resuming_a_different_speculative_mode_is_refused(main_mod, stub_tokenizers, tmp_path):
+    """A checkpoint from another speculative mode must fail with a clear message.
+
+    The skip-convert guard only asks whether *some* speculative mode is present, so without
+    this an eagle/dflash checkpoint would skip the convert, never become an external draft,
+    and die later on an unrelated attribute.
+    """
+    draft = _tiny_causal_lm()
+    mtsp.convert(draft, [("eagle", {})])
+    draft.save_pretrained(tmp_path / "ckpt")
+    restored = transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "ckpt")
+
+    with pytest.raises(ValueError, match="not 'external'"):
+        main_mod.setup_external_draft(
+            _recipe(offline_data_path="/tmp/hidden"),
+            _training_args(),
+            base_model=_tiny_causal_lm(hidden=2 * HIDDEN),
+            draft=restored,
+        )
