@@ -170,3 +170,29 @@ def test_dry_run_is_exempt_from_the_data_source_requirement(main_mod, stub_token
         recipe, _training_args(), base_model=base, draft=_tiny_causal_lm(), dry_run=True
     )
     assert draft is not None
+
+
+def test_resume_honours_an_edited_external_section(main_mod, stub_tokenizers, tmp_path):
+    """An edited `external:` section must take effect on resume, not be silently dropped.
+
+    The restore replays the config saved in the checkpoint, so skipping convert also
+    skips modify(). Resuming with a changed objective would then train the old one while
+    the printed recipe reports the new -- a plausible loss curve and the wrong draft.
+    """
+    draft = _tiny_causal_lm()
+    mtsp.convert(draft, [("external", {"external_loss": "soft_ce"})])
+    draft.save_pretrained(tmp_path / "ckpt")
+    restored = transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "ckpt")
+    assert restored.external_loss == "soft_ce", "checkpoint did not carry the objective"
+
+    recipe = _recipe(offline_data_path="/tmp/hidden")
+    recipe.external.external_loss = "tvd_deploy"
+    out, _ = main_mod.setup_external_draft(
+        recipe,
+        _training_args(),
+        base_model=_tiny_causal_lm(hidden=2 * HIDDEN),
+        draft=restored,
+    )
+    assert out.external_loss == "tvd_deploy", (
+        f"resume trained {out.external_loss!r} while the recipe asked for 'tvd_deploy'"
+    )

@@ -58,6 +58,7 @@ from modelopt.recipe.config import (
     ModelOptSpeculativeRecipeBase,
 )
 from modelopt.torch.opt.conversion import ModeloptStateManager
+from modelopt.torch.speculative.config import ExternalDraftConfig
 from modelopt.torch.speculative.plugins.hf_dflash import HFDFlashModel
 from modelopt.torch.speculative.plugins.hf_domino import DominoLambdaCallback
 from modelopt.torch.speculative.plugins.hf_training_args import (
@@ -227,6 +228,12 @@ def setup_external_draft(recipe, training_args, base_model, draft=None, dry_run=
     )
     if not ModeloptStateManager.has_state_for_mode_type("speculative", model=draft):
         mtsp.convert(draft, [("external", external_cfg)])
+    else:
+        # The restore replayed the config stored in the checkpoint, so modify() has
+        # already run with the values this draft was last trained under. Re-apply the
+        # recipe's: otherwise an edited external_loss / top_k / top_p is dropped while
+        # the banner and the recipe saved beside the checkpoint report the new one.
+        draft.modify(ExternalDraftConfig(**external_cfg))
     # Fail before training: a vocab mismatch yields a plausible loss curve and a draft
     # with no acceptance. Equal sizes are not enough -- different tokenizers are
     # routinely padded to the same width -- so also check that the two agree on the ids.
