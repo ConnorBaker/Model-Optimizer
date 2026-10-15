@@ -13,6 +13,8 @@ Changelog
 
 *Quantization*
 
+- Add an independent ``rounding="stochastic"`` TensorQuantizer option for integer and FP8 E4M3 fake quantization with unquantized scales. Nearest rounding remains the default; stochastic rounding is preserved in ModelOpt checkpoints and is not supported by inference export.
+
 - Added experimental NVFP4 recurrent-state fake quantization using TensorQuantizer block16 E4M3 scales for linear-attention QAT.
 
 - Add Q8_0 weight-only quantization with 32-value GGML blocks, packed unified HF and Megatron export, and a built-in ``q8_0`` PTQ recipe.
