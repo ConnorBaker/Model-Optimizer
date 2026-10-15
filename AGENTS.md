@@ -45,7 +45,7 @@ These instructions apply to AI-assisted work in this repository.
   already exercises. Dev scaffolding tests stay out of the commit.
 - **Keep `tests/unit` fast.** The `linux` CI job times out at 20 min. A new unit test must run in
   well under 5s locally (`--durations`); anything spawning processes/subprocesses, multi-step training or
-  large models goes to `tests/gpu*`. In the pre-push pass, list the tests you added and why each is needed.
+  large models goes to `tests/gpu*` (except tests sharing the session-scoped `cpu_dist_workers`). In the pre-push pass, list the tests you added and why each is needed.
 
 ## Pre-push review pass
 

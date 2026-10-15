@@ -192,7 +192,8 @@ nox -s "unit-3.12(torch_211, tf_latest)"
 - **Keep `tests/unit` fast — the `linux` job has a hard 20-minute limit** and runs the whole suite serially.
   A unit test should take well under 5s (check with `pytest --durations=20`). Tests that spawn processes or
   subprocesses (`spawn_multiprocess_job`, `subprocess.run` importing torch), train for many steps, or build
-  real-size models belong in `tests/gpu*`; batch several cases into one spawn rather than one spawn per case.
+  real-size models belong in `tests/gpu*`; batch several cases into one spawn rather than one spawn per case,
+  or reuse the session-scoped `cpu_dist_workers` fixture for multi-rank CPU tests.
   Slow tests for features without active maintenance (e.g. AutoNAS) should be `@pytest.mark.manual` or nightly-only.
 - **Exercise the behavior a test claims to validate.** Mocks are useful for focused interface and wiring coverage, but
   replacing the implementation under test does not validate its real behavior. Include an end-to-end test that runs

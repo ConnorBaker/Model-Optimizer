@@ -39,7 +39,8 @@ def _ensure_local_checkpoint_job(tmp_path, fail, group_ranks, rank, size):
     snapshot = tmp_path / "snapshot"
 
     def fake_snapshot_download(repo_id, **kwargs):
-        (tmp_path / f"downloaded-by-rank{rank}").write_text(repo_id)
+        with (tmp_path / f"downloaded-by-rank{rank}").open("a") as marker:
+            marker.write(f"{repo_id}\n")  # one line per call, so a repeat download shows
         if fail:
             raise OSError("hub unreachable")
         snapshot.mkdir(exist_ok=True)
@@ -103,3 +104,4 @@ def test_ensure_local_checkpoint_downloads_once_per_group(tmp_path, fail, group_
     job = partial(_ensure_local_checkpoint_job, tmp_path, fail, group_ranks)
     spawn_multiprocess_job(2, job, backend="gloo")
     assert [p.name for p in tmp_path.glob("downloaded-by-*")] == [f"downloaded-by-{downloader}"]
+    assert (tmp_path / f"downloaded-by-{downloader}").read_text().splitlines() == ["org/model"]
