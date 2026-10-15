@@ -25,12 +25,10 @@ on GPU are covered in ``tests/gpu``.
 import copy
 import faulthandler
 import json
-from functools import partial
 from pathlib import Path
 
 import pytest
 import torch
-from _test_utils.torch.distributed.utils import spawn_multiprocess_job
 from safetensors.torch import load_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
@@ -176,6 +174,6 @@ def _two_rank_streaming_export(rank, size, export_dir):
         assert torch.equal(exported[key].float(), tensor.float()), key
 
 
-def test_streaming_export_two_cpu_ranks(tmp_path, skip_on_windows):
+def test_streaming_export_two_cpu_ranks(tmp_path, cpu_dist_workers):
     """Two gloo ranks export what a single process does, without a rank waiting on the other."""
-    spawn_multiprocess_job(2, partial(_two_rank_streaming_export, export_dir=str(tmp_path)))
+    cpu_dist_workers.run(_two_rank_streaming_export, export_dir=str(tmp_path))
