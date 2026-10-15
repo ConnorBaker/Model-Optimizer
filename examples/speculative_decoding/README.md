@@ -187,6 +187,10 @@ out-of-support term charges it for the mass the dump itself discarded. That is t
 same asymmetry dense `tvd` has against a full teacher, and it is intended, but it
 means `--top-p` is only symmetric between the two sides under `tvd_deploy`.
 
+See [doc/external_draft.md](doc/external_draft.md) for the full reference: the recipe
+parameters, the two teacher-data formats, the objectives, and the cross-tokenizer
+vocabulary swap.
+
 `external.external_loss` selects the objective:
 
 | value | what it scores |
