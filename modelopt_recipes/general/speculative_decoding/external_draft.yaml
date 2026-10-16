@@ -35,7 +35,9 @@ data:
   #       SparsePolicyDataset as D, discover_shards as F; \
   #       D(F('DUMP'), max_length=12288, cache_dir=None)"
   # Use discover_shards and the same cache_dir training will use: a cache keyed on a
-  # different shard list is ignored, and torchrun rebuilds it from scratch.
+  # different shard list is ignored, and torchrun rebuilds it from scratch. A ragged
+  # third-party dump also needs top_k=<its top-k> here, since the cache width is
+  # otherwise inferred from the first record and there is no recipe field for it.
   sparse_data_path:
   # Where that cache lives. Defaults to a .sparse_cache beside the shards, which fails
   # on a read-only dump and makes concurrent runs over the same shards contend.

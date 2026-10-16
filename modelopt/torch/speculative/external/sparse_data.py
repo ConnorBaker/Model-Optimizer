@@ -99,7 +99,7 @@ def _builder_progress(cache: Path) -> tuple[int, int]:
 
 
 def _wait_for_cache(cache: Path, files: list[str], stall_s: float = 1800.0) -> None:
-    """Block until rank 0 publishes a cache built from ``files``, with no barrier to use.
+    """Block until rank 0 publishes a cache built from ``files``, without a collective.
 
     Waiting on mere existence is not enough. The only way to reach this with a cache
     already on disk is that it was found stale, so ``meta.json`` is there from the
@@ -228,11 +228,16 @@ def _build_cache(cache: Path, files: list[str], top_k: int | None) -> None:
                                 # Truncating here would drop real teacher mass and bake
                                 # the narrow width into meta["top_k"], and the stored-mass
                                 # warning cannot see it. Refuse with the remedy instead.
+                                # The recipe has no top_k field, so the remedy is the
+                                # single-process pre-build, which takes one.
                                 raise ValueError(
                                     f"{path}: a stored policy row holds {widest} entries "
                                     f"but the cache was sized at {width} from the first "
-                                    f"record. Pass top_k=<dump's top-k> to size it "
-                                    f"explicitly."
+                                    f"record. Build the cache once with an explicit "
+                                    f"width, then point the run at it: "
+                                    f"SparsePolicyDataset(discover_shards(dump), "
+                                    f"max_length=..., top_k=<dump's top-k, at least "
+                                    f"{widest}>, cache_dir=<data.sparse_cache_dir>)."
                                 )
                             tok = np.zeros((n_gen, width), dtype=np.int32)
                             prob = np.zeros((n_gen, width), dtype=np.float16)
@@ -393,19 +398,21 @@ class SparsePolicyDataset(torch.utils.data.Dataset):
             )
 
         if stale:
-            # Under DDP every rank sees the same shards; one builds and the rest wait.
-            # The dataset is often constructed before the process group exists, so fall
-            # back to the launcher's RANK: without it every worker takes the rank-0
-            # branch and they race to delete and rewrite the same cache directory.
+            # Under DDP every rank sees the same shards; one builds and the rest wait on
+            # the files rather than on a barrier. A collective here would be bounded by
+            # ddp_timeout (1800s by default, and HfTrainingArguments has already created
+            # the process group with it by the time a dataset is built), which a first
+            # build over a large corpus outlasts. _wait_for_cache needs no process group
+            # and bounds time without progress instead, so it serves both cases.
+            # Fall back to the launcher's RANK when there is no group: without it every
+            # worker takes the rank-0 branch and they race to rewrite the same cache.
             if torch.distributed.is_initialized():
-                rank, can_barrier = torch.distributed.get_rank(), True
+                rank = torch.distributed.get_rank()
             else:
-                rank, can_barrier = int(os.environ.get("RANK", 0)), False
+                rank = int(os.environ.get("RANK", 0))
             if rank == 0:
                 _build_cache(cache, files, top_k)
-            if can_barrier:
-                torch.distributed.barrier()
-            elif rank != 0:
+            else:
                 _wait_for_cache(cache, files)
 
         meta = json.loads((cache / "meta.json").read_text())
@@ -413,7 +420,7 @@ class SparsePolicyDataset(torch.utils.data.Dataset):
         # dumped directory resolve to the same default cache path, and the one that loses
         # the publish rename returns from _build_cache normally having adopted the
         # winner's cache -- which it never compared against its own shards. The waiting
-        # ranks are covered by _wait_for_cache; this covers the builder and the barrier.
+        # ranks are covered by _wait_for_cache; this covers the builder.
         if meta.get("version") != CACHE_VERSION or meta.get("sources") != _cache_signature(files):
             raise RuntimeError(
                 f"the sparse cache at {cache} was published by a concurrent job from "

@@ -43,6 +43,8 @@ from modelopt.torch.speculative.plugins.hf_training_args import DataArguments
 VOCAB = 64
 HIDDEN = 32
 TOPK = 8
+# Marks a key the parametrization removes from a record rather than overwrites.
+_DROP = object()
 
 
 def _causal_lm(hidden=HIDDEN, vocab_size=VOCAB):
@@ -266,6 +268,41 @@ def test_losing_a_publish_race_to_different_shards_is_refused(tmp_path):
     assert json.loads((cache / "meta.json").read_text()) == meta
 
 
+def test_a_non_builder_rank_waits_on_the_files_not_a_barrier(tmp_path):
+    """With a process group already up, rank != 0 must still take the file wait.
+
+    HfTrainingArguments builds the process group -- with ddp_timeout, 1800s by default --
+    while parsing arguments, so by the time any dataset is constructed a collective here
+    is both reachable and bounded. A first build over a large corpus outlasts that bound
+    and every non-builder rank dies at the barrier. _wait_for_cache needs no group and
+    bounds time without progress instead, so it is the branch both cases must take.
+    """
+    a, b = tmp_path / "a.jsonl.gz", tmp_path / "b.jsonl.gz"
+    _write_records(a, n=3)
+    _write_records(b, n=2)
+    SparsePolicyDataset([str(a)], max_length=32)  # a cache for [a], stale for [a, b]
+
+    waited = []
+    real_build = sparse_data._build_cache
+
+    def spy(cache, files, *args, **kwargs):
+        waited.append(list(files))
+        real_build(cache, files, None)  # stand in for the rank-0 process
+
+    barrier = mock.Mock()
+    with (
+        mock.patch.object(sparse_data.torch.distributed, "is_initialized", return_value=True),
+        mock.patch.object(sparse_data.torch.distributed, "get_rank", return_value=1),
+        mock.patch.object(sparse_data.torch.distributed, "barrier", barrier),
+        mock.patch.object(sparse_data, "_wait_for_cache", spy),
+    ):
+        ds = SparsePolicyDataset([str(a), str(b)], max_length=32)
+
+    assert waited == [[str(a), str(b)]], "rank 1 did not wait on the files"
+    barrier.assert_not_called()
+    assert len(ds) == 5
+
+
 def test_ragged_row_whose_support_includes_id_zero():
     """A padded row whose support holds id 0 still scores ~0 for a matching draft.
 
@@ -273,9 +310,8 @@ def test_ragged_row_whose_support_includes_id_zero():
     id 0 has it twice, and ``p`` is not deduplicated -- collapsing to the pad instead of
     the real occurrence would pair the teacher's probability with the pad's ``q``.
 
-    This pins the property, not the ordering that guarantees it: ``torch.sort`` is
-    already stable on CPU, so it passes with or without the ``stable=True`` that makes
-    it hold on CUDA, where the tie order is genuinely unspecified.
+    The collapse keys on stored probability rather than on token id, so the pad slots
+    are identified directly and the real occurrence is never the one dropped.
     """
     tok = torch.tensor([[[0, 7, 0, 0]]])
     prob = torch.tensor([[[0.6, 0.4, 0.0, 0.0]]])
@@ -419,16 +455,22 @@ def test_source_weights_reject_an_unknown_source(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("bad", "kept"),
+    ("bad", "n_bad", "kept"),
     [
         # Empty policy: width inference used to raise IndexError and abort the build.
-        ({"topk_tok": [], "topk_lp": []}, 1),
+        ({"topk_tok": [], "topk_lp": []}, 1, 1),
         # topk_lp shorter than topk_tok: the ragged fallback used to index past its end.
-        ({"topk_lp": [[0.0] * TOPK]}, 2),
+        ({"topk_lp": [[0.0] * TOPK]}, 1, 2),
+        # A renamed field drops every record it touches. One dropped record is a
+        # truncation to tolerate, but a dump-wide rename is schema drift: publishing
+        # whatever happened to parse would train a whole run on a handful of rows
+        # against an ordinary-looking loss curve, so the drop rate has to fail it.
+        ({"topk_lp": _DROP, "logprobs": [[0.0] * TOPK]}, 40, "raises"),
     ],
 )
-def test_malformed_policy_records_never_abort_the_build(tmp_path, bad, kept):
-    """A damaged record is dropped or truncated, never fatal to the whole pass."""
+def test_malformed_policy_records_never_abort_the_build(tmp_path, bad, n_bad, kept):
+    """A damaged record is dropped or truncated, never fatal to the whole pass -- until
+    enough of them are damaged that the dump, not the record, is what is wrong."""
     p = tmp_path / "s.jsonl.gz"
     torch.manual_seed(0)
     good = {
@@ -439,8 +481,16 @@ def test_malformed_policy_records_never_abort_the_build(tmp_path, bad, kept):
         "topk_lp": torch.randn(4, TOPK).log_softmax(-1).tolist(),
     }
     with gzip.open(p, "wt") as f:
-        f.write(json.dumps({**good, "id": "bad", **bad}) + "\n")
+        for i in range(n_bad):
+            record = {**good, "id": f"bad{i}", **bad}
+            f.write(json.dumps({k: v for k, v in record.items() if v is not _DROP}) + "\n")
         f.write(json.dumps(good) + "\n")
+
+    if kept == "raises":
+        with pytest.raises(ValueError, match="failed to parse"):
+            SparsePolicyDataset([str(p)], max_length=32, top_k=TOPK)
+        return
+
     ds = SparsePolicyDataset([str(p)], max_length=32, top_k=TOPK)
     assert len(ds) == kept
     # the intact record must still be intact
@@ -479,44 +529,6 @@ def test_sample_size_draws_across_sources_not_a_prefix(tmp_path):
     assert len(ds.sources) == len(ds), "sources desynchronised from index"
     kept = {ds.source_names[s] for s in ds.sources}
     assert kept == {"alpha", "beta"}, f"sample came from {kept}, not both shards"
-
-
-def test_a_schema_drifted_dump_refuses_rather_than_publishing_a_few_rows(tmp_path):
-    """Every record failing to parse must fail the build, not publish a near-empty cache.
-
-    The shard-level counter records at most one entry per build for record damage, so on
-    its own it cannot see "kept 3 of 100000" -- the build warns once, passes, and training
-    runs on whatever happened to parse with an ordinary-looking loss curve.
-    """
-    # A handful parse and the rest do not: the all-or-nothing case is already caught by
-    # the empty-index guard, so the gap this closes is the partial one -- a cache that
-    # looks complete and holds 2 of 42 records.
-    shard = tmp_path / "drifted.jsonl"
-    good = {
-        "id": "ok",
-        "prompt_ids": [1, 2],
-        "gen_ids": [3, 4],
-        "topk_tok": [[3, 5], [4, 6]],
-        "topk_lp": [[-0.1, -2.0], [-0.1, -2.0]],
-    }
-    with shard.open("w") as fh:
-        for i in range(2):
-            fh.write(json.dumps({**good, "id": f"ok{i}"}) + "\n")
-        for i in range(40):
-            fh.write(
-                json.dumps(
-                    {
-                        "id": f"r{i}",
-                        "prompt_ids": [1, 2],
-                        "gen_ids": [3, 4],
-                        "topk_tok": [[3, 5], [4, 6]],
-                        "logprobs": [[-0.1, -2.0], [-0.1, -2.0]],  # producer renamed topk_lp
-                    }
-                )
-                + "\n"
-            )
-    with pytest.raises(ValueError, match="failed to parse"):
-        SparsePolicyDataset([str(shard)], max_length=64)
 
 
 def test_a_wider_row_refuses_rather_than_losing_teacher_mass(tmp_path):
