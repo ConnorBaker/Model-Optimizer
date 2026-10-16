@@ -31,10 +31,14 @@ from modelopt.torch.speculative.external.sparse_data import (
     SparsePolicyCollator,
     SparsePolicyDataset,
 )
-from modelopt.torch.speculative.plugins.hf_external import SPARSE_CAPABLE_LOSSES
-from modelopt.torch.speculative.plugins.hf_training_args import DataArguments
 
 transformers = pytest.importorskip("transformers")
+
+# Below the guard: the plugins package registers these behind an import_plugin
+# guard, but importing the submodules directly does not, so on an install
+# without transformers this module would fail to collect rather than skip.
+from modelopt.torch.speculative.plugins.hf_external import SPARSE_CAPABLE_LOSSES
+from modelopt.torch.speculative.plugins.hf_training_args import DataArguments
 
 VOCAB = 64
 HIDDEN = 32
