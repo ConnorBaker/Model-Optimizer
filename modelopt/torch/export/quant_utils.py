@@ -1992,13 +1992,14 @@ def sync_tied_input_amax(model: nn.Module, tied_map: "TiedWeightMap | None" = No
             and hasattr(m, "down_proj")
             and first_proj.dim() == 3
         ):
-            gk = tied_map.container_group_key(name, first_proj_attr)
-            if gk is not None:
-                by_group[("moe", gk)].append(m)
-            else:
-                # Undeclared share: group by projection identity so its amaxes still merge
-                # (symmetric with the dense fallback below).
-                by_group[("moe_shared", id(first_proj))].append(m)
+            for proj_attr in (first_proj_attr, "down_proj"):
+                gk = tied_map.group_key(f"{name}.{proj_attr}" if name else proj_attr)
+                quantizer = getattr(m, f"{proj_attr}_input_quantizer", None)
+                if gk is not None:
+                    by_group[("moe", gk)].append(quantizer)
+                else:
+                    # Each projection may be shared independently of the other.
+                    by_group[("moe_shared", id(getattr(m, proj_attr)))].append(quantizer)
         # Dense quantized Linear with an input_quantizer
         elif (
             hasattr(m, "input_quantizer")
@@ -2007,10 +2008,10 @@ def sync_tied_input_amax(model: nn.Module, tied_map: "TiedWeightMap | None" = No
         ):
             gk = tied_map.group_key(f"{name}.weight" if name else "weight")
             if gk is not None:
-                by_group[("dense", gk)].append(m)
+                by_group[("dense", gk)].append(m.input_quantizer)
             else:
                 # Undeclared share: group by object identity so its amaxes still merge.
-                by_group[("dense_shared", id(m.weight))].append(m)
+                by_group[("dense_shared", id(m.weight))].append(m.input_quantizer)
 
     def _merge(quantizers: list) -> bool:
         """Max-merge amaxes across the quantizer list. Returns True on merge."""
@@ -2037,15 +2038,4 @@ def sync_tied_input_amax(model: nn.Module, tied_map: "TiedWeightMap | None" = No
             q.amax = merged.clone()
         return True
 
-    synced = 0
-    for key, modules in by_group.items():
-        if len(modules) < 2:
-            continue
-        if key[0] in ("moe", "moe_shared"):
-            first_proj_attr = getattr(modules[0], "_first_proj_attr", "gate_up_proj")
-            for q_name in (f"{first_proj_attr}_input_quantizer", "down_proj_input_quantizer"):
-                if _merge([getattr(m, q_name, None) for m in modules]):
-                    synced += 1
-        elif _merge([m.input_quantizer for m in modules]):
-            synced += 1
-    return synced
+    return sum(_merge(quantizers) for quantizers in by_group.values())
