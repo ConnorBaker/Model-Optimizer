@@ -13,6 +13,7 @@ Changelog
 
 *Quantization*
 
+- On Linux x86-64 with Python 3.11 and later, the ONNX extra now selects ONNX Runtime 1.30.x and CUDA 13 packages by default. GPU calibration requires a compatible CUDA 13 runtime and driver; Python 3.10 and other platforms retain their existing dependency selections.
 - Add metadata-only export specifications and non-mutating per-weight quantizer-state capture.
 - HF export records canonical activation schemes, group/block sizes and weight-only MXFP4 metadata; mixed-format exports retain unquantized-layer exclusions, and non-square FP8 block layouts are rejected.
 - Add Q8_0 weight-only quantization with 32-value GGML blocks, packed unified HF and Megatron export, and a built-in ``q8_0`` PTQ recipe.

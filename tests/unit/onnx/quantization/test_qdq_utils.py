@@ -844,7 +844,12 @@ class TestColumnMajorTransformation:
         input_data = np.random.randn(4, 32).astype(np.float16)
 
         # Run original model
-        original_session = ort.InferenceSession(original_model.SerializeToString())
+        # Compare the graph rewrites without version-dependent ORT quantization fusions.
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        original_session = ort.InferenceSession(
+            original_model.SerializeToString(), sess_options=options
+        )
         original_output = original_session.run(None, {"input": input_data})[0]
 
         # Create transformed model
@@ -908,7 +913,9 @@ class TestColumnMajorTransformation:
         transformed_model.ir_version = 10  # ORT only supports IR version up to 10
 
         # Run transformed model
-        transformed_session = ort.InferenceSession(transformed_model.SerializeToString())
+        transformed_session = ort.InferenceSession(
+            transformed_model.SerializeToString(), sess_options=options
+        )
         transformed_output = transformed_session.run(None, {"input": input_data})[0]
 
         # Print output values for visibility
@@ -985,7 +992,12 @@ class TestColumnMajorTransformation:
 
         # Run original model
         input_data = np.random.randn(4, 32).astype(np.float16)
-        original_session = ort.InferenceSession(original_model.SerializeToString())
+        # Compare the graph rewrites without version-dependent ORT quantization fusions.
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        original_session = ort.InferenceSession(
+            original_model.SerializeToString(), sess_options=options
+        )
         original_output = original_session.run(None, {"input": input_data})[0]
 
         # Apply column-major transformation using the actual functions
@@ -1058,7 +1070,9 @@ class TestColumnMajorTransformation:
         )
 
         # Run transformed model and verify output equivalence
-        transformed_session = ort.InferenceSession(transformed_model.SerializeToString())
+        transformed_session = ort.InferenceSession(
+            transformed_model.SerializeToString(), sess_options=options
+        )
         transformed_output = transformed_session.run(None, {"input": input_data})[0]
 
         print(f"Original model output shape: {original_output.shape}")
