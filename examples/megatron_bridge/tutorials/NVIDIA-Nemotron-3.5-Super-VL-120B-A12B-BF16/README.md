@@ -10,6 +10,8 @@ End-to-end W4A4 quantization of [NVIDIA Nemotron 3.5 Super VL](https://huggingfa
 
 Only the language model (including its MTP head) is quantized; the vision tower and projector stay BF16 and are copied from the source checkpoint.
 
+The PTQ recipe is the same as the one used for the released [`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4) checkpoint. The calibration data and the QAD training data are all public Hugging Face datasets. The evaluation results below differ from the official model card scores.
+
 ## Results
 
 All checkpoints were served with the same vLLM settings (see [Section 5](#5-evaluation-and-serving)); the quantized ones with an FP8 KV cache. BF16 is the mean of two runs.
