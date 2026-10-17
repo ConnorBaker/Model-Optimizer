@@ -28,8 +28,6 @@ All checkpoints were served with the same vLLM settings (see [Section 5](#5-eval
 
 MMLU-ProX scores a response only if it ends with the answer phrase in the question's language. Most of the QAD gain comes from fewer responses missing that phrase (11.3% for PTQ, 5.4% after QAD); on the responses with a readable answer, accuracy rises from 83.9 to 85.8.
 
-**Scope:** QAD trains on text only, at a 32k sequence length, and only the language model is quantized. AA-LCR is the one long-context benchmark here (prompts average about 108k tokens); a 64k-sequence QAD run scored 67.31 on it, no better than 32k. Vision benchmarks were not run.
-
 The exported W4A4 checkpoint is **70 GB**.
 
 ---
