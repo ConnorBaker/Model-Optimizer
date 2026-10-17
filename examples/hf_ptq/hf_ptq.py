@@ -286,11 +286,15 @@ def _validate_recipe_calibration(args: argparse.Namespace, recipe) -> None:
     if not isinstance(recipe, ModelOptPTQRecipe) or args.calib_with_images:
         return
 
+    visual_input_names = {
+        "*visual.*input_quantizer",
+        "*visual.*merger*.input_quantizer",
+    }
     visual_input_entry = next(
         (
             entry
             for entry in reversed(recipe.quantize.quant_cfg)
-            if entry.quantizer_name == "*visual.*input_quantizer"
+            if entry.quantizer_name in visual_input_names
         ),
         None,
     )
@@ -757,6 +761,9 @@ def pre_quantize(
     preview_input_ids = batch[input_key][0:1]
     # Pass attention_mask to generate(): HF cannot infer it when pad_token == eos_token.
     preview_attention_mask = batch["attention_mask"][0:1] if "attention_mask" in batch else None
+    if input_key == "input_ids" and preview_attention_mask is not None:
+        preview_input_ids = preview_input_ids[:, preview_attention_mask[0].bool()]
+        preview_attention_mask = torch.ones_like(preview_input_ids)
 
     # Generate preview before quantization
     if args.skip_generate:
