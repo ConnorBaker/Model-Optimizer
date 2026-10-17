@@ -199,8 +199,9 @@ def _to_chat(
             if row.get(key):
                 chat[key] = row[key]
     else:
-        text = row.get("text") or ""
-        if not text:
+        text = row.get("text")
+        # A non-string value (e.g. a list) would otherwise pass as list content.
+        if not isinstance(text, str) or not text:
             return None
         if "<extra_id_" not in text:
             return {"messages": [{"role": "assistant", "content": text}]}

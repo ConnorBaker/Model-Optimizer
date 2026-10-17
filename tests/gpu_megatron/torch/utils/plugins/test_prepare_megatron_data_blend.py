@@ -203,6 +203,7 @@ def test_to_chat_handles_all_row_shapes():
         "messages": [{"role": "assistant", "content": "def f(): pass"}]
     }
     assert blend_module._to_chat({"text": ""}, "text") is None
+    assert blend_module._to_chat({"text": ["x"]}, "text") is None
     # Markers that parse to no turns: dropped, never trained as assistant text.
     assert blend_module._to_chat({"text": "<extra_id_0>\nraw body\n"}, "text") is None
     # A role without a mapping would cut its turn out of the middle: the whole row is dropped.
