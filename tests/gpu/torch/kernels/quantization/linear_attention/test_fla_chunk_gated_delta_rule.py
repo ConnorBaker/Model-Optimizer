@@ -29,7 +29,7 @@ from modelopt.torch.kernels.quantization.linear_attention.fla_chunk_gated_delta_
     chunk_gated_delta_rule,
 )
 
-pytestmark = pytest.mark.system
+pytestmark = pytest.mark.integration
 
 
 def make_inputs():

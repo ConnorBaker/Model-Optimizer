@@ -62,18 +62,19 @@ _DEFAULT_TIMEOUT = {
 }
 
 
-# GPU system tests need several processes or GPUs, spawn subprocesses, run an inference engine or
-# compile heavy kernels (see CONTRIBUTING.md). Every test of these groups is one, and in `gpu` so is a
-# test that requests one of these fixtures; other `gpu` tests opt in with `pytest.mark.system`.
-# Pull requests run the rest with `-m "not system"`; the merge queue and the nightly run everything.
-_SYSTEM_GROUPS = {"examples", "gpu_megatron", "gpu_trtllm", "gpu_vllm", "regression"}
-_SYSTEM_FIXTURES = ("dist_workers", "need_2_gpus", "need_4_gpus", "need_8_gpus")
+# GPU integration tests need several processes or GPUs, spawn subprocesses, run an inference engine
+# or compile heavy kernels (see CONTRIBUTING.md). Every test of these groups is one, and in `gpu` so
+# is a test that requests one of these fixtures; other `gpu` tests opt in with
+# `pytest.mark.integration`. Pull requests run the rest with `-m "not integration"`; the merge queue
+# and the nightly run everything.
+_INTEGRATION_GROUPS = {"examples", "gpu_megatron", "gpu_trtllm", "gpu_vllm", "regression"}
+_INTEGRATION_FIXTURES = ("dist_workers", "need_2_gpus", "need_4_gpus", "need_8_gpus")
 
 
-# tryfirst: the `system` marks must exist before pytest applies `-m`
+# tryfirst: the `integration` marks must exist before pytest applies `-m`
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
-    """Mark system tests, skip flag-gated tests and apply a default per-test timeout by directory."""
+    """Mark integration tests, skip flag-gated tests and set per-test timeouts by directory."""
     skip_marks = [
         ("manual", "--run-manual"),
         ("release", "--run-release"),
@@ -92,10 +93,11 @@ def pytest_collection_modifyitems(config, items):
             continue
         # First path component under tests/ is the group dir (unit, gpu, examples, ...).
         group = item.path.relative_to(tests_root).parts[0]
-        if group in _SYSTEM_GROUPS or (
-            group == "gpu" and any(name.startswith(_SYSTEM_FIXTURES) for name in item.fixturenames)
+        if group in _INTEGRATION_GROUPS or (
+            group == "gpu"
+            and any(name.startswith(_INTEGRATION_FIXTURES) for name in item.fixturenames)
         ):
-            item.add_marker(pytest.mark.system)
+            item.add_marker(pytest.mark.integration)
         if item.get_closest_marker("timeout") is not None:
             continue
         # Crash loudly (rather than silently skip) if a group has no configured default, so a

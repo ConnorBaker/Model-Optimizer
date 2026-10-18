@@ -23,8 +23,8 @@ on:
         type: string
       unit_only:
         description: >-
-          Run only the GPU unit tests (pytest -m 'not system'), as a PR without the
-          run-system-tests label does
+          Run only the GPU unit tests (pytest -m 'not integration'), as a PR without the
+          run-integration-tests label does
         required: false
         type: boolean
         default: false
@@ -61,8 +61,8 @@ jobs:
         env:
           COVERAGE_PROCESS_START: ${{ github.workspace }}/pyproject.toml
           COVERAGE_FILE: ${{ github.workspace }}/.coverage
-          # The system tests (see tests/conftest.py) are left out of a PR run without the label
-          PYTEST_ADDOPTS: ${{ inputs.unit_only && '-m "not system"' || '' }}
+          # The integration tests (see tests/conftest.py) are left out of a PR run without the label
+          PYTEST_ADDOPTS: ${{ inputs.unit_only && '-m "not integration"' || '' }}
         run: |
           # Use `python3` (the vllm image has no `python` on PATH)
           python3 -m pip install nox && nox -s ${{ inputs.example }}

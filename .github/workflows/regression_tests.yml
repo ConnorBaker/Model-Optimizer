@@ -41,11 +41,11 @@ jobs:
         modelopt_recipes/general/speculative_decoding/**
         tools/launcher/**
 
-  # System tests: they run in the merge queue, on nightly and on-demand runs, and on a PR that
-  # carries the `run-system-tests` label.
+  # Integration tests: they run in the merge queue, on nightly and on-demand runs, and on a PR that
+  # carries the `run-integration-tests` label.
   regression-tests:
     needs: [pr-gate]
-    if: needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_system == 'true'
+    if: needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_integration == 'true'
     runs-on: >-
       ${{ (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') &&
       'linux-amd64-gpu-rtxpro6000-latest-1' || 'linux-amd64-gpu-rtxpro6000-latest-2' }}
@@ -88,13 +88,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Regression tests are left to the merge queue
-        if: ${{ needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_system != 'true' }}
+        if: >-
+          ${{ needs.pr-gate.outputs.any_changed == 'true' &&
+          needs.pr-gate.outputs.run_integration != 'true' }}
         run: >-
-          echo "::notice::The regression tests are system tests and run in the merge queue. Add the
-          run-system-tests label and re-run this workflow to run them on this PR."
+          echo "::notice::The regression tests are integration tests and run in the merge queue. Add the
+          run-integration-tests label and re-run this workflow to run them on this PR."
       - name: Required regression tests did not succeed
         if: |
           needs.pr-gate.result != 'success' ||
-          (needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_system == 'true' &&
+          (needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_integration == 'true' &&
           needs.regression-tests.result != 'success')
         run: exit 1

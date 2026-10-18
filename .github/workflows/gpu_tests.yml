@@ -41,9 +41,9 @@ jobs:
         tests/gpu_trtllm/**
         tests/gpu_vllm/**
 
-  # The GPU unit tests run on every change. The system tests (pytest marker `system`, see
+  # The GPU unit tests run on every change. The integration tests (pytest marker `integration`, see
   # tests/conftest.py) run in the merge queue, on nightly and on-demand runs, and on a PR that
-  # carries the `run-system-tests` label: the gate says which (`run_system`).
+  # carries the `run-integration-tests` label: the gate says which (`run_integration`).
   gpu-tests:
     needs: [pr-gate]
     if: needs.pr-gate.outputs.any_changed == 'true'
@@ -58,12 +58,12 @@ jobs:
       runner: >-
         ${{ (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') &&
         'linux-amd64-gpu-rtxpro6000-latest-1' || 'linux-amd64-gpu-rtxpro6000-latest-2' }}
-      unit_only: ${{ needs.pr-gate.outputs.run_system != 'true' }}
+      unit_only: ${{ needs.pr-gate.outputs.run_integration != 'true' }}
 
-  # Lanes whose tests are all system tests
-  gpu-system-tests:
+  # Lanes whose tests are all integration tests
+  gpu-integration-tests:
     needs: [pr-gate]
-    if: needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_system == 'true'
+    if: needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_integration == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -99,17 +99,19 @@ jobs:
     if: >-
       ${{ (startsWith(github.ref, 'refs/heads/pull-request/') ||
       github.event_name == 'merge_group') && always() }}
-    needs: [pr-gate, gpu-tests, gpu-system-tests]
+    needs: [pr-gate, gpu-tests, gpu-integration-tests]
     runs-on: ubuntu-latest
     steps:
-      - name: GPU system tests are left to the merge queue
-        if: ${{ needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_system != 'true' }}
+      - name: GPU integration tests are left to the merge queue
+        if: >-
+          ${{ needs.pr-gate.outputs.any_changed == 'true' &&
+          needs.pr-gate.outputs.run_integration != 'true' }}
         run: >-
-          echo "::notice::Only the GPU unit tests ran. The system tests run in the merge queue; add the
-          run-system-tests label and re-run this workflow to run them on this PR."
+          echo "::notice::Only the GPU unit tests ran. The integration tests run in the merge queue; add the
+          run-integration-tests label and re-run this workflow to run them on this PR."
       - name: Required GPU tests did not succeed
         if: >-
           ${{ needs.pr-gate.result != 'success' || (needs.pr-gate.outputs.any_changed == 'true' &&
-          (needs.gpu-tests.result != 'success' || (needs.pr-gate.outputs.run_system == 'true' &&
-          needs.gpu-system-tests.result != 'success'))) }}
+          (needs.gpu-tests.result != 'success' || (needs.pr-gate.outputs.run_integration == 'true' &&
+          needs.gpu-integration-tests.result != 'success'))) }}
         run: exit 1

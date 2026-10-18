@@ -31,7 +31,7 @@ from modelopt.onnx.quantization.quantize import _preprocess_onnx, quantize
 
 skip_if_no_tensorrt()
 
-pytestmark = pytest.mark.system
+pytestmark = pytest.mark.integration
 
 
 def _quantized_tensor_indices(model: onnx.ModelProto) -> set[tuple[str, int]]:

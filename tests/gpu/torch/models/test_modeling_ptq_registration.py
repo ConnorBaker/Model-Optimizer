@@ -30,7 +30,7 @@ import pytest
 
 pytest.importorskip("transformers")
 
-pytestmark = pytest.mark.system
+pytestmark = pytest.mark.integration
 
 FIRST_IMPORTS = [
     "modelopt.torch.models.falcon.modeling_ptq",

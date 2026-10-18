@@ -33,7 +33,7 @@ from modelopt.torch.puzzletron.tools.checkpoint_utils_hf import (
     save_checkpoint_from_shards,
 )
 
-pytestmark = pytest.mark.system
+pytestmark = pytest.mark.integration
 
 
 class TestSaveCheckpointFromShardsSingleProcess:

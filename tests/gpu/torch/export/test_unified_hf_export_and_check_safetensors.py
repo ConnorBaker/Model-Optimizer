@@ -25,7 +25,7 @@ from _test_utils.torch.transformers_models import (
 )
 from safetensors import safe_open
 
-pytestmark = pytest.mark.system
+pytestmark = pytest.mark.integration
 
 
 # Here we map each qformat -> the suffix we expect in the generated safetensors directory

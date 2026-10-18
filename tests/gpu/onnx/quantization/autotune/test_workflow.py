@@ -28,7 +28,7 @@ from modelopt.onnx.quantization.autotune.workflows import (
     region_pattern_autotuning_workflow,
 )
 
-pytestmark = pytest.mark.system
+pytestmark = pytest.mark.integration
 
 
 @pytest.fixture

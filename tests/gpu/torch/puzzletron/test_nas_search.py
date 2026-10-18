@@ -26,7 +26,7 @@ import modelopt.torch.nas as mtn
 import modelopt.torch.puzzletron as mtpz
 import modelopt.torch.utils.distributed as dist
 
-pytestmark = pytest.mark.system
+pytestmark = pytest.mark.integration
 
 
 def test_nas_search(project_root_path: Path, tmp_path: Path):

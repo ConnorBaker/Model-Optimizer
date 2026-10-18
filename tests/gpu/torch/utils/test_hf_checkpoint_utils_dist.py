@@ -26,7 +26,7 @@ from modelopt.torch.utils.plugins import hf_checkpoint_utils
 
 pytest.importorskip("huggingface_hub")
 
-pytestmark = pytest.mark.system
+pytestmark = pytest.mark.integration
 
 
 class _FakeHfApi:
