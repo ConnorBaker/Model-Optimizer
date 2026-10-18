@@ -62,19 +62,8 @@ _DEFAULT_TIMEOUT = {
 }
 
 
-# GPU integration tests need several processes or GPUs, spawn subprocesses, run an inference engine
-# or compile heavy kernels (see CONTRIBUTING.md). Every test of these groups is one, and in `gpu` so
-# is a test that requests one of these fixtures; other `gpu` tests opt in with
-# `pytest.mark.integration`. Pull requests run the rest with `-m "not integration"`; the merge queue
-# and the nightly run everything.
-_INTEGRATION_GROUPS = {"examples", "gpu_megatron", "gpu_trtllm", "gpu_vllm", "regression"}
-_INTEGRATION_FIXTURES = ("dist_workers", "need_2_gpus", "need_4_gpus", "need_8_gpus")
-
-
-# tryfirst: the `integration` marks must exist before pytest applies `-m`
-@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
-    """Mark integration tests, skip flag-gated tests and set per-test timeouts by directory."""
+    """Skip flag-gated tests and apply a default per-test timeout based on the test directory."""
     skip_marks = [
         ("manual", "--run-manual"),
         ("release", "--run-release"),
@@ -89,19 +78,14 @@ def pytest_collection_modifyitems(config, items):
 
     tests_root = Path(__file__).parent
     for item in items:
-        if not item.path.is_relative_to(tests_root):
+        if item.get_closest_marker("timeout") is not None or not item.path.is_relative_to(
+            tests_root
+        ):
             continue
         # First path component under tests/ is the group dir (unit, gpu, examples, ...).
-        group = item.path.relative_to(tests_root).parts[0]
-        if group in _INTEGRATION_GROUPS or (
-            group == "gpu"
-            and any(name.startswith(_INTEGRATION_FIXTURES) for name in item.fixturenames)
-        ):
-            item.add_marker(pytest.mark.integration)
-        if item.get_closest_marker("timeout") is not None:
-            continue
         # Crash loudly (rather than silently skip) if a group has no configured default, so a
         # newly added tests/<group>/ must be given an explicit timeout in the mapping above.
+        group = item.path.relative_to(tests_root).parts[0]
         if group not in _DEFAULT_TIMEOUT:
             raise pytest.UsageError(
                 f"tests/{group}/ has no default timeout; add '{group}' to "

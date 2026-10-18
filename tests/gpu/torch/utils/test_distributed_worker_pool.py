@@ -23,8 +23,6 @@ import pytest
 import torch.distributed as dist
 from _test_utils.torch.distributed.utils import DistributedWorkerPool, get_live_pool
 
-pytestmark = pytest.mark.integration
-
 
 def _hang(rank, size):
     time.sleep(600)

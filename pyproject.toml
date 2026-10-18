@@ -368,7 +368,7 @@ pythonpath = ["tests/"]
 # Apply per-test timeouts (see tests/conftest.py) to the test call only, not fixture setup/teardown
 timeout_func_only = true
 markers = [
-    "integration: Tests that require external services or other non-hermetic dependencies, several processes or GPUs, subprocesses, inference engines or heavy compilation; run by the merge queue and nightly, not on every pull request push",
+    "integration: Tests that require external services or other non-hermetic dependencies",
     "manual: Only run when --run-manual is given",
     "release: Regression tests that should be run before every release",
 ]

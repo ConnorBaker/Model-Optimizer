@@ -28,8 +28,6 @@ from modelopt.onnx.quantization.autotune.workflows import (
     region_pattern_autotuning_workflow,
 )
 
-pytestmark = pytest.mark.integration
-
 
 @pytest.fixture
 def simple_conv_model():

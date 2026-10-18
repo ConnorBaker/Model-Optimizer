@@ -21,13 +21,6 @@ on:
         description: "GitHub runner to use"
         required: true
         type: string
-      unit_only:
-        description: >-
-          Run only the GPU unit tests (pytest -m 'not integration'), as a PR without the
-          run-integration-tests label does
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   run-test:
@@ -61,15 +54,11 @@ jobs:
         env:
           COVERAGE_PROCESS_START: ${{ github.workspace }}/pyproject.toml
           COVERAGE_FILE: ${{ github.workspace }}/.coverage
-          # The integration tests (see tests/conftest.py) are left out of a PR run without the label
-          PYTEST_ADDOPTS: ${{ inputs.unit_only && '-m "not integration"' || '' }}
         run: |
           # Use `python3` (the vllm image has no `python` on PATH)
           python3 -m pip install nox && nox -s ${{ inputs.example }}
       - name: Upload GPU coverage to Codecov
-        # A run of the unit tests only would upload a partial `gpu` report and skew the comparison
-        # with main; carryforward keeps the last full report instead.
-        if: ${{ !inputs.unit_only && github.event_name != 'merge_group' }}
+        if: github.event_name != 'merge_group'
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

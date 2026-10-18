@@ -33,8 +33,6 @@ from modelopt.torch.puzzletron.tools.checkpoint_utils_hf import (
     save_checkpoint_from_shards,
 )
 
-pytestmark = pytest.mark.integration
-
 
 class TestSaveCheckpointFromShardsSingleProcess:
     """Tests that run without torch.distributed (world_size=1 path)."""

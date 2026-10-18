@@ -272,7 +272,6 @@ class TestMeasureSparsity:
         assert out._sparsity_total > 0
         assert out._sparsity_skipped <= out._sparsity_total
 
-    @pytest.mark.integration
     def test_first_measured_call_has_real_tile_count_with_autotune(self):
         """Counters from the first measured call should not include autotune trials."""
         script = r"""

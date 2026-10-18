@@ -3,8 +3,9 @@ description: >
   Resolve the commit to diff a PR run against. For a copied PR branch it is the merge base of the
   PR's head and its target branch; for a merge queue group it is the commit the group was built
   on. Outputs are empty for non-PR triggers, which have no diff to inspect. Also says whether the
-  GPU integration tests run: always in a merge queue group, and on a copied PR branch only when the PR
-  carries the `run-integration-tests` label (the other PR runs get the unit tests only).
+  integration tests (the Megatron, TensorRT-LLM and vLLM lanes, the example and regression tests)
+  run: always in a merge queue group, and on a copied PR branch only when the PR carries the
+  `run-integration-tests` label (the other PR runs skip them).
   Requires a prior actions/checkout with fetch-depth 0.
 
 outputs:

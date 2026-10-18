@@ -41,8 +41,8 @@ jobs:
         tests/gpu_trtllm/**
         tests/gpu_vllm/**
 
-  # The GPU unit tests run on every change. The integration tests (pytest marker `integration`, see
-  # tests/conftest.py) run in the merge queue, on nightly and on-demand runs, and on a PR that
+  # The `gpu` lane (tests/gpu) runs on every change. The lanes that integrate with Megatron-Core,
+  # TensorRT-LLM and vLLM run in the merge queue, on nightly and on-demand runs, and on a PR that
   # carries the `run-integration-tests` label: the gate says which (`run_integration`).
   gpu-tests:
     needs: [pr-gate]
@@ -58,9 +58,8 @@ jobs:
       runner: >-
         ${{ (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') &&
         'linux-amd64-gpu-rtxpro6000-latest-1' || 'linux-amd64-gpu-rtxpro6000-latest-2' }}
-      unit_only: ${{ needs.pr-gate.outputs.run_integration != 'true' }}
 
-  # Lanes whose tests are all integration tests
+  # Lanes that integrate with other frameworks
   gpu-integration-tests:
     needs: [pr-gate]
     if: needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_integration == 'true'
@@ -107,7 +106,7 @@ jobs:
           ${{ needs.pr-gate.outputs.any_changed == 'true' &&
           needs.pr-gate.outputs.run_integration != 'true' }}
         run: >-
-          echo "::notice::Only the GPU unit tests ran. The integration tests run in the merge queue; add the
+          echo "::notice::The Megatron, TensorRT-LLM and vLLM lanes run in the merge queue; add the
           run-integration-tests label and re-run this workflow to run them on this PR."
       - name: Required GPU tests did not succeed
         if: >-
