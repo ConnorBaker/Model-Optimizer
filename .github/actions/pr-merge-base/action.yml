@@ -3,8 +3,8 @@ description: >
   Resolve the commit to diff a PR run against. For a copied PR branch it is the merge base of the
   PR's head and its target branch; for a merge queue group it is the commit the group was built
   on. Outputs are empty for non-PR triggers, which have no diff to inspect. Also says whether the
-  GPU tests (the GPU, example and regression workflows) run: always in a merge queue group, and on
-  a copied PR branch only when the PR carries the `run-merge-tests` label (the other PR runs skip them).
+  merge tests (the GPU, example and regression tests, which a PR run skips) run: always in a merge
+  queue group, and on a copied PR branch only when the PR carries the `run-merge-tests` label.
   Requires a prior actions/checkout with fetch-depth 0.
 
 outputs:
@@ -16,7 +16,7 @@ outputs:
     value: ${{ steps.pr-shas.outputs.head_sha || steps.merge-group.outputs.head_sha }}
   run_merge_tests:
     description: >-
-      "true" if the GPU tests run in this PR run, else "false". Empty for non-PR triggers.
+      "true" if the merge tests run in this PR run, else "false". Empty for non-PR triggers.
     value: ${{ steps.pr-shas.outputs.run_merge_tests || steps.merge-group.outputs.run_merge_tests }}
 
 runs:

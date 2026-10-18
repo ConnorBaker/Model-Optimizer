@@ -22,7 +22,8 @@ on:
         value: ${{ jobs.check-file-changes.outputs.any_changed }}
       run_merge_tests:
         description: >-
-          Whether the GPU tests run: always except on a PR run without the run-merge-tests label
+          Whether the merge tests (the GPU, example and regression tests) run: always except on a PR
+          run without the run-merge-tests label
         value: ${{ jobs.check-file-changes.outputs.run_merge_tests }}
 
 jobs:
@@ -57,7 +58,7 @@ jobs:
           fail_on_initial_diff_error: true
   wait-checks:
     needs: [check-file-changes]
-    # Nothing to wait for when the GPU tests are left to the merge queue
+    # Nothing to wait for when the merge tests are skipped
     if: >-
       (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') &&
       needs.check-file-changes.outputs.any_changed == 'true' &&

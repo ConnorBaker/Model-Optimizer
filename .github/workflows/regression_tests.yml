@@ -41,8 +41,8 @@ jobs:
         modelopt_recipes/general/speculative_decoding/**
         tools/launcher/**
 
-  # Runs in the merge queue, on nightly and on-demand runs, and on a PR that carries the
-  # `run-merge-tests` label.
+  # The regression tests are merge tests: they run in the merge queue, on nightly and on-demand runs,
+  # and on a PR that carries the `run-merge-tests` label.
   regression-tests:
     needs: [pr-gate]
     if: needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_merge_tests == 'true'
@@ -94,8 +94,8 @@ jobs:
           ${{ needs.pr-gate.outputs.any_changed == 'true' &&
           needs.pr-gate.outputs.run_merge_tests != 'true' }}
         run: >-
-          echo "::notice::The regression tests run in the merge queue. Add the run-merge-tests label and
-          re-run this workflow to run them on this PR."
+          echo "::notice::The regression tests are merge tests and run in the merge queue. Add the
+          run-merge-tests label and re-run this workflow to run them on this PR."
       - name: Required regression tests did not succeed
         if: |
           needs.pr-gate.result != 'success' ||

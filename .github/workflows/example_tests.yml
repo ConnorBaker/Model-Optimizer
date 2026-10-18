@@ -94,7 +94,7 @@ jobs:
           # Nightly and on-demand runs have no diff to inspect, so they run everything.
           NON_PR: >-
             ${{ !(startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') }}
-          # The example tests run on GPUs: a PR run without the run-merge-tests label skips them
+          # The example tests are merge tests: a PR run without the run-merge-tests label skips them
           RUN_MERGE_TESTS: ${{ steps.base.outputs.run_merge_tests || 'true' }}
           COMMON: ${{ steps.changed.outputs.common_any_modified }}
           TORCH: ${{ steps.changed.outputs.torch_any_modified }}
@@ -271,8 +271,8 @@ jobs:
       - name: Example tests are left to the merge queue
         if: ${{ needs.pr-gate.outputs.run_merge_tests != 'true' }}
         run: >-
-          echo "::notice::The example tests run in the merge queue. Add the run-merge-tests label and
-          re-run this workflow to run them on this PR."
+          echo "::notice::The example tests are merge tests and run in the merge queue. Add the
+          run-merge-tests label and re-run this workflow to run them on this PR."
       - name: Required example tests did not succeed
         if: |
           needs.pr-gate.result != 'success' ||
