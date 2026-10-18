@@ -3,9 +3,10 @@ name: Code Quality
 on:
   pull_request:
     branches: [main, release/*, feature/*]
-  # The merge queue re-runs the required checks on the PR merged with the target branch.
+  # The merge queue re-runs the required checks on the PR merged with the target branch
   merge_group:
     types: [checks_requested]
+    branches: [main, release/*, feature/*]
   schedule:
     - cron: "0 0 * * *" # Nightly
   workflow_dispatch:
