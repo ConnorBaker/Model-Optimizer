@@ -21,7 +21,8 @@ on:
         description: "Whether any relevant files changed"
         value: ${{ jobs.check-file-changes.outputs.any_changed }}
       run_system:
-        description: "Whether the GPU system tests run: always except on a PR run without the run-system-tests label"
+        description: >-
+          Whether the GPU system tests run: always except on a PR run without the run-system-tests label
         value: ${{ jobs.check-file-changes.outputs.run_system }}
 
 jobs:

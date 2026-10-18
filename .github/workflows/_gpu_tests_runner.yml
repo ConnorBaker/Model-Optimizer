@@ -22,7 +22,9 @@ on:
         required: true
         type: string
       unit_only:
-        description: "Run only the GPU unit tests (pytest -m 'not system'), as a PR without the run-system-tests label does"
+        description: >-
+          Run only the GPU unit tests (pytest -m 'not system'), as a PR without the
+          run-system-tests label does
         required: false
         type: boolean
         default: false

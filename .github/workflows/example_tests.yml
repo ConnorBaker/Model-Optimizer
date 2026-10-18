@@ -92,7 +92,8 @@ jobs:
       - id: lanes
         env:
           # Nightly and on-demand runs have no diff to inspect, so they run everything.
-          NON_PR: ${{ !(startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') }}
+          NON_PR: >-
+            ${{ !(startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') }}
           # The example tests are system tests: a PR run without the run-system-tests label skips them
           RUN_SYSTEM: ${{ steps.base.outputs.run_system || 'true' }}
           COMMON: ${{ steps.changed.outputs.common_any_modified }}
@@ -105,7 +106,8 @@ jobs:
         run: |
           any=false
           for lane in TORCH VLLM TRTLLM MEGATRON DIFFUSERS ONNX; do
-            if [[ "$RUN_SYSTEM" == "true" && ("$NON_PR" == "true" || "$COMMON" == "true" || "${!lane}" == "true") ]]; then
+            if [[ "$RUN_SYSTEM" == "true" &&
+                  ("$NON_PR" == "true" || "$COMMON" == "true" || "${!lane}" == "true") ]]; then
               run=true
               any=true
             else
@@ -266,7 +268,9 @@ jobs:
     steps:
       - name: Example tests are left to the merge queue
         if: ${{ needs.pr-gate.outputs.run_system != 'true' }}
-        run: echo "::notice::The example tests are system tests and run in the merge queue. Add the run-system-tests label and re-run this workflow to run them on this PR."
+        run: >-
+          echo "::notice::The example tests are system tests and run in the merge queue. Add the
+          run-system-tests label and re-run this workflow to run them on this PR."
       - name: Required example tests did not succeed
         if: |
           needs.pr-gate.result != 'success' ||

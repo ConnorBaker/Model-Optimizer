@@ -33,7 +33,8 @@ runs:
       run: |
         echo "head_sha=$(echo "$PR_INFO" | jq -r '.head.sha')" >> $GITHUB_OUTPUT
         echo "base_sha=$(echo "$PR_INFO" | jq -r '.base.sha')" >> $GITHUB_OUTPUT
-        echo "run_system=$(echo "$PR_INFO" | jq -r '[(.labels // [])[].name] | index("run-system-tests") != null')" >> $GITHUB_OUTPUT
+        echo "run_system=$(echo "$PR_INFO" |
+          jq -r '[(.labels // [])[].name] | index("run-system-tests") != null')" >> $GITHUB_OUTPUT
     # Get commit from the target branch that is present in the PR to use as base for changed files
     - if: startsWith(github.ref, 'refs/heads/pull-request/')
       id: calculate-merge-base

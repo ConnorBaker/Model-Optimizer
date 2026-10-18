@@ -55,7 +55,9 @@ jobs:
       example: gpu
       timeout_minutes: 60
       container_image: nvcr.io/nvidia/pytorch:26.07-py3
-      runner: ${{ (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') && 'linux-amd64-gpu-rtxpro6000-latest-1' || 'linux-amd64-gpu-rtxpro6000-latest-2' }}
+      runner: >-
+        ${{ (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') &&
+        'linux-amd64-gpu-rtxpro6000-latest-1' || 'linux-amd64-gpu-rtxpro6000-latest-2' }}
       unit_only: ${{ needs.pr-gate.outputs.run_system != 'true' }}
 
   # Lanes whose tests are all system tests
@@ -88,17 +90,26 @@ jobs:
       example: ${{ matrix.example }}
       timeout_minutes: ${{ matrix.timeout }}
       container_image: ${{ matrix.container_image }}
-      runner: ${{ (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') && 'linux-amd64-gpu-rtxpro6000-latest-1' || 'linux-amd64-gpu-rtxpro6000-latest-2' }}
+      runner: >-
+        ${{ (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') &&
+        'linux-amd64-gpu-rtxpro6000-latest-1' || 'linux-amd64-gpu-rtxpro6000-latest-2' }}
 
   gpu-pr-required-check:
     # Run even if gpu-tests is skipped
-    if: ${{ (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') && always() }}
+    if: >-
+      ${{ (startsWith(github.ref, 'refs/heads/pull-request/') ||
+      github.event_name == 'merge_group') && always() }}
     needs: [pr-gate, gpu-tests, gpu-system-tests]
     runs-on: ubuntu-latest
     steps:
       - name: GPU system tests are left to the merge queue
         if: ${{ needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_system != 'true' }}
-        run: echo "::notice::Only the GPU unit tests ran. The system tests run in the merge queue; add the run-system-tests label and re-run this workflow to run them on this PR."
+        run: >-
+          echo "::notice::Only the GPU unit tests ran. The system tests run in the merge queue; add the
+          run-system-tests label and re-run this workflow to run them on this PR."
       - name: Required GPU tests did not succeed
-        if: ${{ needs.pr-gate.result != 'success' || (needs.pr-gate.outputs.any_changed == 'true' && (needs.gpu-tests.result != 'success' || (needs.pr-gate.outputs.run_system == 'true' && needs.gpu-system-tests.result != 'success'))) }}
+        if: >-
+          ${{ needs.pr-gate.result != 'success' || (needs.pr-gate.outputs.any_changed == 'true' &&
+          (needs.gpu-tests.result != 'success' || (needs.pr-gate.outputs.run_system == 'true' &&
+          needs.gpu-system-tests.result != 'success'))) }}
         run: exit 1
