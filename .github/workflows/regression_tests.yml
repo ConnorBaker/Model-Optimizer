@@ -86,6 +86,8 @@ jobs:
       github.event_name == 'merge_group') && always() }}
     needs: [pr-gate, regression-tests]
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
       - name: Regression tests are left to the merge queue
         if: >-
@@ -100,3 +102,15 @@ jobs:
           (needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_gpu == 'true' &&
           needs.regression-tests.result != 'success')
         run: exit 1
+      - name: Remove the run-gpu-tests label, it applies to one round of runs
+        if: >-
+          ${{ !cancelled() && startsWith(github.ref, 'refs/heads/pull-request/') &&
+          needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_gpu == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr="${GITHUB_REF_NAME#pull-request/}"
+          url="repos/${GITHUB_REPOSITORY}/issues/${pr}/labels/run-gpu-tests"
+          if gh api -X DELETE "$url" --silent; then
+            echo "::notice::Removed the run-gpu-tests label after this round; add it again for the next push."
+          fi

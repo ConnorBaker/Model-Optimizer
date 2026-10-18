@@ -156,7 +156,7 @@ Test filenames must mirror the production module they primarily cover: tests for
 - `tests/gpu_vllm`: Fast GPU-based unit tests for the core ModelOpt library for vLLM features. In most cases, they should not take more than a few seconds to run.
 - `tests/examples`: Integration tests for ModelOpt examples. They should not take more than a few minutes to run. Please refer to [example test README](./tests/examples/README.md) for more details.
 
-CI runs the GPU tests (`tests/gpu`, `tests/gpu_megatron`, `tests/gpu_trtllm`, `tests/gpu_vllm`, `tests/regression` and `tests/examples`) in the merge queue and on the nightly, not on every pull request push. To run them on a pull request, add the `run-gpu-tests` label and re-run the workflows.
+CI runs the GPU tests (`tests/gpu`, `tests/gpu_megatron`, `tests/gpu_trtllm`, `tests/gpu_vllm`, `tests/regression` and `tests/examples`) in the merge queue and on the nightly, not on every pull request push. To run them on a pull request, add the `run-gpu-tests` label and re-run the workflows; CI removes the label again when that round of runs finishes.
 
 For lightweight focused local validation, run `pytest` directly on the relevant test path. For example:
 
