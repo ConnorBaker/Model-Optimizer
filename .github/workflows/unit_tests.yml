@@ -3,9 +3,10 @@ name: Unit tests
 on:
   pull_request:
     branches: [main, release/*, feature/*]
-  # The merge queue re-runs the required checks on the PR merged with the target branch.
+  # The merge queue re-runs the required checks on the PR merged with the target branch
   merge_group:
     types: [checks_requested]
+    branches: [main, release/*, feature/*]
   push:
     branches: [main, release/*, feature/*]
     paths:
