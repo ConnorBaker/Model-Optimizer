@@ -41,10 +41,10 @@ jobs:
         tests/gpu_vllm/**
 
   # The GPU tests run in the merge queue, on nightly and on-demand runs, and on a PR that carries the
-  # `run-gpu-tests` label: the gate says which (`run_gpu`).
+  # `run-merge-tests` label: the gate says which (`run_merge_tests`).
   gpu-tests:
     needs: [pr-gate]
-    if: needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_gpu == 'true'
+    if: needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_merge_tests == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -122,24 +122,24 @@ jobs:
       - name: GPU tests are left to the merge queue
         if: >-
           ${{ needs.pr-gate.outputs.any_changed == 'true' &&
-          needs.pr-gate.outputs.run_gpu != 'true' }}
+          needs.pr-gate.outputs.run_merge_tests != 'true' }}
         run: >-
-          echo "::notice::The GPU tests run in the merge queue. Add the run-gpu-tests label and
+          echo "::notice::The GPU tests run in the merge queue. Add the run-merge-tests label and
           re-run this workflow to run them on this PR."
       - name: Required GPU tests did not succeed
         if: >-
           ${{ needs.pr-gate.result != 'success' || (needs.pr-gate.outputs.any_changed == 'true' &&
-          needs.pr-gate.outputs.run_gpu == 'true' && needs.gpu-tests.result != 'success') }}
+          needs.pr-gate.outputs.run_merge_tests == 'true' && needs.gpu-tests.result != 'success') }}
         run: exit 1
-      - name: Remove the run-gpu-tests label, it applies to one round of runs
+      - name: Remove the run-merge-tests label, it applies to one round of runs
         if: >-
           ${{ !cancelled() && startsWith(github.ref, 'refs/heads/pull-request/') &&
-          needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_gpu == 'true' }}
+          needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_merge_tests == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           pr="${GITHUB_REF_NAME#pull-request/}"
-          url="repos/${GITHUB_REPOSITORY}/issues/${pr}/labels/run-gpu-tests"
+          url="repos/${GITHUB_REPOSITORY}/issues/${pr}/labels/run-merge-tests"
           if gh api -X DELETE "$url" --silent; then
-            echo "::notice::Removed the run-gpu-tests label after this round; add it again for the next push."
+            echo "::notice::Removed the run-merge-tests label after this round; re-add it for the next push."
           fi

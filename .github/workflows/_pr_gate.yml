@@ -20,10 +20,10 @@ on:
       any_changed:
         description: "Whether any relevant files changed"
         value: ${{ jobs.check-file-changes.outputs.any_changed }}
-      run_gpu:
+      run_merge_tests:
         description: >-
-          Whether the GPU tests run: always except on a PR run without the run-gpu-tests label
-        value: ${{ jobs.check-file-changes.outputs.run_gpu }}
+          Whether the GPU tests run: always except on a PR run without the run-merge-tests label
+        value: ${{ jobs.check-file-changes.outputs.run_merge_tests }}
 
 jobs:
   check-file-changes:
@@ -31,7 +31,7 @@ jobs:
     outputs:
       any_changed: ${{ steps.changed-tests.outputs.any_modified || steps.non-pr.outputs.any_changed }}
       # Empty outside PR runs (nightly, on demand), which run everything
-      run_gpu: ${{ steps.base.outputs.run_gpu || 'true' }}
+      run_merge_tests: ${{ steps.base.outputs.run_merge_tests || 'true' }}
     steps:
       # For non-PR triggers (schedule, workflow_dispatch), always run tests. A PR run is a push to a
       # copy-pr-bot branch (pull-request/N) or a merge queue group, which both diff against the base.
@@ -61,7 +61,7 @@ jobs:
     if: >-
       (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') &&
       needs.check-file-changes.outputs.any_changed == 'true' &&
-      needs.check-file-changes.outputs.run_gpu == 'true'
+      needs.check-file-changes.outputs.run_merge_tests == 'true'
     runs-on: ubuntu-latest
     permissions:
       checks: read

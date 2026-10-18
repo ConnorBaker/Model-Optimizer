@@ -4,7 +4,7 @@ description: >
   PR's head and its target branch; for a merge queue group it is the commit the group was built
   on. Outputs are empty for non-PR triggers, which have no diff to inspect. Also says whether the
   GPU tests (the GPU, example and regression workflows) run: always in a merge queue group, and on
-  a copied PR branch only when the PR carries the `run-gpu-tests` label (the other PR runs skip them).
+  a copied PR branch only when the PR carries the `run-merge-tests` label (the other PR runs skip them).
   Requires a prior actions/checkout with fetch-depth 0.
 
 outputs:
@@ -14,10 +14,10 @@ outputs:
   head_sha:
     description: The PR's head commit, or the merge queue group's head commit.
     value: ${{ steps.pr-shas.outputs.head_sha || steps.merge-group.outputs.head_sha }}
-  run_gpu:
+  run_merge_tests:
     description: >-
       "true" if the GPU tests run in this PR run, else "false". Empty for non-PR triggers.
-    value: ${{ steps.pr-shas.outputs.run_gpu || steps.merge-group.outputs.run_gpu }}
+    value: ${{ steps.pr-shas.outputs.run_merge_tests || steps.merge-group.outputs.run_merge_tests }}
 
 runs:
   using: composite
@@ -34,8 +34,8 @@ runs:
       run: |
         echo "head_sha=$(echo "$PR_INFO" | jq -r '.head.sha')" >> $GITHUB_OUTPUT
         echo "base_sha=$(echo "$PR_INFO" | jq -r '.base.sha')" >> $GITHUB_OUTPUT
-        echo "run_gpu=$(echo "$PR_INFO" |
-          jq -r '[(.labels // [])[].name] | index("run-gpu-tests") != null')" >> $GITHUB_OUTPUT
+        echo "run_merge_tests=$(echo "$PR_INFO" |
+          jq -r '[(.labels // [])[].name] | index("run-merge-tests") != null')" >> $GITHUB_OUTPUT
     # Get commit from the target branch that is present in the PR to use as base for changed files
     - if: startsWith(github.ref, 'refs/heads/pull-request/')
       id: calculate-merge-base
@@ -56,4 +56,4 @@ runs:
       run: |
         echo "base_sha=$BASE_SHA" | tee --append "${GITHUB_OUTPUT}"
         echo "head_sha=$HEAD_SHA" | tee --append "${GITHUB_OUTPUT}"
-        echo "run_gpu=true" | tee --append "${GITHUB_OUTPUT}"
+        echo "run_merge_tests=true" | tee --append "${GITHUB_OUTPUT}"

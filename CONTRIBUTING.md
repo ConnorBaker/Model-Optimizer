@@ -156,7 +156,7 @@ Test filenames must mirror the production module they primarily cover: tests for
 - `tests/gpu_vllm`: Fast GPU-based unit tests for the core ModelOpt library for vLLM features. In most cases, they should not take more than a few seconds to run.
 - `tests/examples`: Integration tests for ModelOpt examples. They should not take more than a few minutes to run. Please refer to [example test README](./tests/examples/README.md) for more details.
 
-CI runs the GPU tests (`tests/gpu`, `tests/gpu_megatron`, `tests/gpu_trtllm`, `tests/gpu_vllm`, `tests/regression` and `tests/examples`) in the merge queue and on the nightly, not on every pull request push. To run them on a pull request, add the `run-gpu-tests` label and re-run the workflows; CI removes the label again when that round of runs finishes.
+CI runs the GPU tests (`tests/gpu`, `tests/gpu_megatron`, `tests/gpu_trtllm`, `tests/gpu_vllm`, `tests/regression` and `tests/examples`) in the merge queue and on the nightly, not on every pull request push. To run them on a pull request, add the `run-merge-tests` label and re-run the workflows; CI removes the label again when that round of runs finishes.
 
 For lightweight focused local validation, run `pytest` directly on the relevant test path. For example:
 
@@ -288,7 +288,7 @@ nox -s "unit-3.12(torch_211, tf_latest)"
   enabled on its target branch (the queue runs the checks for `main`, `release/*` and `feature/*`), merging adds
   the PR to the queue: GitHub builds a temporary branch of the target branch plus the queued PRs ahead of it,
   re-runs the required checks on it (path gating and runners as in a PR run, but with the GPU tests, which a
-  PR run leaves out unless it carries the `run-gpu-tests` label, and without the nightly-only tests) and
+  PR run leaves out unless it carries the `run-merge-tests` label, and without the nightly-only tests) and
   merges the PR only if they pass. Each PR still lands on its own. A PR that fails in the queue is removed
   from it and the PRs behind it are re-tested without it; fix it and queue it again.
 - If your PR is a bug fix that should also land in an ongoing release branch, add the
