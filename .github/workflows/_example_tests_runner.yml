@@ -107,7 +107,9 @@ jobs:
             # Keep legacy ONNX/TRT tests available manually during deprecation.
             pytest_args+=(--ignore=tests/examples/diffusers/test_diffusers_onnx_trt.py)
           fi
-          if [[ "${{ inputs.example }}" == "hf_ptq" && ( "${{ github.ref }}" == refs/heads/pull-request/* || "${{ github.event_name }}" == "merge_group" ) ]]; then
+          if [[ "${{ inputs.example }}" == "hf_ptq" &&
+                ( "${{ github.ref }}" == refs/heads/pull-request/* ||
+                  "${{ github.event_name }}" == "merge_group" ) ]]; then
             # One GPU on PR runners: small-model tests share it and the rest run alone on it
             # (tests/examples/hf_ptq/conftest.py). The 2-GPU nightly stays serial.
             pytest_args+=(-n 4)

@@ -79,7 +79,9 @@ jobs:
 
   regression-pr-required-check:
     # Run even if regression-tests is skipped
-    if: ${{ (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') && always() }}
+    if: >-
+      ${{ (startsWith(github.ref, 'refs/heads/pull-request/') ||
+      github.event_name == 'merge_group') && always() }}
     needs: [pr-gate, regression-tests]
     runs-on: ubuntu-latest
     steps:
