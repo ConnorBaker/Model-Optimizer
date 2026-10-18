@@ -14,7 +14,7 @@ The PTQ recipe is the same as the one used for the released [`nvidia/NVIDIA-Nemo
 
 ## Results
 
-All checkpoints were served with the same vLLM settings (see [Section 5](#5-evaluation-and-serving)); the quantized ones with an FP8 KV cache. BF16 is the mean of two runs.
+All checkpoints were served with the same vLLM settings (see [Section 5](#5-evaluation-and-serving)), MMLU-ProX at `--max-model-len 32768` for all three; the quantized ones with an FP8 KV cache. BF16 is the mean of two runs.
 
 | Benchmark | BF16 (teacher) | W4A4 PTQ | W4A4 QAD (600 iters) |
 | --- | --- | --- | --- |
