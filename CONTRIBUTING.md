@@ -151,12 +151,12 @@ Test filenames must mirror the production module they primarily cover: tests for
 
 - `tests/unit`: Fast cpu-based unit tests for the core ModelOpt library. They should not take more than a few seconds to run.
 - `tests/gpu`: Fast GPU-based unit tests for the core ModelOpt library. In most cases, they should not take more than a few seconds to run.
-- `tests/gpu_megatron`: GPU-based integration tests for the core ModelOpt library for Megatron-Core features.
-- `tests/gpu_trtllm`: GPU-based integration tests for the core ModelOpt library for TensorRT-LLM features.
-- `tests/gpu_vllm`: GPU-based integration tests for the core ModelOpt library for vLLM features.
+- `tests/gpu_megatron`: Fast GPU-based unit tests for the core ModelOpt library for Megatron-Core features. In most cases, they should not take more than a few seconds to run.
+- `tests/gpu_trtllm`: Fast GPU-based unit tests for the core ModelOpt library for TensorRT-LLM features. In most cases, they should not take more than a few seconds to run.
+- `tests/gpu_vllm`: Fast GPU-based unit tests for the core ModelOpt library for vLLM features. In most cases, they should not take more than a few seconds to run.
 - `tests/examples`: Integration tests for ModelOpt examples. They should not take more than a few minutes to run. Please refer to [example test README](./tests/examples/README.md) for more details.
 
-CI runs the integration tests (`tests/gpu_megatron`, `tests/gpu_trtllm`, `tests/gpu_vllm`, `tests/regression` and `tests/examples`) in the merge queue and on the nightly, not on every pull request push. To run them on a pull request, add the `run-integration-tests` label and re-run the workflows.
+CI runs the GPU tests (`tests/gpu`, `tests/gpu_megatron`, `tests/gpu_trtllm`, `tests/gpu_vllm`, `tests/regression` and `tests/examples`) in the merge queue and on the nightly, not on every pull request push. To run them on a pull request, add the `run-gpu-tests` label and re-run the workflows.
 
 For lightweight focused local validation, run `pytest` directly on the relevant test path. For example:
 
@@ -287,10 +287,10 @@ nox -s "unit-3.12(torch_211, tf_latest)"
 - Once your PR is approved and all checks pass, one of the reviewers will merge the PR. With the merge queue
   enabled on its target branch (the queue runs the checks for `main`, `release/*` and `feature/*`), merging adds
   the PR to the queue: GitHub builds a temporary branch of the target branch plus the queued PRs ahead of it,
-  re-runs the required checks on it (path gating and runners as in a PR run, but with the integration tests,
-  which a PR run leaves out unless it carries the `run-integration-tests` label, and without the nightly-only
-  tests) and merges the PR only if they pass. Each PR still lands on its own. A PR that fails in the queue is
-  removed from it and the PRs behind it are re-tested without it; fix it and queue it again.
+  re-runs the required checks on it (path gating and runners as in a PR run, but with the GPU tests, which a
+  PR run leaves out unless it carries the `run-gpu-tests` label, and without the nightly-only tests) and
+  merges the PR only if they pass. Each PR still lands on its own. A PR that fails in the queue is removed
+  from it and the PRs behind it are re-tested without it; fix it and queue it again.
 - If your PR is a bug fix that should also land in an ongoing release branch, add the
   `cherry-pick-<X.Y.Z>` label (e.g. `cherry-pick-0.47.0`) matching that release. Labeled PRs are
   cherry-picked into the release branch so the fix is included in the next release candidate.

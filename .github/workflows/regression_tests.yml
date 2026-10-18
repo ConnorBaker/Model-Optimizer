@@ -41,11 +41,11 @@ jobs:
         modelopt_recipes/general/speculative_decoding/**
         tools/launcher/**
 
-  # Integration tests: they run in the merge queue, on nightly and on-demand runs, and on a PR that
-  # carries the `run-integration-tests` label.
+  # Runs in the merge queue, on nightly and on-demand runs, and on a PR that carries the
+  # `run-gpu-tests` label.
   regression-tests:
     needs: [pr-gate]
-    if: needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_integration == 'true'
+    if: needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_gpu == 'true'
     runs-on: >-
       ${{ (startsWith(github.ref, 'refs/heads/pull-request/') || github.event_name == 'merge_group') &&
       'linux-amd64-gpu-rtxpro6000-latest-1' || 'linux-amd64-gpu-rtxpro6000-latest-2' }}
@@ -90,13 +90,13 @@ jobs:
       - name: Regression tests are left to the merge queue
         if: >-
           ${{ needs.pr-gate.outputs.any_changed == 'true' &&
-          needs.pr-gate.outputs.run_integration != 'true' }}
+          needs.pr-gate.outputs.run_gpu != 'true' }}
         run: >-
-          echo "::notice::The regression tests are integration tests and run in the merge queue. Add the
-          run-integration-tests label and re-run this workflow to run them on this PR."
+          echo "::notice::The regression tests run in the merge queue. Add the run-gpu-tests label and
+          re-run this workflow to run them on this PR."
       - name: Required regression tests did not succeed
         if: |
           needs.pr-gate.result != 'success' ||
-          (needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_integration == 'true' &&
+          (needs.pr-gate.outputs.any_changed == 'true' && needs.pr-gate.outputs.run_gpu == 'true' &&
           needs.regression-tests.result != 'success')
         run: exit 1
