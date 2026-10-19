@@ -32,12 +32,14 @@ BATCH = 2
 SEQ = 4
 
 
-def _build_dq_matmul_model(axis: int | None = 0):
+def _build_dq_matmul_model(axis: int | None = 0, per_tensor: bool = False):
     """Build minimal model: input -> MatMul(input, DQ(weight, scale, zp)) -> output.
 
     Uses per-channel INT8 quantization on the given (possibly negative) axis of the weight
     [IN, OUT]. Defaults to axis 0, matching the ONNX export this surgery targets. Pass
-    axis=None to omit the attribute entirely and rely on the ONNX-spec default of 1.
+    axis=None to omit the attribute entirely and rely on the ONNX-spec default of 1. Pass
+    per_tensor=True for a scalar scale/zero-point instead, as in opset < 13 DQ nodes
+    (which do not have an axis attribute at all, since per-axis quantization is opset 13+).
     """
     rng = np.random.RandomState(123)
 
@@ -45,11 +47,15 @@ def _build_dq_matmul_model(axis: int | None = 0):
 
     # Quantized weight [IN_FEATURES, OUT_FEATURES] int8
     w_int8 = rng.randint(-127, 127, size=(IN_FEATURES, OUT_FEATURES)).astype(np.int8)
-    # Per-channel scale along `axis` -> one value per channel on that axis
-    channels = IN_FEATURES if effective_axis % 2 == 0 else OUT_FEATURES
-    scale = rng.rand(channels).astype(np.float32) * 0.01 + 0.001
-    # Per-channel zero point
-    zp = np.zeros(channels, dtype=np.int8)
+    if per_tensor:
+        scale = np.array(rng.rand() * 0.01 + 0.001, dtype=np.float32)
+        zp = np.array(0, dtype=np.int8)
+    else:
+        # Per-channel scale along `axis` -> one value per channel on that axis
+        channels = IN_FEATURES if effective_axis % 2 == 0 else OUT_FEATURES
+        scale = rng.rand(channels).astype(np.float32) * 0.01 + 0.001
+        # Per-channel zero point
+        zp = np.zeros(channels, dtype=np.int8)
 
     w_init = numpy_helper.from_array(w_int8, name="weight_quantized")
     s_init = numpy_helper.from_array(scale, name="weight_scale")
@@ -215,6 +221,35 @@ def test_negative_axis_is_swapped(axis, expected_axis, tmp_path):
         if attr.name == "axis"
     )
     assert axis_val == expected_axis, f"axis {axis} should become {expected_axis}, got {axis_val}"
+
+    feeds = {"input": np.random.RandomState(999).randn(BATCH, SEQ, IN_FEATURES).astype(np.float32)}
+    np.testing.assert_allclose(
+        _run_unoptimized(modified, feeds)[0],
+        _run_unoptimized(original, feeds)[0],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_per_tensor_dq_axis_is_not_added(tmp_path):
+    """A per-tensor DQ node (scalar scale) must not gain an axis attribute.
+
+    Per-tensor quantization predates the axis attribute (opset < 13) and ignores axis
+    entirely, so adding one unconditionally -- as a DQ node with an explicit per-axis
+    scale needs -- would make an opset < 13 node invalid for its own opset.
+    """
+    original = _build_dq_matmul_model(axis=None, per_tensor=True)
+    orig_path = str(tmp_path / "original.onnx")
+    out_path = str(tmp_path / "transposed.onnx")
+    onnx.save(original, orig_path)
+
+    modified = transpose_dequantize_linear_weights(
+        model_path=orig_path, output_path=out_path, use_external_data=False, verbose=False
+    )
+
+    dq_node = next(n for n in modified.graph.node if n.op_type == "DequantizeLinear")
+    axis_attrs = [attr.i for attr in dq_node.attribute if attr.name == "axis"]
+    assert axis_attrs == [], f"expected no axis attribute on a per-tensor DQ, got {axis_attrs}"
 
     feeds = {"input": np.random.RandomState(999).randn(BATCH, SEQ, IN_FEATURES).astype(np.float32)}
     np.testing.assert_allclose(
