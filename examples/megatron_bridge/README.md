@@ -81,6 +81,8 @@ This section shows how to quantize a HuggingFace model using ModelOpt in the Meg
 
 `quantize.py` supports the following formats via `--quant_cfg` (e.g. `fp8`, `nvfp4`, `int8_smoothquant`, `int4_awq`, `w4a8_awq_beta`, ...). You can also pass any full config name exposed by ModelOpt (e.g. `NVFP4_DEFAULT_CFG`) or a YAML `--recipe` (e.g. `general/ptq/nvfp4_default-kv_fp8`, authoritative for quant_cfg + algorithm + KV-cache). KV-cache quantization can be enabled on top via `--kv_cache_quant` (e.g. `fp8`, `nvfp4`).
 
+Recipes name Hugging Face (transformers) modules such as `q_proj` and `lm_head`. `quantize.py` translates them to the Megatron-Core modules they map to (`linear_qkv`, `output_layer`) through Megatron-Bridge's mapping registry. A recipe that configures only some of the Hugging Face modules that one Megatron module fuses (e.g. `in_proj_qkv` but not `in_proj_a` of a GatedDeltaNet `in_proj`) is rejected with an error naming the module: configure all of them alike.
+
 **Step 1 — quantize** Qwen3-8B to NVFP4 on 2 GPUs (Tensor Parallelism = 2) using 1024 samples from default dataset (Mix of [`cnn_dailymail`](https://huggingface.co/datasets/abisee/cnn_dailymail) and [`nemotron-post-training-dataset-v2`](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2)) for calibration (sequence length = 4096):
 
 ```bash
