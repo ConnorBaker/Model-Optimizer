@@ -21,6 +21,7 @@ Changelog
 - Add ``--sft_in_batch_packing``, ``--moe_aux_loss_coeff`` and ``--dsa_kernel_backend`` to ``examples/megatron_bridge/distill.py`` (``--dsa_kernel_backend`` also to ``quantize.py``): pack ``--sft_hf_dataset`` conversations per micro-batch instead of padding each to ``--seq_length``, override the MoE load-balancing loss weight (e.g. 0 for padded SFT data), and select fused DeepSeek sparse-attention kernels for long sequences.
 - Add ``--vllm_fakequant_export`` to ``examples/megatron_bridge/export_quantized_megatron_to_hf.py`` to evaluate formats vLLM has no kernels for (e.g. GGML IQ) as BF16 fake-quant checkpoints, and allow ``--ep_size`` > 1 for checkpoints built with ``--no_moe_grouped_gemm``.
 - GGML GPTQ checkpoints from ``examples/megatron_bridge`` keep their calibrated codes when the Megatron checkpoint is reloaded for QAD or export, and layerwise calibration now runs on Megatron vision-language models.
+- Add GLM-5.3-Flash (``glm5_next``) support to ``examples/megatron_bridge`` PTQ and unified HF export with the ``models/zai-org/GLM-5.3-Flash-BF16/ptq/nvfp4_experts_dense_mlp-kv_fp8_cast`` recipe, matching ``nvidia/GLM-5.3-Flash-NVFP4``, and a GGML IQ2_S recipe for its routed experts (``models/zai-org/GLM-5.3-Flash-BF16/ptq/iq2_s_experts-q8_0_shared_dense-gptq``). Requires a Megatron-Bridge and Megatron-Core with GLM-5.3-Flash support.
 
 *Misc*
 
@@ -102,7 +103,6 @@ Changelog
 - Add ``--mlflow <tracking-uri>`` to the ``examples/megatron_bridge`` scripts that write a checkpoint -- ``prune_minitron.py``, ``quantize.py``, ``distill.py``, ``export_quantized_megatron_to_hf.py`` and ``export_distilled_megatron_to_hf.py`` (MLflow's own ``MLFLOW_TRACKING_URI`` is honoured too). Each run records the invocation, its arguments as searchable params and its log -- a distillation records its training metrics instead of the rank-0 log -- and writes ``.experiment.json`` into the checkpoint it produced, so a pruning, a quantization, the distillation that refines its checkpoint and the export that deploys it can be traced to one another; uploading the checkpoints themselves stays off unless ``--mlflow_log_checkpoints`` is passed.
 - Add ``--ep_size`` to ``examples/megatron_bridge/export_quantized_megatron_to_hf.py`` so large MoE models with grouped-GEMM experts can be exported with their experts sharded across GPUs. Checkpoints built with ``--no_moe_grouped_gemm`` must still be exported at ``--ep_size 1``.
 - Add unified HF export of GLM-5 / GLM-5.2 (``glm_moe_dsa``) checkpoints quantized with ``examples/megatron_bridge``. The MTP layer, which Megatron-Bridge does not build for these models, is copied through unquantized from the source checkpoint. DSA sparse-attention models also gain FP8 KV-cache quantization on Megatron.
-- Add GLM-5.3-Flash (``glm5_next``) support to ``examples/megatron_bridge`` PTQ and unified HF export with the ``models/zai-org/GLM-5.3-Flash-BF16/ptq/nvfp4_experts_dense_mlp-kv_fp8_cast`` recipe, matching ``nvidia/GLM-5.3-Flash-NVFP4``. Requires a Megatron-Bridge and Megatron-Core with GLM-5.3-Flash support.
 
 *Misc*
 
