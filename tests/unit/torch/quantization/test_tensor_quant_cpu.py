@@ -586,7 +586,7 @@ def test_stochastic_rounding_clipping_and_ste(bits, pass_through):
     [
         {"fake_quant": False},
         {"backend": "custom"},
-        {"num_bits": (2, 1), "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)}},
+        {"num_bits": (2, 1), "block_sizes": {-1: 32, "type": "dynamic", "scale_bits": (4, 3)}},
     ],
 )
 def test_stochastic_rounding_rejects_unsupported_backends(options):
@@ -594,14 +594,21 @@ def test_stochastic_rounding_rejects_unsupported_backends(options):
         QuantizerAttributeConfig(rounding="stochastic", **options)
 
 
-def test_stochastic_rounding_checkpoint_and_export(tmp_path):
+@pytest.mark.parametrize(
+    "format_cfg",
+    [
+        {"num_bits": 8},
+        {"num_bits": (2, 1), "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)}},
+    ],
+)
+def test_stochastic_rounding_checkpoint_and_export(tmp_path, format_cfg):
     model = mtq.quantize(
-        torch.nn.Linear(4, 4),
+        torch.nn.Linear(16, 16),
         {
             "quant_cfg": [
                 {
                     "quantizer_name": "*",
-                    "cfg": {"num_bits": 8, "type": "dynamic", "rounding": "stochastic"},
+                    "cfg": {**format_cfg, "type": "dynamic", "rounding": "stochastic"},
                 }
             ],
             "algorithm": None,
@@ -609,10 +616,10 @@ def test_stochastic_rounding_checkpoint_and_export(tmp_path):
     )
     path = tmp_path / "model.pth"
     mto.save(model, path)
-    restored = mto.restore(torch.nn.Linear(4, 4), path)
+    restored = mto.restore(torch.nn.Linear(16, 16), path)
     assert restored.weight_quantizer.rounding == "stochastic"
     with torch.random.fork_rng(devices=[]):
-        inputs = torch.randn(2, 4)
+        inputs = torch.randn(2, 16)
         torch.manual_seed(41)
         expected = model(inputs)
         torch.manual_seed(41)
@@ -620,7 +627,7 @@ def test_stochastic_rounding_checkpoint_and_export(tmp_path):
     with pytest.raises(NotImplementedError):
         get_quantization_format(restored)
     with pytest.raises(NotImplementedError):
-        torch.export.export(restored.weight_quantizer, (torch.randn(4, 4),), strict=False)
+        torch.export.export(restored.weight_quantizer, (torch.randn(16, 16),), strict=False)
     legacy = TensorQuantizer()
     state = legacy.get_modelopt_state()
     state.pop("_rounding")

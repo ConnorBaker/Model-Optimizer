@@ -897,11 +897,21 @@ class TensorQuantizer(nn.Module):
         return getattr(self, "_rounding", "nearest")
 
     def _check_rounding_support(self):
+        nvfp4 = self.is_nvfp4_dynamic and self.block_sizes == {
+            -1: 16,
+            "type": "dynamic",
+            "scale_bits": (4, 3),
+        }
         if self.rounding != "nearest" and (
             not self.fake_quant
             or self.backend is not None
-            or not (isinstance(self.num_bits, int) or self.num_bits == (4, 3))
-            or (self.block_sizes is not None and self.block_sizes.get("type") == "dynamic")
+            or (
+                not nvfp4
+                and (
+                    not (isinstance(self.num_bits, int) or self.num_bits == (4, 3))
+                    or (self.block_sizes is not None and self.block_sizes.get("type") == "dynamic")
+                )
+            )
             or getattr(self, "_lsq", False)
         ):
             raise NotImplementedError("This quantization path does not support stochastic rounding")
@@ -936,6 +946,7 @@ class TensorQuantizer(nn.Module):
                 getattr(self, "_trt_high_precision_dtype", None),
                 getattr(self, "_onnx_quantizer_type", None),
                 self._pass_through_bwd,
+                self.rounding,
             )
         elif isinstance(self._num_bits, tuple):
             # Float-point quantization, e.g., FP8

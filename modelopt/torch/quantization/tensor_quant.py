@@ -522,11 +522,29 @@ def _dynamic_block_quantize_forward(
     return outputs
 
 
+def _nvfp4_stochastic(inputs, amax):
+    """Round E2M1 values stochastically; keep the FP32 global/E4M3 block scales unchanged."""
+    shape = inputs.shape
+    padding = (-shape[-1]) % 16
+    x = torch.nn.functional.pad(inputs.float(), (0, padding)).reshape(*shape[:-1], -1, 16)
+    global_scale = amax.float().amax() / (6 * 448)
+    global_scale = torch.where(global_scale > 0, global_scale, 1.0)
+    block_scale = (x.abs().amax(-1, keepdim=True) / (6 * global_scale)).clamp(max=448)
+    block_scale = block_scale.to(torch.float8_e4m3fn).float()
+    scale = block_scale * global_scale
+    normalized = (x / torch.where(scale > 0, scale, 1.0)).clamp(-6, 6)
+    # E2M1 has spacing 0.5 below 2, 1 below 4, and 2 up to its maximum of 6.
+    exponent = torch.frexp(normalized.abs())[1].clamp(min=1) - 2
+    spacing = torch.ldexp(torch.ones_like(normalized), exponent)
+    rounded = _round_to_integer(normalized / spacing, "stochastic") * spacing
+    return (rounded * scale).reshape(*shape[:-1], -1)[..., : shape[-1]].to(inputs.dtype)
+
+
 class DynamicBlockQuantizationFunction(Function):
     """Dynamic block quantization functional."""
 
     @staticmethod
-    @symbolic_helper.parse_args("v", "i", "v", "t", "is", "is", "s", "s", "b")
+    @symbolic_helper.parse_args("v", "i", "v", "t", "is", "is", "s", "s", "b", "s")
     def symbolic(
         g,
         inputs,
@@ -538,9 +556,13 @@ class DynamicBlockQuantizationFunction(Function):
         trt_high_precision_dtype=None,
         onnx_quantizer_type="dynamic",
         pass_through_bwd=True,
+        rounding="nearest",
     ):
         """ONNX symbolic function."""
         from .export_onnx import export_fp4, export_mxfp8
+
+        if rounding != "nearest":
+            raise NotImplementedError("ONNX export does not support stochastic rounding")
 
         if num_bits == (2, 1) and scale_bits == (4, 3):
             return export_fp4(
@@ -575,9 +597,18 @@ class DynamicBlockQuantizationFunction(Function):
         trt_high_precision_dtype=None,
         onnx_quantizer_type="dynamic",
         pass_through_bwd=True,
+        rounding="nearest",
     ):
         """Forward method."""
         _save_for_backward_if_needed(ctx, pass_through_bwd, inputs, amax)
+        if rounding == "stochastic":
+            if num_bits != (2, 1) or scale_bits != (4, 3) or block_size != 16 or bias is not None:
+                raise NotImplementedError(
+                    "Stochastic block quantization requires unbiased block16 NVFP4"
+                )
+            return _nvfp4_stochastic(inputs, amax)
+        if rounding != "nearest":
+            raise ValueError(f"Unsupported rounding policy: {rounding}")
         return _dynamic_block_quantize_forward(
             ctx,
             inputs,
@@ -593,7 +624,7 @@ class DynamicBlockQuantizationFunction(Function):
     @staticmethod
     def backward(ctx, grad_outputs):
         """Implements straight through estimation with clipping."""
-        return _fake_quant_backward_function(ctx, grad_outputs, num_args=9)
+        return _fake_quant_backward_function(ctx, grad_outputs, num_args=10)
 
 
 class StaticBlockwiseFP4FakeQuantFunction(Function):

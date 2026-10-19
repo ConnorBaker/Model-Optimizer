@@ -34,16 +34,25 @@ from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor
 class TensorQuantizerTester:
     device = None
 
-    @pytest.mark.parametrize("bits", [8, (4, 3)])
-    @pytest.mark.parametrize("grouping", [{}, {"axis": 0}, {"block_sizes": {-1: 32}}])
+    @pytest.mark.parametrize(
+        ("bits", "grouping"),
+        [
+            (bits, grouping)
+            for bits in (8, (4, 3))
+            for grouping in ({}, {"axis": 0}, {"block_sizes": {-1: 32}})
+        ]
+        + [((2, 1), {"block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)}})],
+    )
     def test_stochastic_rounding(self, bits, grouping):
-        maximum, gap = (127.0, 1.0) if bits == 8 else (448.0, 0.125)
+        maximum, gap = {8: (127.0, 1.0), (4, 3): (448.0, 0.125), (2, 1): (6.0, 0.5)}[bits]
         # Known adjacent codes test the rounding distribution independently of its implementation.
-        tiny = 1.0 if bits == 8 else 2.0**-9
+        tiny = {8: 1.0, (4, 3): 2.0**-9, (2, 1): 0.5}[bits]
         lower = torch.tensor([1.0, -1 - gap, 0.0, -tiny], device=self.device)
         spacing = torch.tensor([gap, gap, tiny, tiny], device=self.device)
         values = lower + spacing * torch.tensor([0.25, 0.75, 0.25, 0.75], device=self.device)
         row = torch.cat([values, torch.zeros(27, device=self.device), values.new_tensor([maximum])])
+        if bits == (2, 1):
+            row[15] = maximum  # Both block scales are exactly 448; the effective scale is 1.
         x = row.repeat(4096, 1).requires_grad_()
         quantizer = TensorQuantizer(
             QuantizerAttributeConfig(

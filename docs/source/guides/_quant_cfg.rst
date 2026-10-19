@@ -123,9 +123,11 @@ quantizer you want active should be explicitly configured with a ``cfg`` entry.
 Rounding is independent of format and scale grouping. For example, an INT8 or
 FP8 E4M3 entry can set ``"rounding": "stochastic"`` while retaining its existing
 ``num_bits``, ``axis`` or ``block_sizes``. The initial implementation supports
-built-in fake quantization with unquantized scales; custom backends, MX/NVFP4,
-learned scales, fused attention/GEMM kernels and inference export reject
-stochastic rounding.
+built-in integer/E4M3 fake quantization with unquantized scales, and dynamic
+block16 NVFP4 (E2M1 values with E4M3 block scales). NVFP4 rounds values
+stochastically and keeps scale quantization at nearest. Custom backends, MX,
+static NVFP4, learned scales, fused attention/GEMM kernels and inference export
+reject stochastic rounding.
 
 Stochastic rounding uses PyTorch's device RNG. Use ``torch.manual_seed`` for
 repeatable forwards with the same shapes and call order. ModelOpt checkpoints
