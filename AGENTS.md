@@ -37,6 +37,20 @@ These instructions apply to AI-assisted work in this repository.
   "ship", or equivalent before running `git push`, `gh pr create`, or any
   push-option flags like `-o merge_request.create`.
 
+## Responding to README testability advice
+
+- CI advice is a proposal, not authorization to edit files or submit jobs.
+  Implement it only after an authorized maintainer explicitly requests the changes.
+- Compare the proposal's reviewed commit with the current PR head. If it moved,
+  reassess the affected snippets; ask again only if the required scope materially changed.
+- Keep README changes minimal: stable snippet IDs and justified command fixes.
+  Put scenarios, setup, assertions, resource metadata, and exclusions in Python
+  tests/fixtures, following the [snippet contract](tests/_test_utils/doc_tests/README.md).
+- Reuse fixtures before adding helpers. Propose necessary tests, fixtures, and
+  CI lane changes together; distinguish bounded smoke tests from manual integrations.
+- Stay within the approved implementation and validation scope. Honor existing
+  launch approvals and the normal commit/push rules; advice alone grants neither.
+
 ## Updating skills
 
 - **Keep skill edits concise.** Skills are loaded into agent context, so every
