@@ -39,6 +39,7 @@ with import_plugin("apex"):
 
 from .attention import *
 from .custom import *
+from .gated_delta_net import *
 
 with import_plugin("diffusers"):
     from .diffusion.diffusers import *
@@ -71,6 +72,8 @@ with import_plugin("transformers"):
 with import_plugin("vllm"):
     from .vllm import *
     from .vllm_indexer import *
+    from .vllm_layer_scope import *
+    from .vllm_mega_moe import *
 
 with import_plugin("trl"):
     from .trl import *

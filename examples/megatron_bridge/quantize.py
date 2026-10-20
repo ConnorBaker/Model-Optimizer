@@ -152,6 +152,15 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--pp_size", type=int, default=1, help="Pipeline parallel size")
     parser.add_argument("--ep_size", type=int, default=1, help="Expert parallel size")
     parser.add_argument("--cp_size", type=int, default=1, help="Context parallel size")
+    parser.add_argument(
+        "--dsa_kernel_backend",
+        choices=["none", "tilelang", "cudnn"],
+        default=None,
+        help=(
+            "Fused kernels for DeepSeek sparse attention (e.g. GLM-5.x). The unfused fallback "
+            "builds dense [seq, seq] scores per head, which does not fit at long sequence lengths."
+        ),
+    )
 
     # Quantization arguments
     parser.add_argument(
@@ -203,6 +212,16 @@ def get_args() -> argparse.Namespace:
         action="store_true",
         help="Compress weights to a real low-bit representation (instead of fake quantization).",
     )
+    parser.add_argument(
+        "--lora_rank", type=int, default=0, help="Enable LoRA-QAT/QAD; 0 disables it."
+    )
+    parser.add_argument("--lora_alpha", type=float, default=16.0)
+    parser.add_argument(
+        "--lora_target_modules",
+        nargs="+",
+        default=["*.linear_qkv", "*.linear_proj", "*.linear_fc1", "*.linear_fc2"],
+        help="Glob patterns of fake-quantized linear layers to adapt.",
+    )
     # Calibration dataset arguments (matched to hf_ptq.py)
     parser.add_argument(
         "--calib_dataset_name",
@@ -250,6 +269,11 @@ def get_args() -> argparse.Namespace:
 
     args = parser.parse_args()
     resolve_mlflow_args(args, parser, QUANTIZE)
+
+    if args.lora_rank < 0:
+        parser.error("--lora_rank must be non-negative")
+    if args.lora_rank and args.compress:
+        parser.error("--lora_rank requires fake quantization; cannot be combined with --compress")
 
     print_args(masked_args(args))
 
@@ -330,6 +354,11 @@ def main(args: argparse.Namespace):
             "pipeline_dtype": torch.bfloat16,
             "seq_length": args.seq_length,
             "gradient_accumulation_fusion": False,  # not supported
+            **(
+                {"dsa_kernel_backend": args.dsa_kernel_backend}
+                if args.dsa_kernel_backend is not None
+                else {}
+            ),
         },
         init_model_parallel=True,
     )
@@ -435,6 +464,16 @@ def main(args: argparse.Namespace):
         unwrapped_model.calibration_mode = False
     else:
         mtq.quantize(unwrapped_model, mtq_config, forward_loop)
+
+    if args.lora_rank:
+        mtq.enable_quant_lora(
+            unwrapped_model,
+            {
+                "rank": args.lora_rank,
+                "alpha": args.lora_alpha,
+                "target_modules": args.lora_target_modules,
+            },
+        )
 
     # Free calibration/quantization memory before generate
     gc.collect()

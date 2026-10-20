@@ -60,17 +60,21 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer import MegatronModule, TransformerConfig
+from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.router import TopKRouter
 
 import modelopt
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
+from modelopt.recipe import load_recipe
+from modelopt.torch.opt.dynamic import DynamicModule
 from modelopt.torch.opt.plugins.mcore_dist_checkpointing import (
     restore_sharded_modelopt_state,
     save_sharded_modelopt_state,
 )
 from modelopt.torch.quantization.algorithms import QuantRecipe, _AutoQuantizeBaseSearcher
+from modelopt.torch.quantization.ggml.common import PINNED_PAYLOAD_PREFIX
 from modelopt.torch.quantization.nn import QuantModuleRegistry, SequentialQuantizer
 from modelopt.torch.quantization.nn.modules.quant_linear import RealQuantLinear
 from modelopt.torch.quantization.plugins.megatron import (
@@ -95,7 +99,9 @@ from modelopt.torch.quantization.plugins.transformer_engine import (
 )
 from modelopt.torch.quantization.qtensor import QTensorWrapper
 from modelopt.torch.quantization.utils import is_quantized_linear
+from modelopt.torch.quantization.utils.calib_utils import GPTQHelper
 from modelopt.torch.quantization.utils.layerwise_calib import LayerActivationCollector
+from modelopt.torch.utils.plugins.megatron_generate import megatron_prefill
 
 try:
     from megatron.core.extensions.transformer_engine import TERowParallelLinear
@@ -1522,6 +1528,53 @@ def _test_gptq_mamba_hybrid(rank, size):
     assert torch.isfinite(forward(model)).all()
 
 
+def test_gptq_hessian_sync_across_dp(dist_workers_size_2):
+    """GPTQ at DP2 must use the Hessian of both ranks' calibration data and agree across ranks."""
+    dist_workers_size_2.run(_test_gptq_hessian_sync_across_dp)
+
+
+def _test_gptq_hessian_sync_across_dp(rank, size):
+    initialize_for_megatron(tensor_model_parallel_size=1, seed=SEED)
+    model = get_mcore_gpt_model(tensor_model_parallel_size=1, num_layers=1).cuda()
+    ref_model = get_mcore_gpt_model(tensor_model_parallel_size=1, num_layers=1).cuda()
+    ref_model.load_state_dict(model.state_dict())
+
+    torch.manual_seed(SEED + rank)
+    batch = get_batch(model, batch_size=2)
+    all_input_ids = [torch.empty_like(batch[0]) for _ in range(size)]
+    torch.distributed.all_gather(all_input_ids, batch[0])
+
+    def forward(model, input_ids_list):
+        for input_ids in input_ids_list:
+            model(input_ids, *batch[2:4], labels=batch[1], loss_mask=batch[4])
+
+    hessians = {}
+    update_weights = GPTQHelper.update_weights
+
+    def capture_hessian(self, *args, **kwargs):
+        hessians[self.name] = self.hessian.clone()
+        return update_weights(self, *args, **kwargs)
+
+    quant_cfg = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
+    quant_cfg["algorithm"] = {"method": "gptq"}
+    with patch.object(GPTQHelper, "update_weights", capture_hessian):
+        mtq.quantize(model, quant_cfg, partial(forward, input_ids_list=[batch[0]]))
+        dp_hessians = dict(hessians)
+        # Every rank calibrates on the union of the data, so its Hessian is the full-data one.
+        mtq.quantize(ref_model, quant_cfg, partial(forward, input_ids_list=all_input_ids))
+
+    assert dp_hessians
+    for name, hessian in dp_hessians.items():
+        # TF32 matmuls in the Hessian update leave ~1e-4 relative noise between the two runs.
+        assert (hessian - hessians[name]).norm() < 1e-3 * hessians[name].norm(), name
+
+    for name, m in model.named_modules():
+        if is_quantized_linear(m) and m.weight_quantizer.is_enabled:
+            weights = [torch.empty_like(m.weight) for _ in range(size)]
+            torch.distributed.all_gather(weights, m.weight.contiguous())
+            assert all(torch.equal(w, weights[0]) for w in weights), f"{name} differs across ranks"
+
+
 def _auto_quantize_mamba_hybrid_cost_helper(rank, size, expert_model_parallel_size, result_path):
     initialize_for_megatron(
         tensor_model_parallel_size=1,
@@ -1636,6 +1689,76 @@ def _test_mcore_layerwise_calibration_layers_do_not_mutate_decoder(rank, size):
 
 def test_mcore_layerwise_calibration_layers_do_not_mutate_decoder(dist_workers_size_1):
     dist_workers_size_1.run(_test_mcore_layerwise_calibration_layers_do_not_mutate_decoder)
+
+
+class _VLMWrapper(MegatronModule):
+    """A VLM root that, like Megatron-Bridge's GLM-5.3-Flash model, has no ``decoder`` of its own."""
+
+    def __init__(self, language_model):
+        super().__init__(config=language_model.config)
+        self.language_model = language_model
+
+    def forward(self, *args, **kwargs):
+        # Post-processes the language model's output, as real wrappers do.
+        return self.language_model(*args, **kwargs).float()
+
+
+def _test_layerwise_calibrate_vlm_text_forward_loop(drive_wrapper, rank, size):
+    initialize_for_megatron(tensor_model_parallel_size=1, seed=SEED)
+    language_model = _gpt_model_provider(tp_size=1, hidden_size=64)
+    model = _VLMWrapper(language_model)
+    tokens = torch.randint(0, language_model.vocab_size, (2, 16), device="cuda")
+
+    # Text calibration in examples/megatron_bridge/quantize.py drives the inner language model; image-text
+    # calibration drives the wrapper, so both patched forwards are on the stack when the stop is raised.
+    def forward_loop(_model):
+        megatron_prefill(
+            model if drive_wrapper else language_model, tokens, skip_return_logits=True
+        )
+
+    config = copy.deepcopy(mtq.FP8_DEFAULT_CFG)
+    config["algorithm"] = {"method": "max", "layerwise": {"enable": True}}
+    mtq.quantize(model, config, forward_loop)
+
+    calibrated = [m for m in language_model.decoder.modules() if is_quantized_linear(m)]
+    assert calibrated
+    assert all(m.input_quantizer.amax is not None for m in calibrated)
+
+
+@pytest.mark.parametrize("drive_wrapper", [False, True])
+def test_layerwise_calibrate_vlm_text_forward_loop(dist_workers_size_1, drive_wrapper):
+    dist_workers_size_1.run(partial(_test_layerwise_calibrate_vlm_text_forward_loop, drive_wrapper))
+
+
+def _test_ggml_gptq_payload_sharded_state_dict(tmp_path, rank, size):
+    initialize_for_megatron(tensor_model_parallel_size=size, seed=SEED)
+    model_ref = _gpt_model_provider(tp_size=size)
+    model_test = _gpt_model_provider(tp_size=size)
+
+    config = load_recipe("general/ptq/iq2_xs").quantize.model_dump()
+    gptq = next(algo for algo in config["algorithm"] if algo["method"] == "gptq")
+    config["algorithm"] = {**gptq, "layerwise": {"enable": False}}
+    mtq.quantize(model_ref, config, get_forward(model_ref))
+    pinned = {k: v for k, v in model_ref.state_dict().items() if PINNED_PAYLOAD_PREFIX in k}
+    assert pinned, "GPTQ pinned no GGML payload"
+
+    save_distributed_checkpoint(tmp_path, model_ref)
+    save_sharded_modelopt_state([model_ref], tmp_path)
+    restore_sharded_modelopt_state([model_test], tmp_path)
+    model_test = load_distributed_checkpoint(tmp_path, model_test)
+
+    restored = model_test.state_dict()
+    matches = torch.tensor(
+        all(k in restored and torch.equal(v, restored[k]) for k, v in pinned.items()), device="cuda"
+    )
+    # Agree across ranks before asserting, so a mismatch on one rank fails instead of hanging.
+    torch.distributed.all_reduce(matches, op=torch.distributed.ReduceOp.MIN)
+    assert matches.item(), "GPTQ's pinned GGML payloads did not survive the checkpoint"
+
+
+def test_ggml_gptq_payload_sharded_state_dict(dist_workers, tmp_path):
+    """GPTQ's pinned GGML codes are saved, so a reload exports them instead of re-encoding."""
+    dist_workers.run(partial(_test_ggml_gptq_payload_sharded_state_dict, tmp_path))
 
 
 @pytest.mark.parametrize("ep_size", [1, 2])
@@ -2074,6 +2197,117 @@ def test_csa_indexer_quant(dist_workers_size_1, tmp_path):
     """The DeepSeek-V4 CSA indexer query and key are fake-quantized before the Hadamard rotation,
     and their quantizer state survives save/restore."""
     dist_workers_size_1.run(partial(_test_csa_indexer_quant_helper, tmp_path))
+
+
+def test_registered_megatron_quant_modules_checkpoint_quantizer_state():
+    """Quantizer state rides in ``_extra_state``, which torch saves only for classes overriding it.
+
+    ``register_modelopt_extra_state_callbacks`` binds the hooks per instance, so a registered class
+    without a class-level ``get/set_extra_state`` silently drops its amax from checkpoints (as
+    DSAttention did). Containers whose child linears hold all quantizers are exempt.
+    """
+    containers = {MLP, SequentialMLP, TEGroupedMLP}
+    base = torch.nn.Module
+    missing = []
+    for cls, quant_cls in QuantModuleRegistry._registry.items():
+        if not issubclass(cls, MegatronModule) or cls in containers:
+            continue
+        if issubclass(cls, DynamicModule):
+            continue  # e.g. LoRA wrappers: the runtime class also includes the wrapped Megatron layer
+        routes = all(
+            any(getattr(c, attr) is not getattr(base, attr) for c in (quant_cls, cls))
+            for attr in ("get_extra_state", "set_extra_state")
+        )
+        if not routes:
+            missing.append(cls.__name__)
+    assert not missing, f"quantizer state would be dropped from checkpoints for: {missing}"
+
+
+def _get_tiny_dsa_gpt_model():
+    """Tiny GPT with DSA sparse attention (AbsorbedMLASelfAttention + DSAttention + indexer)."""
+    # Local: DSA is optional; test_dsa_kv_cache_quant importorskips it before calling this.
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_transformer_block_with_experimental_attention_variant_spec,
+    )
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+    config = MLATransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        ffn_hidden_size=128,
+        q_lora_rank=32,
+        kv_lora_rank=16,
+        qk_head_dim=16,
+        qk_pos_emb_head_dim=16,
+        v_head_dim=16,
+        experimental_attention_variant="dsa",
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=32,
+        dsa_indexer_topk=8,
+        normalization="RMSNorm",
+        add_bias_linear=False,
+        hidden_dropout=0.0,  # deterministic forward for the checkpoint round-trip comparison
+        attention_dropout=0.0,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+    )
+    spec = get_transformer_block_with_experimental_attention_variant_spec(config)
+    return GPTModel(
+        config=config,
+        transformer_layer_spec=spec,
+        vocab_size=64,
+        max_sequence_length=64,
+        position_embedding_type="rope",
+        # Tied so a checkpoint round-trip restores the output layer too.
+        share_embeddings_and_output_weights=True,
+    ).cuda()
+
+
+def _test_dsa_kv_cache_quant_helper(tmp_path, rank, size):
+    # Local: DSA is optional; test_dsa_kv_cache_quant importorskips it before calling this.
+    from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+
+    initialize_for_megatron(tensor_model_parallel_size=1, pipeline_model_parallel_size=1, seed=SEED)
+    model, model_test = _get_tiny_dsa_gpt_model(), _get_tiny_dsa_gpt_model()
+    forward = get_forward(model)
+    # Calibrated (not constant-amax) FP8 KV cache: the case that needs a real V amax to export.
+    kv_fp8_calibrated = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {"quantizer_name": "*[kv]_bmm_quantizer", "cfg": {"num_bits": (4, 3), "axis": None}},
+        ],
+        "algorithm": "max",
+    }
+    model = mtq.quantize(model, kv_fp8_calibrated, forward)
+
+    dsa_modules = [m for m in model.modules() if isinstance(m, DSAttention)]
+    assert dsa_modules, "DSAttention was not converted for KV-cache quantization"
+    for module in dsa_modules:
+        assert module.k_bmm_quantizer.is_enabled and module.v_bmm_quantizer.is_enabled
+        # Absorbed MLA passes value=None; V is calibrated on the shared KV latent like K, so a
+        # calibrated FP8 KV cache still exports a v_scale.
+        assert module.k_bmm_quantizer.amax is not None
+        assert torch.equal(module.v_bmm_quantizer.amax, module.k_bmm_quantizer.amax)
+
+    # The KV quantizer state (incl. amax) survives a torch-dist round-trip alongside the indexer.
+    # DSA trains its indexer through a separate indexer loss, so the LM-loss backward in the helper
+    # gives it no gradient; exclude it from that check.
+    for name, param in model_test.named_parameters():
+        if ".indexer." in name:
+            param.requires_grad_(False)
+    sharded_state_dict_test_helper(tmp_path, model, model_test, forward)
+    # The helper compares every restored tensor (incl. K/V amax), but V is unused in the forward
+    # pass, so also check both quantizers came back enabled.
+    restored = [m for m in model_test.modules() if isinstance(m, DSAttention)]
+    assert len(restored) == len(dsa_modules)
+    assert all(m.k_bmm_quantizer.is_enabled and m.v_bmm_quantizer.is_enabled for m in restored)
+
+
+def test_dsa_kv_cache_quant(dist_workers_size_1, tmp_path):
+    """DSAttention gets calibrated K/V KV-cache quantizers that survive a checkpoint round-trip."""
+    pytest.importorskip("megatron.core.transformer.experimental_attention_variant.dsa")
+    dist_workers_size_1.run(partial(_test_dsa_kv_cache_quant_helper, tmp_path))
 
 
 def _test_kv_cache_amax_sync_helper(config, rank, size, tensor_model_parallel_size=1):
