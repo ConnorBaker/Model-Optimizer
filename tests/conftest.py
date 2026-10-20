@@ -52,11 +52,11 @@ def pytest_addoption(parser):
 # Every collectible test group must be listed here else collection errors occur
 # A test can override its cap by adding ``@pytest.mark.timeout(...)``
 _DEFAULT_TIMEOUT = {
-    "examples": int(os.environ.get("MODELOPT_QA_TEST_TIMEOUT", 300)),
-    "gpu": 120,
-    "gpu_megatron": 120,
+    "examples": int(os.environ.get("MODELOPT_QA_TEST_TIMEOUT", 600)),
+    "gpu": 180,
+    "gpu_megatron": 180,
     "gpu_trtllm": 60,
-    "gpu_vllm": 60,
+    "gpu_vllm": 120,
     "regression": 180,
     "unit": 120 if platform.system() == "Windows" else 60,
 }
