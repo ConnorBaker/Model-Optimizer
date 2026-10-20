@@ -73,3 +73,29 @@ Results are saved under `$GYM_OUTPUT_DIR/gym-job-<timestamp>-<id>/mmlu_pro/`:
 - `artifacts/rollouts.jsonl`: raw responses and scores for each question.
 - `artifacts/rollouts_aggregate_metrics.json`: MMLU-Pro accuracy under `pass@1/accuracy`.
 - `artifacts/rollouts_failures.jsonl`: failed rollouts.
+
+## MMLU-Pro accuracy by subject
+
+<details>
+<summary>Show per-subject results</summary>
+
+Temporary results cover eight business questions only; N/A means the subject has not yet been evaluated.
+
+| Subject | Questions evaluated | Teacher (BF16) | PTQ (NVFP4) | PTQ → QAD (NVFP4) |
+|---|---:|---:|---:|---:|
+| Biology | 0 | N/A | N/A | N/A |
+| Business | 8 | 75.00% | 62.50% | 75.00% |
+| Chemistry | 0 | N/A | N/A | N/A |
+| Computer science | 0 | N/A | N/A | N/A |
+| Economics | 0 | N/A | N/A | N/A |
+| Engineering | 0 | N/A | N/A | N/A |
+| Health | 0 | N/A | N/A | N/A |
+| History | 0 | N/A | N/A | N/A |
+| Law | 0 | N/A | N/A | N/A |
+| Mathematics | 0 | N/A | N/A | N/A |
+| Other | 0 | N/A | N/A | N/A |
+| Philosophy | 0 | N/A | N/A | N/A |
+| Physics | 0 | N/A | N/A | N/A |
+| Psychology | 0 | N/A | N/A | N/A |
+
+</details>
