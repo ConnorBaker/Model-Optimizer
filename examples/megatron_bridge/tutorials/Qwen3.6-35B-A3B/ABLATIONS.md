@@ -3,6 +3,7 @@
 Experiments behind the [main tutorial](README.md) that did not become the recommended recipe. All builds use the same W4A4 NVFP4 PTQ student, the same evaluation setup and the same `mean ± sem` pooling as the [main results](README.md#results); deltas are against BF16.
 
 - [Data format: pre-tokenized blend vs chat SFT data](#data-format-pre-tokenized-blend-vs-chat-sft-data)
+  - [Controlled rerun: document isolation and assistant-only loss](#controlled-rerun-document-isolation-and-assistant-only-loss)
 - [SciCode non-termination: diagnosis and decode-time fix](#scicode-non-termination-diagnosis-and-decode-time-fix)
 
 ## Data format: pre-tokenized blend vs chat SFT data
@@ -32,11 +33,38 @@ Everything else matches the main run: 32 nodes, EP=8, ~16.8M tokens per iteratio
 >
 > *Capped* = hit the 131,072-token limit without a stop token, out of 2,704 SciCode sub-steps (338 × 8 runs). See [SciCode non-termination](#scicode-non-termination-diagnosis-and-decode-time-fix).
 
-**Chat SFT's early lead does not last.** It leads at iteration 50, is nearly tied at 300 and trails at 500, mostly on tau2-bench and SciCode. Its SciCode capped rate *rises* with training, to ~5.8% against 3.1-3.6% for the pre-tokenized run, so assistant-only loss did not remove the runaway here (chat SFT also changed packing; see the caveat below).
+**Chat SFT's early lead does not last.** It leads at iteration 50, is nearly tied at 300 and trails at 500, mostly on tau2-bench and SciCode. Its SciCode capped rate *rises* with training, to ~5.8% against 3.1-3.6% for the pre-tokenized run, so assistant-only loss did not remove the runaway here (chat SFT also changed packing; see the correction below).
 
 **Self-distillation does not fix the length drift either.** At iteration 50 its SciCode capped rate and median length match chat SFT's even though it trains on the teacher's own responses, and it is no better on average, so it was not continued.
 
-**Caveat: the chat-SFT teachers were noisier.** Both chat-SFT variants pack two conversations into one THD micro-batch (`cu_seqlens`), and on that path the Gated DeltaNet kernels are not reproducible: the BF16 teacher's logits for the same packed input differ run to run by 0.001–0.007 nats/token of KL on average, against a KD loss of ~0.03. The same conversations unpacked are bit-exact, and the pre-tokenized run feeds unpacked 32K windows, so only the chat-SFT arms trained on these noisier targets. Treat their gap to the pre-tokenized run as provisional until the kernel is fixed.
+**Correction: the chat-SFT runs used a wrong packed kernel.** Both chat-SFT variants pack two conversations into one THD micro-batch (`cu_seqlens`). On that path the Gated DeltaNet `chunk_gated_delta_rule` in FLA 0.4.2, the version in `nemo:26.08`, is **wrong, not just noisy**: on a real packed pair, compared with each conversation run alone, 11% of tokens are off by more than 1% of the layer output's maximum and the worst by ~20%, for the teacher and the student alike. FLA 0.5.2 is bit-exact and reproducible on the same input. The pre-tokenized run feeds unpacked 32K windows, which are exact on both versions, so only the packed runs on this page are affected: both chat-SFT variants and the on-policy test under [SciCode non-termination](#for-the-next-qad-run). The controlled rerun below repeats the iteration-50 comparison on FLA 0.5.2.
+
+### Controlled rerun: document isolation and assistant-only loss
+
+The comparison above changed three things at once: cross-document attention (the pre-tokenized windows let each conversation attend to the ones packed before it), the loss mask, and the packed kernel. Three 50-iteration runs separate them, all on the same student and schedule as above:
+
+| | A: pre-tokenized (main run) | B: + per-document attention | C: chat SFT |
+| --- | --- | --- | --- |
+| Data | pre-tokenized blend | pre-tokenized blend | Cascade-2 chat `.jsonl` |
+| Attention | across the 32K window | within each document (THD, boundary at every end-of-document token) | within each conversation (THD) |
+| Loss on | all tokens | all tokens | assistant tokens |
+| FLA | 0.4.2, unpacked (exact) | 0.5.2 | 0.5.2 |
+
+| Benchmark (runs) | BF16 | A | B | C | Chat SFT on FLA 0.4.2 (above) |
+| --- | --- | --- | --- | --- | --- |
+| GPQA Diamond (1) | 84.7 | −0.8 | −0.6 | −0.1 | +0.5 |
+| MMMU-Pro (3) | 74.6 | −0.8 | −0.6 | −1.0 | −0.5 |
+| SciCode (8) | 39.9 | +0.2 | +0.6 | −2.4 | +0.2 |
+| IFBench (8) | 60.0 | −1.3 | −1.0 | −2.4 | −1.9 |
+| AA-LCR (8) | 69.1 | −0.9 | −1.2 | +0.1 | +1.0 |
+| tau2-bench Telecom (3) | 94.2 | −4.2 | −2.2 | −0.4 | −1.4 |
+| **Mean delta** | | −1.30 | −0.85 | −1.02 | −0.34 |
+| SciCode capped sub-steps | 0.7% | 4.3% | 3.5% | 2.0% | 3.0% |
+| SciCode median tokens | 1,817 | 2,684 | 2,932 | 2,388 | 2,244 |
+
+- **The three setups are within noise of each other at iteration 50.** Per-document attention gains +0.45 on the mean (A → B), mostly on tau2-bench (3 runs); switching to chat data with assistant-only loss changes it by −0.17 (B → C).
+- **The correct kernel did not reproduce chat SFT's lead.** C is the iteration-50 chat-SFT run repeated on FLA 0.5.2 and scores 0.68 below it, mostly on SciCode (−2.6, 8 runs, sd 0.8) and IFBench, without more runaways (C has the lowest capped rate of all). So the wrong kernel did not measurably hurt the original run. Its −0.34 was a favourable draw, consistent with its lead disappearing by iteration 300, and two QAD runs of the same recipe can differ by this much at iteration 50.
+- **The recipe is unchanged:** pre-tokenized windows with no document boundaries. They need neither per-document attention nor a newer FLA.
 
 ### Cost
 
@@ -112,4 +140,4 @@ Measured on single-Slurm-segment runs on both sides, so neither figure includes 
 
 - Track the **length-capped rate** as a first-class metric alongside accuracy: a benchmark score can stay flat while 3.6% of responses return nothing.
 - Changing the KD loss's vocabulary coverage (top-p, full-vocab KL) is unlikely to help: the top-4096 tokens already hold nearly all of the teacher's probability. We confirmed it with a 50-iteration rerun that adds a "ghost" token carrying the teacher's mass outside the top-4096: SciCode 39.35 ± 0.56 vs 40.13 ± 0.60, length-capped 5.0% vs 4.3%, all within noise.
-- **On-policy distillation did not fix it either**, in one offline round. From the iteration-50 weights, 50 more KD iterations on 189K responses the student generated itself (looping ones kept) for the first 190K prompts of the chat-SFT data give SciCode 39.24 ± 0.47 with 5.2% length-capped, against 38.50 ± 0.74 and 5.5% for the same 50 iterations on the teacher's responses to the same prompts, and 5.0% at the start. The test is weak: on these training prompts the student loops barely more than the teacher (4.1% vs 3.4% capped), so its rollouts hold few loop entries; a retest would need SciCode-like prompts. `presence_penalty` remains the fix.
+- **On-policy distillation did not fix it either**, in one offline round. From the iteration-50 weights, 50 more KD iterations on 189K responses the student generated itself (looping ones kept) for the first 190K prompts of the chat-SFT data give SciCode 39.24 ± 0.47 with 5.2% length-capped, against 38.50 ± 0.74 and 5.5% for the same 50 iterations on the teacher's responses to the same prompts, and 5.0% at the start. Both arms packed rows on FLA 0.4.2's wrong kernel ([correction](#results)). The test is weak: on these training prompts the student loops barely more than the teacher (4.1% vs 3.4% capped), so its rollouts hold few loop entries; a retest would need SciCode-like prompts. `presence_penalty` remains the fix.
