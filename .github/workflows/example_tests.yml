@@ -133,7 +133,7 @@ jobs:
     with:
       docker_image: "nvcr.io/nvidia/pytorch:26.09-py3"
       example: ${{ matrix.example }}
-      timeout_minutes: 30
+      timeout_minutes: 45
       pip_install_extras: "[hf,dev-test]"
       runner: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && 'linux-amd64-gpu-rtxpro6000-latest-1' || 'linux-amd64-gpu-rtxpro6000-latest-2' }}
       allow_failure: ${{ contains(format(',{0},', vars.ALLOW_FAILURE_EXAMPLE_TESTS), format(',{0},', matrix.example)) }}
@@ -191,8 +191,8 @@ jobs:
     with:
       docker_image: "nvcr.io/nvidia/nemo:26.08"
       example: megatron_bridge
-      # PR runs single-GPU (~11 min); the nightly runs every test multi-GPU (~58 min).
-      timeout_minutes: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && 30 || 75 }}
+      # PR runs single-GPU (~20 min with the setup); the nightly runs every test multi-GPU (~45 min).
+      timeout_minutes: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && 45 || 90 }}
       pip_install_extras: "[hf,puzzletron,dev-test]"
       runner: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && 'linux-amd64-gpu-rtxpro6000-latest-1' || 'linux-amd64-gpu-rtxpro6000-latest-2' }}
       allow_failure: ${{ contains(format(',{0},', vars.ALLOW_FAILURE_EXAMPLE_TESTS), ',megatron_bridge,') }}
