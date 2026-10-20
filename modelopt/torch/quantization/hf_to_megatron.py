@@ -18,7 +18,9 @@
 Recipes name transformers modules (``q_proj``, ``gate_proj``, ``lm_head``) while Megatron-Core
 renames and fuses them (``linear_qkv``, ``linear_fc1``, ``output_layer``). Megatron-Bridge's mapping
 registry records that relation per architecture: :func:`module_mappings_from_registry` reads it and
-:func:`translate_quant_cfg_to_megatron` applies it to a ``quant_cfg``.
+:func:`translate_quant_cfg_to_megatron` applies it to a ``quant_cfg``. This module does not import
+Megatron-Bridge; ``modelopt.torch.utils.plugins.mbridge.module_mappings_from_bridge`` is the entry
+point that takes a bridge.
 """
 
 import fnmatch
@@ -67,8 +69,9 @@ def _strip_weight(param: str) -> str | None:
 def module_mappings_from_registry(registry: Any) -> list[ModuleMapping]:
     """Read the module-level mappings off a Megatron-Bridge ``MegatronMappingRegistry``.
 
-    Only ``registry.mappings`` is read. Mappings that are not module weights, or that do not sit
-    in the language-model decoder, are skipped. Each attention ``linear_qkv`` also yields its
+    Only ``registry.mappings`` is read (each item's ``megatron_param`` and ``hf_param``), so any
+    object of that shape works. Mappings that are not module weights, or that do not sit in the
+    language-model decoder, are skipped. Each attention ``linear_qkv`` also yields its
     ``core_attention``, which hosts the KV-cache quantizers of the transformers attention module.
     """
     mappings: dict[ModuleMapping, None] = {}

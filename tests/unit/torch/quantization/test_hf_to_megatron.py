@@ -41,7 +41,8 @@ def _mapping(megatron_param, hf_param):
     return SimpleNamespace(megatron_param=megatron_param, hf_param=hf_param)
 
 
-# What a Megatron-Bridge registry holds for a Qwen3-MoE-like model, plus mappings to be skipped.
+# A stand-in shaped like a Megatron-Bridge registry of a Qwen3-MoE-like model, plus mappings to be
+# skipped. The real registries are read in tests/gpu_megatron/torch/utils/plugins/test_mbridge.py.
 REGISTRY = SimpleNamespace(
     mappings=[
         _mapping("output_layer.weight", "lm_head.weight"),

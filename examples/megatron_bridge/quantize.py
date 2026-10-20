@@ -76,16 +76,14 @@ from modelopt.recipe.presets import (
     QUANT_CFG_CHOICES,
     RecipeSupersededAction,
 )
-from modelopt.torch.quantization.hf_to_megatron import (
-    module_mappings_from_registry,
-    translate_quant_cfg_to_megatron,
-)
+from modelopt.torch.quantization.hf_to_megatron import translate_quant_cfg_to_megatron
 from modelopt.torch.utils import print_args, print_rank_0, warn_rank_0
 from modelopt.torch.utils.dataset_utils import get_supported_datasets
 from modelopt.torch.utils.mlflow import Tool, masked_args, resolved_recipe_texts
 from modelopt.torch.utils.plugins.mbridge import (
     get_language_model,
     load_mbridge_model_from_hf,
+    module_mappings_from_bridge,
     use_moe_grouped_gemm,
 )
 from modelopt.torch.utils.plugins.megatron_calibration import (
@@ -337,11 +335,11 @@ def get_quant_config(args: argparse.Namespace) -> dict:
 
 def translate_to_megatron(quant_cfg: list, bridge, language_model) -> list:
     """Translate the Hugging Face module names of ``quant_cfg`` to this Megatron model's."""
-    # AutoBridge has no public accessor for the architecture's mapping registry.
-    mappings = module_mappings_from_registry(bridge._model_bridge.mapping_registry())
     # Global index of each local layer, so a pipeline stage reads the recipe's layer indices right.
     layer_indices = [layer.layer_number - 1 for layer in language_model.decoder.layers]
-    return translate_quant_cfg_to_megatron(quant_cfg, mappings, layer_indices)
+    return translate_quant_cfg_to_megatron(
+        quant_cfg, module_mappings_from_bridge(bridge), layer_indices
+    )
 
 
 def main(args: argparse.Namespace):
