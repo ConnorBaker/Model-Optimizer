@@ -26,7 +26,7 @@ The following environment variables can be set to control the behavior of the te
 
 ## Executable README scenarios
 
-The LLM QAT and Megatron Bridge examples test explicitly annotated Markdown shell
-and Python fences, with separate opt-in integrations for costly workflows. See
-[the directive contract and CPU/GPU commands](../_test_utils/doc_tests/README.md)
+The LLM QAT and Megatron Bridge examples reference ID-marked Markdown shell
+and Python fences from Python scenario definitions, with separate opt-in integrations for costly workflows. See
+[the snippet contract and CPU/GPU commands](../_test_utils/doc_tests/README.md)
 for local development, collection, reduced-scale inputs and acceptance checks.

@@ -26,7 +26,7 @@ Running these examples requires many additional dependencies to be installed (e.
 
 To get the ModelOpt examples scripts, mount your Model-Optimizer repo to the container as follows:
 
-<!-- modelopt-doc-test:skip Interactive container provisioning runs outside pytest; CI supplies the container. -->
+<!-- modelopt-snippet: bridge-docker -->
 ```bash
 export MODELOPT_DIR=${PWD}/Model-Optimizer # or set to your local Model-Optimizer repository path if you have cloned it
 if [ ! -d "${MODELOPT_DIR}" ]; then
@@ -53,28 +53,10 @@ docker run \
 You also need to login with your HuggingFace token to download gated datasets / models.
 Note that the default dataset for pruning and quantization is [`nemotron-post-training-dataset-v2`](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2), which is gated.
 
-<!-- modelopt-doc-test:begin
-id = "bridge-login"
-profile = "cpu"
-timeout_seconds = 120
-manual = true
-min_gpus = 0
-requires = ["huggingface_hub"]
--->
-<!-- modelopt-doc-test:setup python
-import os
-assert os.environ.get("HF_TOKEN"), "Set HF_TOKEN for the manual login test"
-ctx.cwd = ctx.tmp
-ctx.env["HF_HOME"] = str(ctx.tmp / "hf-home")
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-login -->
 ```bash
 hf auth login --token "$HF_TOKEN"
 ```
-<!-- modelopt-doc-test:verify python
-assert (ctx.tmp / "hf-home/token").stat().st_size > 0
--->
-<!-- modelopt-doc-test:end -->
 
 ### Importing a HuggingFace Checkpoint (optional)
 
@@ -83,21 +65,7 @@ checkpoint (e.g. to reuse across runs), convert it with Megatron-Bridge's conver
 `--tp` / `--pp` / `--ep` to shard a model that does not fit on one GPU (`--ep` for MoE models), or
 `--device cpu` to convert in a single process without GPUs:
 
-<!-- modelopt-doc-test:begin
-id = "bridge-import"
-profile = "gpu"
-timeout_seconds = 7200
-manual = true
-min_gpus = 8
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale, verify_bridge_hf_export
-prepare_bridge_full_scale(ctx)
-output = Path(ctx.env["OUTPUT_ROOT"])
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-import -->
 ```bash
 bash /opt/Megatron-Bridge/scripts/conversion/convert.sh import \
     --executor local \
@@ -106,10 +74,6 @@ bash /opt/Megatron-Bridge/scripts/conversion/convert.sh import \
     --hf-model Qwen/Qwen3-8B \
     --megatron-path "${OUTPUT_ROOT:-/tmp}/Qwen3-8B-megatron"
 ```
-<!-- modelopt-doc-test:verify python
-assert (output / "Qwen3-8B-megatron").is_dir()
--->
-<!-- modelopt-doc-test:end -->
 
 The commands accept optional environment overrides for `MODEL`, `OUTPUT_ROOT`,
 `CALIB_DATA`, `CALIB_SAMPLES`, `SEQ_LENGTH`, `GPUS`, `GLOBAL_BATCH`, `TRAIN_ITERS`,
@@ -128,18 +92,7 @@ This section shows how to quantize a HuggingFace model using ModelOpt in the Meg
 
 **Step 1 — quantize** Qwen3-8B to NVFP4 on 2 GPUs (Tensor Parallelism = 2) using 1024 samples from default dataset (Mix of [`cnn_dailymail`](https://huggingface.co/datasets/abisee/cnn_dailymail) and [`nemotron-post-training-dataset-v2`](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2)) for calibration (sequence length = 4096):
 
-<!-- modelopt-doc-test:begin
-id = "bridge-ptq-export"
-profile = "gpu"
-timeout_seconds = 900
-min_gpus = 2
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_smoke
-prepare_bridge_smoke(ctx)
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-quantize -->
 ```bash
 torchrun --nproc_per_node 2 quantize.py \
     --hf_model_name_or_path "${MODEL:-Qwen/Qwen3-8B}" \
@@ -157,7 +110,7 @@ torchrun --nproc_per_node 2 quantize.py \
 
 **Step 2 — export** the Megatron checkpoint to a deployable HuggingFace checkpoint:
 
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-export -->
 ```bash
 torchrun --nproc_per_node 2 export_quantized_megatron_to_hf.py \
     --hf_model_name_or_path "${MODEL:-Qwen/Qwen3-8B}" \
@@ -165,12 +118,6 @@ torchrun --nproc_per_node 2 export_quantized_megatron_to_hf.py \
     --pp_size 2 \
     --export_unified_hf_path "${OUTPUT_ROOT:-/tmp}/Qwen3-8B-NVFP4-hf"
 ```
-
-<!-- modelopt-doc-test:verify python
-from _test_utils.doc_tests.fixtures.megatron_bridge import verify_bridge_quantized
-verify_bridge_quantized(ctx)
--->
-<!-- modelopt-doc-test:end -->
 
 > [!NOTE]
 > The HuggingFace unified exporter can't split weights across GPUs with tensor parallelism. For large models, use `--pp_size` on `export_quantized_megatron_to_hf.py` to shard the export across GPUs with pipeline parallelism instead.
@@ -194,20 +141,7 @@ For a vision-language model (e.g. Qwen3.5-VL, Gemma3-VL), `quantize.py` automati
 
 Set MLflow's own `MLFLOW_TRACKING_URI`, or pass `--mlflow <tracking-uri>`, to record a run on an MLflow server. Every script here that writes a checkpoint takes the flag — [`prune_minitron.py`](#pruning), `quantize.py`, [`distill.py`](#distillation), `export_quantized_megatron_to_hf.py` and `export_distilled_megatron_to_hf.py` — and they share one experiment-name convention, so a pruning, a quantization, the distillation that refines its checkpoint and the export that deploys it can be found together. (One gap remains: `distill.py --hf_export_path` writes its HuggingFace checkpoint from rank 0, which is not the rank that owns that run, so it carries no pointer.)
 
-<!-- modelopt-doc-test:begin
-id = "bridge-mlflow"
-profile = "gpu"
-timeout_seconds = 7200
-manual = true
-min_gpus = 2
-requires = ["megatron.bridge", "mlflow"]
--->
-<!-- modelopt-doc-test:setup python
-from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale
-prepare_bridge_full_scale(ctx)
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-mlflow -->
 ```bash
 torchrun --nproc_per_node 2 quantize.py \
     --hf_model_name_or_path "${MODEL:-Qwen/Qwen3-8B}" \
@@ -216,12 +150,6 @@ torchrun --nproc_per_node 2 quantize.py \
     --export_megatron_path "${OUTPUT_ROOT:-/tmp}/Qwen3-8B-NVFP4-megatron" \
     --mlflow "${MLFLOW_TRACKING_URI:?set the tracking URI}"
 ```
-<!-- modelopt-doc-test:verify python
-import json
-pointer = Path(ctx.env["OUTPUT_ROOT"]) / "Qwen3-8B-NVFP4-megatron/.experiment.json"
-assert json.loads(pointer.read_text())
--->
-<!-- modelopt-doc-test:end -->
 
 The run opens *before* the model loads, so a bad URI fails in seconds rather than after a full calibration. Only the master rank uploads: the invocation, every argument as a searchable param, the resolved recipe, that rank's log and the quantizer summary — plus `.experiment.json` written into `--export_megatron_path` once the checkpoint is saved, so a checkpoint on disk names the run that produced it. A failed run is still recorded, with its traceback.
 
@@ -268,19 +196,7 @@ token ids, and the KD losses compare the two models' logits elementwise over the
 
 Example usage to distill a 4B student (HF) from an 8B teacher (HF) on 8 GPUs (TP=8, PP=1):
 
-<!-- modelopt-doc-test:begin
-id = "bridge-real-data"
-profile = "gpu"
-timeout_seconds = 86400
-manual = true
-min_gpus = 8
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale
-prepare_bridge_full_scale(ctx)
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-real-data -->
 ```bash
 torchrun --nnodes 1 --nproc_per_node 8 distill.py \
     --tp_size 8 \
@@ -300,13 +216,6 @@ torchrun --nnodes 1 --nproc_per_node 8 distill.py \
     --log_interval 10 \
     --output_dir "${OUTPUT_ROOT:-/output}/qwen3_8b_to_4b_distill"
 ```
-<!-- modelopt-doc-test:verify python
-from pathlib import Path
-checkpoints = Path(ctx.env["OUTPUT_ROOT"]) / "qwen3_8b_to_4b_distill/checkpoints"
-assert (checkpoints / "latest_checkpointed_iteration.txt").is_file()
-assert list(checkpoints.glob("iter_*"))
--->
-<!-- modelopt-doc-test:end -->
 
 Tensorboard logging is enabled by default and logs are saved to `<output_dir>/tensorboard` directory.
 To use Weights & Biases for logging, set the `WANDB_API_KEY` environment variable and pass the `--wandb_project` argument.
@@ -317,38 +226,16 @@ This skips training and evaluates the student at iteration 0.
 
 To see all available arguments:
 
-<!-- modelopt-doc-test:begin
-id = "bridge-distill-help"
-profile = "gpu"
-timeout_seconds = 120
-min_gpus = 0
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-ctx.cwd = ctx.repo / "examples/megatron_bridge"
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-distill-help -->
 ```bash
 torchrun --nproc_per_node 1 distill.py --help
 ```
-<!-- modelopt-doc-test:end -->
 
 ### Quick Test with Mock Data
 
 Example usage with mock data for quick testing (no pre-tokenized data needed):
 
-<!-- modelopt-doc-test:begin
-id = "bridge-distill"
-profile = "gpu"
-timeout_seconds = 900
-min_gpus = 2
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_smoke
-prepare_bridge_smoke(ctx)
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-distill -->
 ```bash
 torchrun --nproc_per_node "${GPUS:-8}" distill.py \
     --tp_size "${GPUS:-8}" \
@@ -365,19 +252,11 @@ torchrun --nproc_per_node "${GPUS:-8}" distill.py \
     --output_dir "${OUTPUT_ROOT:-/tmp}/test_distill"
 ```
 
-<!-- modelopt-doc-test:verify python
-from pathlib import Path
-checkpoint = Path(ctx.env["OUTPUT_ROOT"]) / "test_distill/checkpoints"
-assert (checkpoint / "iter_0000002").is_dir()
-assert (checkpoint / "latest_checkpointed_iteration.txt").read_text().strip() == "2"
--->
-<!-- modelopt-doc-test:end -->
-
 ### Vision-Language Models (VLMs)
 
 For a vision-language model (e.g. Qwen3.5-VL, Gemma3-VL), `distill.py` distills only the **language model** (on text data) and leaves the vision tower and projector untouched — matching the pruning and quantization behavior. It composes with pruning and QAD (`--student_megatron_path`) exactly as for LLMs, and the HF export reuses `--student_hf_path` (no `--student_hf_model` needed).
 
-<!-- modelopt-doc-test:skip Incomplete template with user-specific inputs; executable counterparts cover training and export. -->
+<!-- modelopt-snippet: bridge-vlm-template -->
 ```bash
 torchrun --nproc_per_node 8 distill.py \
     --tp_size 8 \
@@ -392,7 +271,7 @@ A **non-quantized** distilled checkpoint (LLM or VLM) is saved in Megatron distr
 
 **Inline** -- add `--hf_export_path` to the `distill.py` command to automatically convert the **final** checkpoint after distillation:
 
-<!-- modelopt-doc-test:skip Incomplete template with user-specific inputs; executable counterparts cover training and export. -->
+<!-- modelopt-snippet: bridge-inline-export-template -->
 ```bash
 torchrun --nnodes 1 --nproc_per_node 8 distill.py \
     ... \
@@ -403,7 +282,7 @@ torchrun --nnodes 1 --nproc_per_node 8 distill.py \
 
 **Separate conversion** -- convert **any** saved iteration (intermediate or final) with [export_distilled_megatron_to_hf.py](export_distilled_megatron_to_hf.py):
 
-<!-- modelopt-doc-test:skip Template requires a user-selected model and saved iteration; concrete multi-iteration conversion is tested below. -->
+<!-- modelopt-snippet: bridge-single-export-template -->
 ```bash
 torchrun --nproc_per_node 1 export_distilled_megatron_to_hf.py \
     --student_hf_path <student_hf_model_or_path> \
@@ -419,19 +298,7 @@ to keep all saved checkpoints.
 Then export all retained checkpoints, with one Hugging Face checkpoint written per
 `iter_<iteration>` subdirectory:
 
-<!-- modelopt-doc-test:begin
-id = "bridge-distill-export"
-profile = "gpu"
-timeout_seconds = 1200
-min_gpus = 2
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_smoke, verify_bridge_distilled, run_bridge_distill_prerequisite
-prepare_bridge_smoke(ctx)
-run_bridge_distill_prerequisite(ctx)
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-distill-export -->
 ```bash
 torchrun --nproc_per_node 1 export_distilled_megatron_to_hf.py \
     --student_hf_path "${MODEL:-Qwen/Qwen3-0.6B}" \
@@ -440,14 +307,9 @@ torchrun --nproc_per_node 1 export_distilled_megatron_to_hf.py \
     --export_iterations all
 ```
 
-<!-- modelopt-doc-test:verify python
-verify_bridge_distilled(ctx)
--->
-<!-- modelopt-doc-test:end -->
-
 The export path contains one loadable Hugging Face checkpoint per exported iteration:
 
-<!-- modelopt-doc-test:skip Illustrative output tree, not executable code. -->
+<!-- modelopt-snippet: bridge-output-tree -->
 ```text
 hf_validation/
 ├── iter_0000100/
@@ -470,19 +332,7 @@ Recalculate the budget when changing those settings, and keep the prepared data 
 
 We also use a smaller learning rate for QAD:
 
-<!-- modelopt-doc-test:begin
-id = "bridge-qad"
-profile = "gpu"
-timeout_seconds = 86400
-manual = true
-min_gpus = 8
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale
-prepare_bridge_full_scale(ctx)
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-qad -->
 ```bash
 torchrun --nproc_per_node 8 distill.py \
     --tp_size 8 \
@@ -498,15 +348,6 @@ torchrun --nproc_per_node 8 distill.py \
     --min_lr 5e-6 \
     --output_dir "${OUTPUT_ROOT:-/output}/qwen3_8b_nvfp4_qad"
 ```
-<!-- modelopt-doc-test:verify python
-from pathlib import Path
-checkpoints = Path(ctx.env["OUTPUT_ROOT"]) / "qwen3_8b_nvfp4_qad/checkpoints"
-assert (checkpoints / "latest_checkpointed_iteration.txt").is_file()
-assert list(checkpoints.glob("iter_*"))
-from _test_utils.torch.megatron.modelopt_state import assert_has_modelopt_state
-assert_has_modelopt_state(checkpoints)
--->
-<!-- modelopt-doc-test:end -->
 
 The distilled checkpoint retains the ModelOpt quantization state, so it can be converted to a deployable HuggingFace checkpoint with [export_quantized_megatron_to_hf.py](export_quantized_megatron_to_hf.py) (point `--megatron_path` at `${OUTPUT_ROOT:-/output}/qwen3_8b_nvfp4_qad/checkpoints`), exactly like the PTQ checkpoint in [step 2 above](#post-training-quantization).
 
@@ -538,21 +379,7 @@ Multiple NAS targets can be combined — e.g. `--prune_target_params 6e9 --prune
     at-most 20% depth (`num_layers`) and 40% width is pruned per prunable hparam (`hidden_size`, `ffn_hidden_size`, ...),
     top-10 candidates are evaluated for MMLU score (5% sampled data) to select the best model.
 
-<!-- modelopt-doc-test:begin
-id = "bridge-prune-params"
-profile = "gpu"
-timeout_seconds = 7200
-manual = true
-min_gpus = 2
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale, verify_bridge_hf_export
-prepare_bridge_full_scale(ctx)
-output = Path(ctx.env["OUTPUT_ROOT"])
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-prune-params -->
 ```bash
 torchrun --nproc_per_node 2 prune_minitron.py \
     --pp_size 2 \
@@ -561,28 +388,10 @@ torchrun --nproc_per_node 2 prune_minitron.py \
     --hparams_to_skip num_attention_heads \
     --output_hf_path "${OUTPUT_ROOT:-/tmp}/Qwen3-8B-Pruned-6B"
 ```
-<!-- modelopt-doc-test:verify python
-verify_bridge_hf_export(output / "Qwen3-8B-Pruned-6B")
--->
-<!-- modelopt-doc-test:end -->
 
 **Prune by active parameter count** — useful for MoE models where most experts are inactive per token (e.g. prune Nemotron-3-Nano-30B-A3B-BF16 (3.6B active params) to 3B active params):
 
-<!-- modelopt-doc-test:begin
-id = "bridge-prune-active"
-profile = "gpu"
-timeout_seconds = 7200
-manual = true
-min_gpus = 2
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale, verify_bridge_hf_export
-prepare_bridge_full_scale(ctx)
-output = Path(ctx.env["OUTPUT_ROOT"])
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-prune-active -->
 ```bash
 torchrun --nproc_per_node 2 prune_minitron.py \
     --pp_size 2 \
@@ -590,28 +399,10 @@ torchrun --nproc_per_node 2 prune_minitron.py \
     --prune_target_active_params 3e9 \
     --output_hf_path "${OUTPUT_ROOT:-/tmp}/Nemotron-3-Nano-30B-A3B-BF16-Pruned-3B-Active"
 ```
-<!-- modelopt-doc-test:verify python
-verify_bridge_hf_export(output / "Nemotron-3-Nano-30B-A3B-BF16-Pruned-3B-Active")
--->
-<!-- modelopt-doc-test:end -->
 
 **Prune by memory footprint** — prune to fit a target GPU memory budget (weights + KV-cache at the given sequence length and batch size, assuming BF16):
 
-<!-- modelopt-doc-test:begin
-id = "bridge-prune-memory"
-profile = "gpu"
-timeout_seconds = 7200
-manual = true
-min_gpus = 2
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale, verify_bridge_hf_export
-prepare_bridge_full_scale(ctx)
-output = Path(ctx.env["OUTPUT_ROOT"])
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-prune-memory -->
 ```bash
 torchrun --nproc_per_node 2 prune_minitron.py \
     --pp_size 2 \
@@ -621,25 +412,10 @@ torchrun --nproc_per_node 2 prune_minitron.py \
     --calib_batch_size 1 \
     --output_hf_path "${OUTPUT_ROOT:-/tmp}/Qwen3-8B-Pruned-12GB"
 ```
-<!-- modelopt-doc-test:verify python
-verify_bridge_hf_export(output / "Qwen3-8B-Pruned-12GB")
--->
-<!-- modelopt-doc-test:end -->
 
 **Manual pruning** — prune directly to a specified architecture (no NAS, no score evaluation):
 
-<!-- modelopt-doc-test:begin
-id = "bridge-prune-manual"
-profile = "gpu"
-timeout_seconds = 900
-min_gpus = 2
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_smoke
-prepare_bridge_smoke(ctx)
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-prune-manual -->
 ```bash
 PRUNE_CONFIG=${PRUNE_CONFIG:-'{"hidden_size":3584,"ffn_hidden_size":9216}'}
 torchrun --nproc_per_node 2 prune_minitron.py \
@@ -652,29 +428,12 @@ torchrun --nproc_per_node 2 prune_minitron.py \
     --output_hf_path "${OUTPUT_ROOT:-/tmp}/Qwen3-8B-Pruned-6B-manual"
 ```
 
-<!-- modelopt-doc-test:verify python
-from _test_utils.doc_tests.fixtures.megatron_bridge import verify_bridge_pruned
-verify_bridge_pruned(ctx)
--->
-<!-- modelopt-doc-test:end -->
-
 To see the full usage for advanced configurations, run:
 
-<!-- modelopt-doc-test:begin
-id = "bridge-prune-minitron-help"
-profile = "gpu"
-timeout_seconds = 120
-min_gpus = 0
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-ctx.cwd = ctx.repo / "examples/megatron_bridge"
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-prune-minitron-help -->
 ```bash
 torchrun --nproc_per_node 1 prune_minitron.py --help
 ```
-<!-- modelopt-doc-test:end -->
 
 > [!TIP]
 > If number of layers in the model is not divisible by number of GPUs i.e. pipeline parallel (PP) size, you can configure
@@ -694,21 +453,7 @@ For a vision-language model (e.g. Qwen3.5-VL, Gemma3-VL), `prune_minitron.py` au
 - The `--prune_target_params` / `--prune_target_active_params` / `--prune_target_memory_mb` targets (and `export_config` dimensions) apply to the **language model only** — the (unpruned) vision tower's parameters are *not* counted, so the full saved VLM will be larger than the target.
 - `hidden_size` is never pruned for VLMs (it is shared with the vision projector).
 
-<!-- modelopt-doc-test:begin
-id = "bridge-prune-vlm"
-profile = "gpu"
-timeout_seconds = 7200
-manual = true
-min_gpus = 2
-requires = ["megatron.bridge"]
--->
-<!-- modelopt-doc-test:setup python
-from pathlib import Path
-from _test_utils.doc_tests.fixtures.megatron_bridge import prepare_bridge_full_scale, verify_bridge_hf_export
-prepare_bridge_full_scale(ctx)
-output = Path(ctx.env["OUTPUT_ROOT"])
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-prune-vlm -->
 ```bash
 torchrun --nproc_per_node 2 prune_minitron.py \
     --pp_size 2 \
@@ -716,27 +461,12 @@ torchrun --nproc_per_node 2 prune_minitron.py \
     --prune_target_params 3e9 \
     --output_hf_path "${OUTPUT_ROOT:-/tmp}/Qwen3.5-4B-Pruned-3B"
 ```
-<!-- modelopt-doc-test:verify python
-verify_bridge_hf_export(output / "Qwen3.5-4B-Pruned-3B")
--->
-<!-- modelopt-doc-test:end -->
 
 ## Sanity-Check Generation
 
 [generate_vllm.py](generate_vllm.py) runs a quick generation check on an exported HuggingFace checkpoint using vLLM — a useful smoke test for a **quantized**, **pruned**, or **distilled** model to confirm it still produces coherent text. For quantized checkpoints, vLLM auto-detects the ModelOpt quantization from the exported `hf_quant_config.json`, so no extra flags are needed:
 
-<!-- modelopt-doc-test:begin
-id = "bridge-generation"
-profile = "gpu"
-timeout_seconds = 7200
-manual = true
-min_gpus = 1
-requires = ["vllm"]
--->
-<!-- modelopt-doc-test:setup python
-ctx.cwd = ctx.repo / "examples/megatron_bridge"
--->
-<!-- modelopt-doc-test:run -->
+<!-- modelopt-snippet: bridge-generation -->
 ```bash
 # Quantized model
 python generate_vllm.py --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 --trust_remote_code
@@ -744,7 +474,6 @@ python generate_vllm.py --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 --tr
 # Pruned model
 python generate_vllm.py --model "${PRUNED_CHECKPOINT:?set the pruned Hugging Face checkpoint path}"
 ```
-<!-- modelopt-doc-test:end -->
 
 > [!NOTE]
 > `--trust_remote_code` is only needed for models that ship custom modeling code (e.g. Nemotron); Qwen models don't require it.

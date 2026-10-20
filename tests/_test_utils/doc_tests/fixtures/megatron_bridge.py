@@ -124,12 +124,8 @@ def run_bridge_distill_prerequisite(ctx):
     """Build real checkpoints using the README's training fence, in the same process group."""
     from _test_utils.doc_tests.parser import parse_markdown
 
-    scenario = next(
-        s
-        for s in parse_markdown(ctx.repo / "examples/megatron_bridge/README.md")
-        if s.id == "bridge-distill"
-    )
-    code = "\n".join(step.code for step in scenario.steps if step.kind == "run")
+    snippet = parse_markdown(ctx.repo / "examples/megatron_bridge/README.md")["bridge-distill"]
+    code = snippet.code
     subprocess.run(["bash", "-euo", "pipefail", "-c", code], cwd=ctx.cwd, env=ctx.env, check=True)
 
 

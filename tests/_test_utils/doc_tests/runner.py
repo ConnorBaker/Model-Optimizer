@@ -16,6 +16,8 @@
 """Run trusted documentation in an isolated process group with a whole-scenario deadline."""
 
 import contextlib
+import importlib
+import json
 import os
 import shlex
 import signal
@@ -23,16 +25,19 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
-from .parser import DocTestError, parse_markdown
+from .parser import DocTestError, Scenario, Snippet
 
 __all__ = ["run_scenario"]
 
 
 def run_scenario(scenario, repo: Path, tmp: Path) -> str:
     """Execute one scenario and return captured output; terminate its group on every exit."""
+    if scenario.path is None or not scenario.steps:
+        raise DocTestError("Resolve snippet references before running a scenario")
     repo = Path(repo).resolve()
     tmp = Path(tmp).resolve()
     tmp.mkdir(parents=True, exist_ok=True)
@@ -48,14 +53,15 @@ def run_scenario(scenario, repo: Path, tmp: Path) -> str:
         tempfile.TemporaryDirectory(prefix="doc-test-", dir=tmp) as control_dir,
         tempfile.TemporaryFile() as output,
     ):
+        manifest = Path(control_dir) / "scenario.json"
+        manifest.write_text(json.dumps(asdict(scenario) | {"path": str(scenario.path)}))
         process = subprocess.Popen(
             [
                 sys.executable,
                 "-u",
                 "-m",
                 "_test_utils.doc_tests.runner",
-                str(scenario.path),
-                scenario.id,
+                str(manifest),
                 str(Path(repo).resolve()),
                 str(tmp),
                 control_dir,
@@ -102,29 +108,40 @@ def run_scenario(scenario, repo: Path, tmp: Path) -> str:
 
 def _execute(scenario, repo, tmp, control):
     ctx = SimpleNamespace(repo=repo, tmp=tmp, cwd=repo, env=dict(os.environ))
-    namespace = {"ctx": ctx, "__name__": "__main__", "__file__": str(scenario.path)}
+    called = completed = False
 
-    def python_step(step):
-        print(f"{scenario.path}:{step.line}: {step.kind}", flush=True)
-        # Only explicitly opted-in, repository-owned Python is executed, just as in pytest.
-        exec(compile("\n" * (step.line - 1) + step.code, str(scenario.path), "exec"), namespace)
+    def run(namespace=None):
+        nonlocal called, completed
+        if called:
+            raise DocTestError("A scenario handler must call ctx.run() exactly once")
+        called = True
+        namespace = {} if namespace is None else namespace
+        namespace.update(ctx=ctx, __name__="__main__", __file__=str(scenario.path))
+        if scenario.steps[0].kind == "python":
+            os.chdir(ctx.cwd)
+            os.environ.clear()
+            os.environ.update(ctx.env)
+            for step in scenario.steps:
+                print(f"{scenario.path}:{step.line}: {step.id}", flush=True)
+                exec(
+                    compile("\n" * (step.line - 1) + step.code, str(scenario.path), "exec"),
+                    namespace,
+                )
+            ctx.cwd, ctx.env = Path.cwd(), dict(os.environ)
+        else:
+            _execute_shell(scenario, ctx, control)
+        completed = True
+        return namespace
 
-    for step in scenario.steps:
-        if step.kind == "setup":
-            python_step(step)
-    if any(step.kind == "python" for step in scenario.steps):
-        os.chdir(ctx.cwd)
-        os.environ.clear()
-        os.environ.update(ctx.env)
-        for step in scenario.steps:
-            if step.kind == "python":
-                python_step(step)
-        ctx.cwd, ctx.env = Path.cwd(), dict(os.environ)
+    ctx.run = run
+    if scenario.handler:
+        module, name = scenario.handler.split(":")
+        handler = getattr(importlib.import_module(module), name)
+        handler(ctx)
     else:
-        _execute_shell(scenario, ctx, control)
-    for step in scenario.steps:
-        if step.kind == "verify":
-            python_step(step)
+        ctx.run()
+    if not completed:
+        raise DocTestError("Scenario handler did not complete ctx.run()")
 
 
 def _execute_shell(scenario, ctx, control):
@@ -134,10 +151,12 @@ def _execute_shell(scenario, ctx, control):
             continue
         source = control / f"fence-{index}.sh"
         source.write_text("\n" * (step.line - 1) + step.code)
-        script.append(f"printf '%s\\n' {shlex.quote(f'{scenario.path}:{step.line}: run')}")
+        script.append(f"printf '%s\\n' {shlex.quote(f'{scenario.path}:{step.line}: {step.id}')}")
+        script.append(f"DOC_TEST_SNIPPET={shlex.quote(step.id)}")
         script.append("set -Eeuo pipefail")
         script.append(
-            'trap \'printf "%s:%s: shell command failed\\n" "$DOC_TEST_SOURCE" "$LINENO" >&2\' ERR'
+            'trap \'printf "%s:%s: %s: shell command failed\\n" '
+            '"$DOC_TEST_SOURCE" "$LINENO" "$DOC_TEST_SNIPPET" >&2\' ERR'
         )
         command = f"source {shlex.quote(str(source))}"
         if step.kind == "background":
@@ -162,7 +181,9 @@ def _execute_shell(scenario, ctx, control):
 
 
 if __name__ == "__main__":
-    markdown, scenario_id, root, workspace, control_dir = sys.argv[1:]
-    selected = next(s for s in parse_markdown(Path(markdown)) if s.id == scenario_id)
-    _execute(selected, Path(root), Path(workspace), Path(control_dir))
+    manifest, root, workspace, control_dir = sys.argv[1:]
+    payload = json.loads(Path(manifest).read_text())
+    payload["path"] = Path(payload["path"])
+    payload["steps"] = [Snippet(**step) for step in payload["steps"]]
+    _execute(Scenario(**payload), Path(root), Path(workspace), Path(control_dir))
     (Path(control_dir) / "completed").touch()

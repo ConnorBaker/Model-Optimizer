@@ -13,29 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Parse explicit, trusted Markdown test scenarios without importing ML dependencies."""
+"""Extract named Markdown snippets and resolve Python-owned test scenarios."""
 
 import re
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+__all__ = ["DocTestError", "Scenario", "Snippet", "parse_markdown", "resolve_scenarios"]
 
-__all__ = ["DocTestError", "Scenario", "Step", "parse_markdown"]
+_ID = r"[a-z0-9][a-z0-9-]*"
 
 
 class DocTestError(ValueError):
-    """A Markdown scenario is malformed or failed to execute."""
+    """A Markdown snippet or scenario is malformed or failed to execute."""
 
 
 @dataclass
-class Step:
-    """Source code with its original Markdown location."""
+class Snippet:
+    """A named code fence with its original Markdown location."""
 
+    id: str
     kind: str
     code: str
     line: int
@@ -43,28 +41,31 @@ class Step:
 
 @dataclass
 class Scenario:
-    """An explicitly opted-in sequence of setup, executable fences and verification."""
+    """An ordered snippet selection with worker-side orchestration and resource limits."""
 
-    path: Path
-    line: int
     id: str
-    profile: str
-    timeout_seconds: int
-    steps: list[Step] = field(default_factory=list)
+    snippets: list[str]
+    profile: str = "cpu"
+    timeout_seconds: int = 60
+    handler: str | None = None
     manual: bool = False
     min_gpus: int = 0
     requires: list[str] = field(default_factory=list)
+    background: bool = False
+    path: Path | None = None
+    steps: list[Snippet] = field(default_factory=list)
+
+    @property
+    def line(self):
+        return self.steps[0].line
 
 
-def parse_markdown(path: Path, *, require_coverage: bool = False) -> list[Scenario]:
-    """Validate all directives and return scenarios; unmarked fences are never executed."""
+def parse_markdown(path: Path, *, require_ids: bool = False) -> dict[str, Snippet]:
+    """Extract ID-marked fences without executing code; optionally require IDs on every fence."""
     path = Path(path).resolve()
     lines = path.read_text().splitlines(keepends=True)
-    scenarios = []
-    current = None
-    pending = False
-    excluded = False
-    phase = "setup"
+    snippets = {}
+    pending = None
     i = 0
 
     def fail(message, line):
@@ -87,141 +88,109 @@ def parse_markdown(path: Path, *, require_coverage: bool = False) -> list[Scenar
                 (unquote(lines[i]) if quoted else lines[i]).strip(),
             ):
                 i += 1
-            if i == len(lines) and (pending or require_coverage):
-                fail("unclosed executable fence", line)
+            if i == len(lines) and (pending or require_ids):
+                fail("unclosed snippet fence", line)
             if pending:
-                language = language.strip()
-                if language not in {"bash", "sh", "python"}:
-                    fail("run requires a bash, sh or python fence", line)
-                if pending == "background" and language == "python":
-                    fail("background requires a shell fence", line)
-                kind = "python" if language == "python" else pending
                 code = textwrap.dedent(
                     "".join(unquote(part) if quoted else part for part in lines[start:i])
                 )
-                if kind == "python":
-                    try:
-                        compile("\n" * start + code, str(path), "exec")
-                    except SyntaxError as error:
-                        fail(f"invalid Python: {error.msg}", error.lineno)
-                current.steps.append(Step(kind, code, start + 1))
-                pending = False
-                phase = "run"
-            elif require_coverage and not excluded:
-                fail("unaccounted fence: add run or skip with a reason", line)
-            excluded = False
-            i += 1
-            continue
-        if (pending or excluded) and text:
-            fail("run must be immediately followed by a fence (blank lines allowed)", line)
-        if "modelopt-doc-test:" not in text:
-            i += 1
-            continue
-        skip = re.fullmatch(r"<!-- modelopt-doc-test:skip (.+) -->", text)
-        if skip:
-            if current or not skip.group(1).strip():
-                fail("skip requires a reason outside a scenario", line)
-            excluded = True
-            i += 1
-            continue
-        match = re.fullmatch(
-            r"<!-- modelopt-doc-test:(begin|setup python|verify python|run background|run|end)(.*)",
-            text,
-        )
-        if not match:
-            fail("invalid doc-test directive", line)
-        kind, suffix = match.groups()
-        body = ""
-        if kind in {"run", "run background", "end"}:
-            if suffix != " -->":
-                fail("run/end directives must occupy one line", line)
-        else:
-            if suffix:
-                fail("multiline directive header must end after its kind", line)
-            start = i + 1
-            i += 1
-            while i < len(lines) and unquote(lines[i]).strip() != "-->":
-                i += 1
-            if i == len(lines):
-                fail("unclosed doc-test directive", line)
-            body = textwrap.dedent("".join(unquote(part) for part in lines[start:i]))
-        if kind == "begin":
-            if current:
-                fail("nested scenarios are not allowed", line)
-            try:
-                metadata = tomllib.loads(body)
-            except tomllib.TOMLDecodeError as error:
-                fail(f"invalid scenario metadata: {error}", line)
-            required = {"id", "profile", "timeout_seconds"}
-            if not required <= metadata.keys() or metadata.keys() - required - {
-                "manual",
-                "min_gpus",
-                "requires",
-            }:
-                fail(
-                    "begin requires id, profile, timeout_seconds; optional manual, min_gpus, requires",
-                    line,
+                language = language.strip()
+                kind = {"bash": "run", "sh": "run", "python": "python"}.get(
+                    language, "unsupported:" + language
                 )
-            if type(metadata.get("manual", False)) is not bool:
-                fail("manual must be a boolean", line)
-            if type(metadata.get("min_gpus", 0)) is not int or metadata.get("min_gpus", 0) < 0:
-                fail("min_gpus must be a nonnegative integer", line)
-            dependencies = metadata.get("requires", [])
-            if not isinstance(dependencies, list) or not all(
-                isinstance(name, str)
-                and re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*", name)
-                for name in dependencies
-            ):
-                fail("requires must be a list of Python module names", line)
-            if not isinstance(metadata["id"], str) or not re.fullmatch(
-                r"[a-z0-9][a-z0-9-]*", metadata["id"]
-            ):
-                fail("id must contain lowercase letters, digits or hyphens", line)
-            if any(s.id == metadata["id"] for s in scenarios):
-                fail("duplicate scenario id", line)
-            if metadata["profile"] not in ("cpu", "gpu"):
-                fail("profile must be cpu or gpu", line)
-            if type(metadata["timeout_seconds"]) is not int or metadata["timeout_seconds"] <= 0:
-                fail("timeout_seconds must be a positive integer", line)
-            current = Scenario(path, line, **metadata)
-            phase = "setup"
-        elif current is None:
-            fail("directive outside a scenario", line)
-        elif kind == "end":
-            runs = [
-                step.kind for step in current.steps if step.kind in {"run", "python", "background"}
-            ]
-            if not runs:
-                fail("scenario needs at least one run fence", line)
-            if "python" in runs and any(kind != "python" for kind in runs):
-                fail("use separate scenarios for Python and shell fences", line)
-            if "background" in runs and (
-                runs.count("background") != 1
-                or runs[-1] != "background"
-                or not any(step.kind == "verify" for step in current.steps)
-            ):
-                fail("background must be the last run and have verification", line)
-            scenarios.append(current)
-            current = None
-        elif kind in {"run", "run background"}:
-            if phase == "verify":
-                fail("run cannot follow verification", line)
-            pending = "background" if kind == "run background" else "run"
-        else:
-            kind = kind.split()[0]
-            if kind == "setup" and phase != "setup":
-                fail("setup must precede all run fences", line)
-            if kind == "verify" and phase == "setup":
-                fail("verification must follow run fences", line)
-            try:
-                compile("\n" * line + body, str(path), "exec")
-            except SyntaxError as error:
-                fail(f"invalid Python: {error.msg}", error.lineno)
-            current.steps.append(Step(kind, body, line + 1))
-            phase = kind
+                snippets[pending] = Snippet(pending, kind, code, start + 1)
+                pending = None
+            elif require_ids:
+                fail("unaccounted fence: add a snippet ID and a test or exclusion", line)
+            i += 1
+            continue
+        if pending and text:
+            fail("snippet ID must be immediately followed by a fence (blank lines allowed)", line)
+        if "modelopt-doc-test:" in text:
+            fail(
+                "legacy doc-test directives are unsupported; use snippet IDs and Python tests", line
+            )
+        if "modelopt-snippet:" in text:
+            match = re.fullmatch(r"<!-- modelopt-snippet: (" + _ID + r") -->", text)
+            if not match:
+                fail("invalid snippet ID marker", line)
+            pending = match.group(1)
+            if pending in snippets:
+                fail(f"duplicate snippet ID: {pending}", line)
         i += 1
-    if excluded:
-        fail("skip missing its fence", len(lines))
-    if current:
-        fail("scenario missing end", current.line)
-    return scenarios
+    if pending:
+        fail(f"snippet ID {pending} missing its fence", len(lines))
+    return snippets
+
+
+def resolve_scenarios(path, scenarios, *, excluded=None):
+    """Validate references and account for every fence before any scenario can execute."""
+    path = Path(path).resolve()
+    snippets = parse_markdown(path, require_ids=True)
+    excluded = {} if excluded is None else excluded
+    if any(not isinstance(reason, str) or not reason.strip() for reason in excluded.values()):
+        raise DocTestError(f"{path}: exclusions require a nonempty reason")
+    unknown = excluded.keys() - snippets.keys()
+    if unknown:
+        raise DocTestError(f"{path}: unknown excluded snippets: {sorted(unknown)}")
+    result, covered, ids = [], set(), set()
+    for scenario in scenarios:
+
+        def fail(message):
+            raise DocTestError(f"{path}: scenario {scenario.id}: {message}")
+
+        if not isinstance(scenario.id, str) or not re.fullmatch(_ID, scenario.id):
+            fail("invalid scenario ID")
+        if scenario.id in ids:
+            fail("duplicate scenario ID")
+        ids.add(scenario.id)
+        if scenario.profile not in {"cpu", "gpu"}:
+            fail("profile must be cpu or gpu")
+        if type(scenario.timeout_seconds) is not int or scenario.timeout_seconds <= 0:
+            fail("timeout_seconds must be a positive integer")
+        if type(scenario.min_gpus) is not int or scenario.min_gpus < 0:
+            fail("min_gpus must be a nonnegative integer")
+        if type(scenario.manual) is not bool or type(scenario.background) is not bool:
+            fail("manual and background must be booleans")
+        if not isinstance(scenario.requires, list) or not all(
+            isinstance(name, str) and re.fullmatch(r"[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*", name)
+            for name in scenario.requires
+        ):
+            fail("requires must be a list of Python module names")
+        if scenario.handler is not None and (
+            not isinstance(scenario.handler, str)
+            or not re.fullmatch(r"[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*:[a-zA-Z_]\w*", scenario.handler)
+        ):
+            fail("handler must be an importable module:function reference")
+        if (
+            not isinstance(scenario.snippets, list)
+            or not scenario.snippets
+            or not all(isinstance(key, str) for key in scenario.snippets)
+        ):
+            fail("snippets must be a nonempty list of IDs")
+        missing = set(scenario.snippets) - snippets.keys()
+        if missing:
+            fail(f"unknown snippets: {sorted(missing)}")
+        overlap = set(scenario.snippets) & excluded.keys()
+        if overlap:
+            fail(f"snippets are both tested and excluded: {sorted(overlap)}")
+        steps = [snippets[key] for key in scenario.snippets]
+        kinds = {step.kind for step in steps}
+        if not kinds <= {"run", "python"} or len(kinds) != 1:
+            fail("select only shell fences or only Python fences in each scenario")
+        if scenario.background:
+            if kinds != {"run"} or scenario.handler is None:
+                fail("background requires shell snippets and a verification handler")
+            steps = [*steps[:-1], replace(steps[-1], kind="background")]
+        for step in steps:
+            if step.kind == "python":
+                try:
+                    compile("\n" * (step.line - 1) + step.code, str(path), "exec")
+                except SyntaxError as error:
+                    fail(f"invalid Python in {step.id} at line {error.lineno}: {error.msg}")
+        covered.update(scenario.snippets)
+        result.append(replace(scenario, path=path, steps=steps))
+    unaccounted = snippets.keys() - covered - excluded.keys()
+    if unaccounted:
+        raise DocTestError(f"{path}: unaccounted snippets: {sorted(unaccounted)}")
+    return result

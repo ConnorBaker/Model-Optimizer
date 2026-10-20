@@ -19,16 +19,16 @@ import importlib.util
 
 import pytest
 
-from .parser import parse_markdown
+from .parser import resolve_scenarios
 from .runner import run_scenario
 
 __all__ = ["execute_scenario", "scenario_parameters"]
 
 
-def scenario_parameters(path):
+def scenario_parameters(path, scenarios, *, excluded=None):
     """Collect every scenario, enforcing a documented disposition for every fence."""
     result = []
-    for scenario in parse_markdown(path, require_coverage=True):
+    for scenario in resolve_scenarios(path, scenarios, excluded=excluded):
         marks = [pytest.mark.timeout(scenario.timeout_seconds + 30)]
         if scenario.manual:
             marks.append(pytest.mark.manual)

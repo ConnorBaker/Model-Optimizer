@@ -15,69 +15,97 @@ the QAT README's QLoRA checkpoint layout and adapter name. These are not general
 installation or serving APIs. Add a shared abstraction only when another example
 needs the same behavior with a clear parameter contract.
 
-## Directive contract
+## Snippet IDs and Python scenarios
 
-Directives occupy their own lines outside code fences. Metadata is TOML:
+A README contains only one ID marker immediately before each fence (blank lines
+are allowed). IDs are unique within the document and remain stable when prose or
+snippets move. Code is extracted directly, without substitutions:
 
 ````markdown
-<!-- modelopt-doc-test:begin
-id = "example-smoke"
-profile = "cpu"
-timeout_seconds = 30
--->
-<!-- modelopt-doc-test:setup python
-ctx.cwd = ctx.tmp
-ctx.env["MESSAGE"] = "hello"
--->
-<!-- modelopt-doc-test:run -->
-
+<!-- modelopt-snippet: example-command -->
 ```bash
 printf '%s' "$MESSAGE" > result.txt
 ```
-
-<!-- modelopt-doc-test:verify python
-assert (ctx.cwd / "result.txt").read_text() == "hello"
--->
-<!-- modelopt-doc-test:end -->
 ````
 
-- Required metadata: unique lowercase/hyphenated `id`, `profile` (`cpu` or `gpu`),
-  and positive `timeout_seconds`. Optional: `manual = true`, `min_gpus = 2`,
-  and `requires = ["megatron.bridge"]` for importable modules.
-- Setup precedes all selected fences; verification follows them. Both share a
-  namespace with `ctx.repo`, `ctx.tmp`, `ctx.cwd` and mutable `ctx.env`.
-  `ctx.repo` and `ctx.tmp` are absolute paths; `ctx.cwd` initially points to the
-  repository. Setup must select the temporary workspace when isolation is needed.
-- Each `run` selects one immediately following `bash`, `sh`, or `python` fence;
-  only blank lines may intervene. Backtick, tilde, list-indented and single-level
-  blockquoted fences are supported. Nested scenarios and duplicate IDs fail.
-- Shell fences share one Bash process with `set -Eeuo pipefail`; shell variables,
-  directory changes and exported environment persist. Verification sees the final
-  `ctx.cwd` and `ctx.env`. Setup/verification Python uses those explicit fields.
-- Python fences share the setup namespace, with `__name__ = "__main__"` and
-  `__file__` set to the README path. Before execution the worker applies
-  `ctx.cwd` and `ctx.env`; afterward it records their final values. Keep Python
-  and shell fences in separate scenarios to avoid ambiguous shared state.
-- `run background` starts the final shell fence asynchronously. Verification must
-  check readiness and behavior; `ctx.background_pid` identifies its shell process.
-  Background-fence changes to the directory or environment do not propagate back;
-  configure server settings in setup. The serving test checks HTTP health and
-  requests a real adapter completion.
-- The deadline covers setup, commands and verification. The parent kills the
-  process group on success, failure or timeout. Commands must not detach, disable
-  error checking, or replace/exit the shell. Workspace artifacts remain in pytest's
-  temporary directory; internal control files are removed. Failures include output
-  and Markdown source locations. A zero exit status is insufficient: the worker
-  must reach the end of verification. Early exits such as `sys.exit(0)` fail.
+The pytest module owns scenario definitions, execution order, resource metadata,
+and exclusions. One snippet can be reused in multiple scenarios:
+
+```python
+SCENARIOS = [
+    Scenario(
+        "example-smoke",
+        ["example-command"],
+        timeout_seconds=30,
+        handler="_test_utils.doc_tests.fixtures.example_readme:smoke",
+    ),
+]
+EXCLUDED = {"interactive-container": "Provisioned outside pytest by the CI job."}
+
+@pytest.mark.parametrize(
+    "scenario", scenario_parameters(README, SCENARIOS, excluded=EXCLUDED)
+)
+def test_readme(scenario, tmp_path, monkeypatch):
+    execute_scenario(scenario, REPO, tmp_path, monkeypatch)
+```
+
+An optional importable handler performs setup, calls `ctx.run()` exactly once,
+then verifies results. Put it in an example-specific module under `fixtures/`:
+
+```python
+def smoke(ctx):
+    ctx.cwd = ctx.tmp
+    ctx.env["MESSAGE"] = "hello"
+    ctx.run()
+    assert (ctx.cwd / "result.txt").read_text() == "hello"
+```
+
+- `parse_markdown(path)` extracts named fences and source locations without
+  executing them. `resolve_scenarios` requires an ID on **every** fence and
+  validates that each ID is referenced or explicitly excluded with a reason.
+  Missing/duplicate IDs, unknown references, stale exclusions, and tested/excluded
+  overlaps fail collection. Accounting does **not** mean manual/excluded code passed.
+- `Scenario` requires a unique scenario ID and a nonempty ordered list of snippet
+  IDs. Defaults are `profile="cpu"` and `timeout_seconds=60`. Optional metadata:
+  `profile="gpu"`, `min_gpus=2`, `requires=["megatron.bridge"]`, `manual=True`,
+  `background=True`, and `handler="module:function"`.
+- Handlers are imported only by the worker. Collection does not import their ML
+  dependencies or discover GPUs. Keep optional ML imports in the worker path so
+  CPU-only scenarios can still run independently. Without a handler, the worker
+  simply runs the selected snippets.
+- `ctx.repo` and `ctx.tmp` are absolute paths. `ctx.cwd` starts at the repository;
+  `ctx.env` is mutable. Select a temporary workspace when isolation is needed.
+- Shell snippets run in test-defined order in one Bash process with
+  `set -Eeuo pipefail`. Variables, directory changes, and exported environment
+  persist; the handler sees final `ctx.cwd` and `ctx.env` after `ctx.run()`.
+- Python snippets share the dictionary supplied to `ctx.run(namespace)`, which is
+  also returned for assertions. The worker supplies `ctx`, `__name__="__main__"`,
+  and `__file__` pointing to the README. Before execution it applies `ctx.cwd` and
+  `ctx.env`; afterward it records their final values. Keep Python and shell
+  snippets in separate scenarios.
+- `background=True` starts the **last shell snippet** asynchronously. A handler
+  must verify readiness and behavior after `ctx.run()`. `ctx.background_pid`
+  identifies its shell process. Background changes to directory/environment do
+  not propagate back; configure server settings before running the snippets.
+- The parent passes a JSON execution plan to the worker; the worker does not
+  reparse the README or import pytest modules. The deadline covers handler import,
+  setup, snippet execution, and verification. The process group is terminated on
+  success, failure, or timeout. A zero exit status cannot bypass completion checks.
+- Failures include the scenario ID and Markdown source location; execution logs
+  identify each snippet ID. Python snippets preserve README traceback lines;
+  handler errors point to the actual Python test helper. Internal control files
+  are removed while workspace artifacts remain in pytest's temporary directory.
+- Commands must not detach, disable error checking, or replace/exit the shell.
+  These are trusted repository tests, not a security sandbox.
 - The runner prepends the checkout and test utilities to `PYTHONPATH`. The separate
-  installation test deliberately removes it and uses a disposable virtualenv so
-  the installed package can be tested without replacing the checkout environment.
-- Collection uses `require_coverage=True`: every fence must be selected or have
-  `<!-- modelopt-doc-test:skip A specific reason. -->` immediately before it.
-  This is an accounting check, **not** proof that excluded/manual snippets passed.
-- `manual` uses the repository's existing `--run-manual` option. Missing declared
-  modules or insufficient GPUs produce explicit pytest skips. A GPU profile needs
-  at least one device. Manual prerequisites are supplied by the operator.
+  installation test removes it and uses a disposable virtualenv to test the
+  installed package without replacing the checkout environment.
+- Manual scenarios use the existing `--run-manual` option. Missing declared
+  modules or insufficient GPUs produce explicit skips. A GPU profile requires
+  at least one device. Manual prerequisites remain the operator's responsibility.
+
+The old `modelopt-doc-test:begin/setup/run/verify/end/skip` format is unsupported.
+Test-only setup, assertions, metadata, and exclusion reasons belong in Python.
 
 ## Coverage and limits
 
@@ -160,9 +188,10 @@ CLI-help scenarios still execute on the single-GPU runner.
 
 | File | Purpose in this extension |
 | --- | --- |
-| `parser.py` | Shared support for Python, quoted/list fences, background services, resource metadata and explicit exclusions. |
-| `runner.py` | Execute Python in the scenario namespace and keep servers alive through verification, under the existing timeout and cleanup. |
+| `parser.py` | Extract named fences and validate scenario references, resource metadata, and exclusions. |
+| `runner.py` | Execute resolved plans with worker-side handlers, deadlines, shared state, and cleanup. |
 | `pytest_utils.py` | Common collection, manual markers and resource checks, independent of the example. |
+| `fixtures/llm_qat_readme.py`, `fixtures/megatron_bridge_readme.py` | Worker-side scenario setup and verification moved out of Markdown. |
 | `fixtures/llm_qat.py` | Reduced QAT/QAD/QLoRA/Llama inputs, real prerequisite quantization, Python API inputs and artifact assertions. |
 | `fixtures/megatron_bridge.py` | Local Bridge inputs, real distillation prerequisites and quantization/pruning/export assertions. |
 | `fixtures/llm_qat_installation.py` | QAT requirements in a disposable venv and QAT dependency import verification. |
