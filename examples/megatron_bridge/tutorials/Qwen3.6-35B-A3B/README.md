@@ -70,7 +70,7 @@ The six benchmarks above barely test recalling facts, which is what weight quant
 | **W4A4 NVFP4 PTQ** | 20.2 | 39.3 | 39.8 | −19.1 | 49.2% |
 | **↳ + QAD 500 iters** | 21.0 ± 0.3 | 48.5 ± 2.3 | 29.8 ± 2.4 | −27.5 | 61.4% |
 
->`pass@1[avg-of-10]`, judged by Gemini 3 Flash. Hallucination rate = incorrect / (incorrect + abstained). `±` is the sem across the 10 repeats (≤0.6 on the rows without one).
+>`pass@1[avg-of-10]`, judged by Gemini 3 Flash. Hallucination rate = incorrect / (100 − correct). The judge grades the remaining ~0.7% partially correct, so the three columns sum to ~99.3. `±` is the sem across the 10 repeats (≤0.6 on the rows without one).
 
 - **Knowledge is kept.** Every model answers the same ~21% correctly; 4-bit weights, 4-bit activations and QAD all leave recall intact.
 - **Calibration is not.** Each step abstains less and guesses wrong more: the published W4A16 checkpoint already loses 4 index points, W4A4 PTQ 8, and **QAD 500 loses 16**, at an unchanged correct rate. None of the six benchmarks above can see this.
@@ -249,14 +249,18 @@ One config per benchmark in [eval_configs/](eval_configs/), so each can be launc
 | AA-LCR | [aa_lcr.yaml](eval_configs/aa_lcr.yaml) | 1.0 | 8 | 2:00 | `aalcr_pass_at_1_judge_correct` |
 | IFBench | [ifbench.yaml](eval_configs/ifbench.yaml) | 1.0 | 8 | 1:30 | `ifbench_pass_at_1_average_score` |
 | tau2-bench Telecom | [tau2_telecom.yaml](eval_configs/tau2_telecom.yaml) | 1.0 | 3 | 1:30 | `tau2_bench_telecom_pass_at_1_pass_at_1` |
+| AA-Omniscience<sup>*</sup> | [omniscience.yaml](eval_configs/omniscience.yaml) | 1.0 | 1 (avg-of-10) | 4:00 | `omniscience_pass_at_1_avg-of-10_judge_omni_index` |
+
+<sup>*</sup> Reported separately in [Knowledge recall and calibration](#knowledge-recall-and-calibration), not in the six-benchmark mean.
 
 Sampling follows the [nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) card (`T=1.0, top_p=0.95, max_new_tokens=131072`), except SciCode, which the card specifies at `T=0.6`. `parallelism` varies (32 default, 16 for AA-LCR's long contexts and for tau2-bench's multi-turn tool round-trips, 8 for SciCode's long generations) as a throughput knob only. The same configs serve BF16 and NVFP4 unchanged — vLLM reads the FP8 KV-cache setting from the checkpoint's own `quantization_config`.
 
 > [!IMPORTANT]
-> **Two benchmarks need a second model endpoint besides the one under test.** AA-LCR scores answers
-> with a judge (`NS_JUDGE_URL` / `LCR_JUDGE_MODEL_ID`); tau2-bench drives a simulated user
-> (`TAU2_ENDPOINT_URL` / `TAU2_USER_MODEL_ID`). Both read `INFERENCE_API_KEY`, and neither can
-> produce its metric without that endpoint. Point both at `https://` URLs for the final endpoint:
+> **Three benchmarks need a second model endpoint besides the one under test.** AA-LCR and
+> AA-Omniscience score answers with a judge (`NS_JUDGE_URL` / `LCR_JUDGE_MODEL_ID` or
+> `OMNI_JUDGE_MODEL_ID`); tau2-bench drives a simulated user (`TAU2_ENDPOINT_URL` /
+> `TAU2_USER_MODEL_ID`). All read `INFERENCE_API_KEY`, and none can produce its metric without that
+> endpoint. Point them at `https://` URLs for the final endpoint:
 > the key rides every request, and a redirect can downgrade it to `http` or send it to another
 > origin. tau2-bench additionally needs its own **deployment** —
 > `--enable-auto-tool-choice --tool-call-parser qwen3_coder` and `--max-num-seqs 16` — which is why
@@ -269,7 +273,7 @@ Sampling follows the [nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidi
 > for when `presence_penalty` helps and when it is pure cost.
 
 > [!IMPORTANT]
-> Every task sets `num_repeats: 1`; the repeat counts above come from **launching a config that many times**. N launches give N independent `pass@1` values, which is what `mean ± sem` and the paired tests need — `num_repeats: N` instead yields a single `pass@1[avg-of-N]` with no spread. GPQA is the deliberate exception.
+> Every task sets `num_repeats: 1`; the repeat counts above come from **launching a config that many times**. N launches give N independent `pass@1` values, which is what `mean ± sem` and the paired tests need — `num_repeats: N` instead yields a single `pass@1[avg-of-N]`. GPQA and AA-Omniscience are the deliberate exceptions; AA-Omniscience's `±` is the sem across its 10 in-run repeats, which differ because each repeat shares one sampling seed across all 600 questions.
 
 > [!IMPORTANT]
 > **Run enough repeats.** These benchmarks are noisy, and 3 was not enough to tell signal from noise in either direction. At 3 repeats, AA-LCR (only 100 questions) showed a 3 pp swing that looked real and **vanished completely** at 8; IFBench's genuine +2.3 pp gain was **invisible** at 3 and only appeared at 8. Three runs also *understates* how noisy a benchmark is, so the measured spread looks tighter than it is.
@@ -333,7 +337,7 @@ Accuracy is only half the serving cost — a model that scores the same while em
 
 **4-bit weights lengthen SciCode outputs by ~23-25% on their own** — the published W4A16 checkpoint does it too, so it is not something QAD or W4A4 introduced. **QAD then pushes SciCode to +90.9%**, for an unchanged score (40.2 vs 39.9), while pulling GPQA and MMMU-Pro back toward BF16. The throughput table is measured at fixed output length, so it does not capture this.
 
-The SciCode increase is not verbosity: **3.6% of sub-steps never terminate** (BF16: 0.7%). They hit the 131,072-token cap with no answer and use 45.7% of all completion tokens. **`presence_penalty: 1.5` fixes it at decode time**: capped sub-steps drop from 96 to 2 of 2,704, accuracy stays within noise, and SciCode runs 12-44% faster. [scicode.yaml](eval_configs/scicode.yaml) has the line commented out so it reproduces the results table; uncomment it to apply the fix. Do not set it for every benchmark: on GPQA Diamond it costs 4.8× throughput for no accuracy change. Details are in [ABLATIONS.md](ABLATIONS.md#scicode-non-termination-diagnosis-and-decode-time-fix).
+The SciCode increase is not verbosity: **3.6% of sub-steps never terminate** (BF16: 0.7%). They hit the 131,072-token cap with no answer and use 45.7% of all completion tokens. **`presence_penalty: 1.5` fixes it at decode time**: capped sub-steps drop from 96 to 2 of 2,704, accuracy stays within noise, and SciCode runs 12-44% faster. [scicode.yaml](eval_configs/scicode.yaml) has the line commented out so it reproduces the results table; uncomment it to apply the fix. Do not set it for every benchmark: on GPQA Diamond it cuts generation throughput 4.8× (5,109 to 1,067 tokens/s) for no accuracy change. Details are in [ABLATIONS.md](ABLATIONS.md#scicode-non-termination-diagnosis-and-decode-time-fix).
 
 ---
 

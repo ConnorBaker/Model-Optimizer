@@ -100,8 +100,10 @@ evaluation:
           params:
             extra:
               num_repeats: 10
-              # Score the final answer only, not the reasoning.
+              # vLLM's reasoning parser already strips the thinking; NeMo-Skills' own parse would find no
+              # </think> in the answer and grade it as empty.
               args: "++parse_reasoning=False"
+              # Always judge-scored, so unlike AA-LCR it needs no `judge_support: true`.
               judge:
                 url: ${oc.env:NS_JUDGE_URL}
                 model_id: ${oc.env:OMNI_JUDGE_MODEL_ID}
