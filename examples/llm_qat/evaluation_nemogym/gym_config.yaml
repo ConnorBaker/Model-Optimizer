@@ -44,9 +44,7 @@ driver:
         port_range_high: 64000
         resume_from_cache: true
         upload_rollouts: false
-      resumable:
-        max_retries: 3
-        max_walltime: "16:00:00"
+      resumable: false
 
 otel:
   enabled: false
