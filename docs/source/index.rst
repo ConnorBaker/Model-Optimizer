@@ -31,6 +31,12 @@ Release notes, technical updates, examples, and deployment stories from the Mode
      </div>
 
    <div class="announcement-grid" id="announcement-grid">
+     <article class="announcement-card" data-date="2026-10-21" data-title="GLM-5.3-Flash at 2-3 Bits per Expert Weight: Two PTQ Recipes, and Where QAD Did Not Help" data-summary="IQ2_S routed experts with layerwise GPTQ on GLM-5.3-Flash: NVFP4 down projections reach FP8 accuracy without training, while 300 QAD iterations recover a third of the IQ2 gap and lose knowledge recall." data-tags="quantization ggml nvfp4 qad megatron-bridge">
+       <div class="announcement-card-meta">October 21, 2026 &middot; Model Optimizer Team</div>
+       <h2><a href="announcements/20261021-glm53-flash-iq2.html">GLM-5.3-Flash at 2-3 Bits per Expert Weight: Two PTQ Recipes, and Where QAD Did Not Help</a></h2>
+       <p>IQ2_S experts with NVFP4 down projections match the FP8 checkpoint without training; 300 QAD iterations on the all-IQ2_S model recover a third of its gap and lose knowledge recall.</p>
+       <div class="announcement-card-tags"><span>quantization</span><span>ggml</span><span>nvfp4</span><span>qad</span><span>megatron-bridge</span></div>
+     </article>
      <article class="announcement-card" data-date="2026-10-08" data-title="AutoQuant KV: Automatic Mixed-Precision KV Cache Quantization" data-summary="Learn how AutoQuant selects per-layer KV formats under a storage budget and combines with GEMM quantization, with Qwen3-8B as a case study." data-tags="autoquantize kv-cache quantization mixed-precision modelopt">
        <div class="announcement-card-meta">October 8, 2026 &middot; Model Optimizer Team</div>
        <h2><a href="announcements/20261008-autoquant-kv.html">AutoQuant KV: Automatic Mixed-Precision KV Cache Quantization</a></h2>
