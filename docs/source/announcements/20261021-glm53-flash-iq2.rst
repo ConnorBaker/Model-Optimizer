@@ -94,7 +94,10 @@ model (x=0) through 300 QAD iterations. The dashed line is the FP8 baseline, the
 IQ2_S + NVFP4 (no QAD) and the dotted line is IQ2_S. Bars are ±1 sem.
 
 ``mean ± sem`` across repeats (GPQA-D: one run of 16 repeats); the run count is in brackets. All
-evaluations use a 131K-token generation budget and a BF16 KV cache.
+evaluations use a 131K-token generation budget and a BF16 KV cache, served by vLLM 0.31 with
+prefix caching on. vLLM 0.31 fixes a GLM-5.3-Flash prefix-caching bug that lowers long-context
+scores on earlier versions; with caching off, FP8 AA-LCR moves by 1.2 points (76.12 ± 0.83 vs
+74.88 ± 0.87, 8 runs each), within noise.
 
 .. list-table::
    :header-rows: 1
