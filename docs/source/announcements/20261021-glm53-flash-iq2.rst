@@ -66,8 +66,8 @@ The Two Recipes
      - ~155 GB (2.1x smaller)
    * - Mean delta vs FP8, six benchmarks
      - –
-     - −2.3
-     - **−0.1**
+     - −2.3 ± 0.4
+     - **−0.1 ± 0.3**
    * - Weight formats
      - FP8
      - GGML only (IQ2_S, Q8_0)
@@ -95,7 +95,8 @@ Accuracy
 model (x=0) through 300 QAD iterations. The dashed line is the FP8 baseline, the dash-dot line is
 IQ2_S + NVFP4 (no QAD) and the dotted line is IQ2_S. Bars are ±1 sem.
 
-``mean ± sem`` across repeats (GPQA-D: one run of 16 repeats); the run count is in brackets. All
+``mean ± sem`` across repeats (GPQA-D: one run of 16 repeats); the run count is in brackets. The
+± on a mean delta combines the per-benchmark sems of both models (GPQA-D adds none). All
 evaluations use a 131K-token generation budget and a BF16 KV cache, served by vLLM 0.31 with
 prefix caching on. vLLM 0.31 fixes a GLM-5.3-Flash prefix-caching bug that lowers long-context
 scores on earlier versions; with caching off, FP8 AA-LCR moves by 1.2 points (76.1 ± 0.8 vs
@@ -142,9 +143,9 @@ scores on earlier versions; with caching off, FP8 AA-LCR moves by 1.2 points (76
      - 98.3 ± 0.3
    * - **Mean delta vs FP8**
      - –
-     - −2.3
-     - **−0.1**
-     - −1.4
+     - −2.3 ± 0.4
+     - **−0.1 ± 0.3**
+     - −1.4 ± 0.4
    * - SciCode, ``presence_penalty`` 1.5 (8)
      - 54.3 ± 0.8
      - 51.6 ± 0.8
@@ -252,11 +253,12 @@ accuracy, and shortens answers elsewhere:
      - **15.5K**
      - 3.5K
    * - Mean delta vs FP8, six benchmarks
-     - −2.3
-     - **−1.4**
+     - −2.3 ± 0.4
+     - **−1.4 ± 0.4**
      - –
 
-**Where it falls short.** Most of the gain comes in the first 100 iterations:
+**Where it falls short.** On the six-benchmark mean, QAD 300 gains 0.8 ± 0.4 over IQ2_S, just
+under two standard errors, and most of that comes in the first 100 iterations:
 
 .. list-table::
    :header-rows: 1
@@ -270,11 +272,11 @@ accuracy, and shortens answers elsewhere:
      - QAD 300
      - FP8
    * - Mean delta vs FP8
-     - −2.3
-     - −2.6
-     - −1.8
-     - −1.9
-     - −1.4
+     - −2.3 ± 0.4
+     - −2.6 ± 0.3
+     - −1.8 ± 0.3
+     - −1.9 ± 0.3
+     - −1.4 ± 0.4
      - –
    * - SciCode, ``presence_penalty`` 1.5
      - 51.6
