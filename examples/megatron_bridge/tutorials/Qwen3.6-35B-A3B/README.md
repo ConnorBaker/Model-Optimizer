@@ -6,7 +6,7 @@ End-to-end W4A4 optimization of [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qw
 2. **[Quantization](#2-quantization)** — W4A4 NVFP4 PTQ with `examples/megatron_bridge/quantize.py`
 3. **[QAD](#3-quantization-aware-distillation-qad)** — recovering accuracy with `examples/megatron_bridge/distill.py`
 4. **[Export](#4-export)** — converting the quantized Megatron checkpoint to a deployable HF checkpoint
-5. **[Evaluation](#5-evaluation)** — benchmarking with NeMo Evaluator across MMMU-Pro, GPQA Diamond, SciCode, and more
+5. **[Evaluation](#5-evaluation)** — benchmarking with NeMo Evaluator across MMMU-Pro, GPQA Diamond, SciCode, and more, plus AA-Omniscience for knowledge recall and calibration
 6. **[vLLM Inference Benchmarking](#6-vllm-inference-benchmarking)** — throughput comparison against BF16 on GB200
 
 It closes with [potential further improvements](#potential-further-improvements): settings we did not test and their potential benefits. Experiments that did not become the recommended recipe — chat-format SFT data with assistant-only loss, self-distilled data, per-document attention, and the SciCode non-termination diagnosis — are in [ABLATIONS.md](ABLATIONS.md).
@@ -58,6 +58,25 @@ Comparisons are **paired per-question t-tests**: the same question answered by b
 </details>
 
 See [Potential further improvements](#potential-further-improvements) for what would likely close the remaining MMMU-Pro gap.
+
+### Knowledge recall and calibration
+
+The six benchmarks above barely test recalling facts, which is what weight quantization tends to cost first. [AA-Omniscience](eval_configs/omniscience.yaml) does: 600 questions across domains, each answered 10 times, and a judge grades every answer as correct, incorrect or abstained ("I don't know"). Its index is the share correct minus the share incorrect, so a wrong guess costs as much as a right answer earns.
+
+| Model | Correct | Incorrect | Abstained | Omniscience index | Hallucination rate |
+| --- | --- | --- | --- | --- | --- |
+| **BF16** (teacher) | 21.0 | 32.3 | 46.0 | −11.3 | 40.9% |
+| W4A16 NVFP4 PTQ (published) | 20.9 | 36.3 | 42.2 | −15.4 | 45.8% |
+| **W4A4 NVFP4 PTQ** | 20.2 | 39.3 | 39.8 | −19.1 | 49.2% |
+| **↳ + QAD 500 iters** | 21.0 ± 0.3 | 48.5 ± 2.3 | 29.8 ± 2.4 | −27.5 | 61.4% |
+
+>`pass@1[avg-of-10]`, judged by Gemini 3 Flash. Hallucination rate = incorrect / (incorrect + abstained). `±` is the sem across the 10 repeats (≤0.6 on the rows without one).
+
+- **Knowledge is kept.** Every model answers the same ~21% correctly; 4-bit weights, 4-bit activations and QAD all leave recall intact.
+- **Calibration is not.** Each step abstains less and guesses wrong more: the published W4A16 checkpoint already loses 4 index points, W4A4 PTQ 8, and **QAD 500 loses 16**, at an unchanged correct rate. None of the six benchmarks above can see this.
+- **QAD does most of it early**: the index drops to −31.4 at iteration 50, then partly recovers (−25.1 at 300, −27.5 at 500), the same shape as SciCode's non-terminating sub-steps (see [ABLATIONS.md](ABLATIONS.md#data-format-pre-tokenized-blend-vs-chat-sft-data)).
+
+If abstaining matters for your use case (assistants that should say "I don't know"), evaluate it explicitly: QAD as run here did not preserve it.
 
 ### vLLM Throughput (4× GB200, vLLM 0.28.0, TP=4 + EP)
 
@@ -267,12 +286,14 @@ pip install "nemo-evaluator-launcher[all]==0.2.6"
 export HF_TOKEN=<your_huggingface_token>
 export SLURM_JOB_DIR=<path_to_slurm_job_output_dir>
 
-# Required only by AA-LCR (judge) and tau2-bench (user simulator):
+# Required only by AA-LCR (judge), tau2-bench (user simulator) and AA-Omniscience (judge):
 export INFERENCE_API_KEY=<key_for_those_endpoints>
 export NS_JUDGE_URL=<judge_endpoint_url>
 export LCR_JUDGE_MODEL_ID=<judge_model_id>
 export TAU2_ENDPOINT_URL=<user_simulator_url>
 export TAU2_USER_MODEL_ID=<user_simulator_model>
+# Required only by AA-Omniscience (judge), also via NS_JUDGE_URL and INFERENCE_API_KEY:
+export OMNI_JUDGE_MODEL_ID=<judge_model_id>
 
 # One benchmark. To verify the pipeline first, add
 # `-o ++evaluation.nemo_evaluator_config.config.params.limit_samples=8`
