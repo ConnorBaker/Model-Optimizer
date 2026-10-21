@@ -47,12 +47,12 @@ Both chat-SFT variants pack two conversations into one THD micro-batch (`cu_seql
 
 ### Controlled rerun: document isolation and assistant-only loss
 
-The comparison above changed three things at once: cross-document attention (the pre-tokenized windows let each conversation attend to the ones packed before it), the loss mask, and the packed kernel. Three 50-iteration runs separate them, all on the same student and schedule as above:
+The comparison above changed three things at once: cross-document attention (the pre-tokenized windows let each conversation attend to the ones packed before it), the loss mask, and the packed kernel. Three 50-iteration runs were meant to separate them, all on the same student and schedule as above:
 
-| | A: pre-tokenized (main run) | B: + per-document attention | C: chat SFT |
+| | A: pre-tokenized (main run) | B: A repeated<sup>3</sup> | C: chat SFT |
 | --- | --- | --- | --- |
 | Data | pre-tokenized blend | pre-tokenized blend | Cascade-2 chat `.jsonl` |
-| Attention | across the 32K window | within each document (THD, boundary at every end-of-document token) | within each conversation (THD) |
+| Attention | across the 32K window | across the 32K window (THD, one segment) | within each conversation (THD) |
 | Loss on | all tokens | all tokens | assistant tokens |
 | FLA | 0.4.2, unpacked (exact) | 0.5.2 | 0.5.2 |
 
@@ -68,9 +68,11 @@ The comparison above changed three things at once: cross-document attention (the
 | SciCode capped sub-steps | 0.7% | 4.3% | 3.5% | 2.0% | 3.0% |
 | SciCode median tokens | 1,817 | 2,684 | 2,932 | 2,388 | 2,244 |
 
-- **The three setups are within noise of each other at iteration 50.** Per-document attention gains +0.45 on the mean (A → B), mostly on tau2-bench (3 runs); switching to chat data with assistant-only loss changes it by −0.17 (B → C).
-- **The correct kernel did not reproduce chat SFT's lead.** C is the iteration-50 chat-SFT run repeated on FLA 0.5.2 and scores 0.68 below it, mostly on SciCode (−2.6, 8 runs, sd 0.8) and IFBench, without more runaways (C has the lowest capped rate of the QAD runs). So the wrong kernel did not measurably hurt the original run. Its −0.34 was a favourable draw, consistent with its lead disappearing by iteration 300, and two QAD runs of the same recipe can differ by this much at iteration 50.
-- **The recipe is unchanged:** pre-tokenized windows with no document boundaries. They need neither per-document attention nor a newer FLA.
+><sup>3</sup> B was meant to add per-document attention (`--document_boundaries`, a boundary at every end-of-document token), but no window was split: the blend renders conversations with the chat template and puts no end-of-document token between them, and the flag looked for an ID the data never contains. B is therefore A's recipe again, run on FLA 0.5.2 in THD layout with one segment per window. `distill.py` now uses the tokenizer's EOS and rejects data without it.
+
+- **The three runs are within noise of each other at iteration 50.** A and B train the same recipe and differ by 0.45 on the mean, mostly on tau2-bench (3 runs): that is the run-to-run noise at iteration 50. C, chat data with per-conversation attention and assistant-only loss, lands between them.
+- **The correct kernel did not reproduce chat SFT's lead.** C is the iteration-50 chat-SFT run repeated on FLA 0.5.2 and scores 0.68 below it, mostly on SciCode (−2.6, 8 runs, sd 0.8) and IFBench, without more runaways (C has the lowest capped rate of the QAD runs). So the wrong kernel did not measurably hurt the original run. Its −0.34 was a favourable draw, consistent with its lead disappearing by iteration 300 and with the 0.45 between A and B.
+- **The recipe is unchanged:** pre-tokenized windows with no document boundaries, which need no newer FLA. Per-document attention on its own remains untested; in C it comes with the chat data and loss mask, and C does no better.
 
 ### Cost
 

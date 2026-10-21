@@ -206,5 +206,5 @@ has the full reproduction path — data blend, PTQ recipe, QAD command, export, 
 config per benchmark — plus the parallelism constraints QAD imposes on this model and what we would
 try next to close the remaining MMMU-Pro gap. Its
 `ablations <https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/megatron_bridge/tutorials/Qwen3.6-35B-A3B/ABLATIONS.md>`__
-cover what did not become the recipe: chat-format data with assistant-only loss, per-document
-attention, self-distilled data, and the SciCode non-termination diagnosis.
+cover what did not become the recipe: chat-format data with assistant-only loss, self-distilled
+data, and the SciCode non-termination diagnosis.

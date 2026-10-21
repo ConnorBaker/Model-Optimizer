@@ -9,7 +9,7 @@ End-to-end W4A4 optimization of [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qw
 5. **[Evaluation](#5-evaluation)** — benchmarking with NeMo Evaluator across MMMU-Pro, GPQA Diamond, SciCode, and more, plus AA-Omniscience for knowledge recall and calibration
 6. **[vLLM Inference Benchmarking](#6-vllm-inference-benchmarking)** — throughput comparison against BF16 on GB200
 
-It closes with [potential further improvements](#potential-further-improvements): settings we did not test and their potential benefits. Experiments that did not become the recommended recipe — chat-format SFT data with assistant-only loss, self-distilled data, per-document attention, and the SciCode non-termination diagnosis — are in [ABLATIONS.md](ABLATIONS.md).
+It closes with [potential further improvements](#potential-further-improvements): settings we did not test and their potential benefits. Experiments that did not become the recommended recipe — chat-format SFT data with assistant-only loss, self-distilled data, and the SciCode non-termination diagnosis — are in [ABLATIONS.md](ABLATIONS.md).
 
 > [!NOTE]
 > This tutorial complements the [Nemotron-3-Nano-30B-A3B tutorial](../NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/README.md), which covers pruning + distillation + FP8 PTQ. Here the starting point is an unpruned model and the technique under test is **W4A4** — aggressive enough that PTQ alone leaves a measurable accuracy gap, which is exactly what QAD exists to close.
