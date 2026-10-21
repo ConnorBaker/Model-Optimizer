@@ -1,7 +1,7 @@
 :orphan:
 
-GLM-5.3-Flash at 2-3 Bits per Expert Weight: Two PTQ Recipes, and Where QAD Did Not Help
-########################################################################################
+GLM-5.3-Flash at 2-3 Bits per Expert Weight: IQ2_S PTQ Recipes and QAD
+######################################################################
 
 :Author: Model Optimizer Team
 :Date: October 21, 2026
@@ -10,9 +10,9 @@ GLM-5.3-Flash at 2-3 Bits per Expert Weight: Two PTQ Recipes, and Where QAD Did 
 GLM-5.3-Flash is a 321B-parameter MoE, and 304B of those parameters are its 288 routed experts. We
 quantized the routed experts to GGML IQ2_S (2.56 bits per weight) with layerwise GPTQ in
 Megatron-Bridge. We then tried Quantization-Aware Distillation (QAD) to recover what PTQ lost.
-QAD gave back part of the loss on reasoning benchmarks but none on knowledge recall or long
-context. A small recipe change recovered nearly all of it without any training: NVFP4 on the
-experts' down projections.
+QAD brought AA-LCR back to the FP8 score and cut runaway generations, closing over a third of the
+gap on the six-benchmark mean, but it did not restore knowledge recall. A small recipe change
+recovered nearly all of the gap without any training: NVFP4 on the experts' down projections.
 
 We publish both recipes as alternatives: **IQ2_S**, IQ2_S on every routed-expert weight, for the
 smallest model, and **IQ2_S + NVFP4**, with NVFP4 on the experts' down projections, for accuracy at
@@ -33,9 +33,11 @@ Highlights
 * **IQ2_S is 25 GB smaller** (2.56 bits per weight on every routed-expert weight) and costs 2.3
   points on the mean. Most of that loss is on SciCode and AA-LCR, where generations run 2-3x
   longer than FP8's and more often hit the token budget.
-* **QAD on IQ2_S recovered about a third of that gap and no more.** After 300 iterations it was 1.4
-  points below FP8. HLE and AA-Omniscience ended below the PTQ model QAD started from and
-  RULER-1M did not recover, so we stopped QAD and did not run it on IQ2_S + NVFP4.
+* **QAD fixes long-context runaways, but PTQ alone ends up better.** 300 QAD iterations on the
+  IQ2_S model took AA-LCR from 70.0 to 74.0 (FP8 74.9), cut its answers that hit the token budget
+  from 6.9% to 0.6%, and moved the mean from 2.3 to 1.4 points below FP8. Knowledge recall did not
+  recover, and IQ2_S + NVFP4 matches FP8 with no training, so we recommend the PTQ recipes and did
+  not run QAD on IQ2_S + NVFP4.
 * **The down projections carry most of the IQ2 error.** Moving only them to NVFP4 (+0.65 bits per
   weight on the experts) cut per-token NLL error against FP8 by ~40% and closed the accuracy gap.
 
@@ -199,10 +201,11 @@ each).
 
 **Both recipes lose ~2.2-2.6 points of AA-Omniscience accuracy and hallucinate 4-5 points more
 often.** This is the one place IQ2_S + NVFP4 does not reach FP8: NVFP4 on the down projections
-helps HLE (−1.0 vs −2.1) but barely moves AA-Omniscience. The hallucination rate is incorrect / (incorrect +
-abstained), so a rising rate means the model guesses where FP8 declined to answer.
+helps HLE (−1.0 vs −2.1) but barely moves AA-Omniscience. The hallucination rate is
+incorrect / (incorrect + abstained), so a rising rate means the model guesses where FP8 declined
+to answer.
 
-**QAD made recall worse, not better.** Against the IQ2_S model it started from, QAD 300 lost a
+**QAD did not recover recall.** Against the IQ2_S model it started from, QAD 300 lost a
 further 3.2 points on HLE (~2.3 standard errors) and traded abstentions for wrong answers on
 AA-Omniscience. It also did not recover RULER-1M. We saw the same calibration loss after QAD on
 Qwen3.6-35B-A3B.
@@ -216,6 +219,44 @@ QAD trained the IQ2_S model against the FP8 teacher on Nemotron-Cascade-2 chat-S
 blend re-tokenized for GLM. It packed conversation pairs into 32K sequences with loss on assistant
 tokens only, 3,840 conversations (~16.8M tokens) per step, top-4096 logit KL, and learning rate
 1e-5 → 1e-6 over a 500-iteration cosine schedule.
+
+**Where QAD helps.** It fixes the runaway generations that cost IQ2_S most of its long-context
+accuracy, and shortens answers elsewhere:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 20 20 20
+
+   * -
+     - IQ2_S
+     - IQ2_S + QAD 300
+     - FP8
+   * - AA-LCR
+     - 70.0 ± 1.9
+     - **74.0 ± 1.5**
+     - 74.9 ± 0.9
+   * - AA-LCR answers hitting the token budget
+     - 6.9%
+     - **0.6%**
+     - 0.6%
+   * - SciCode
+     - 47.2 ± 0.5
+     - **48.3 ± 0.8**
+     - 53.7 ± 1.0
+   * - SciCode sub-steps hitting the token budget
+     - 19.8%
+     - **13.9%**
+     - 2.2%
+   * - AA-Omniscience mean tokens per answer
+     - 17.7K
+     - **15.5K**
+     - 3.5K
+   * - Mean delta vs FP8, six benchmarks
+     - −2.3
+     - **−1.4**
+     - –
+
+**Where it falls short.** Most of the gain comes in the first 100 iterations:
 
 .. list-table::
    :header-rows: 1
@@ -243,11 +284,11 @@ tokens only, 3,840 conversations (~16.8M tokens) per step, top-4096 logit KL, an
      - 49.2
      - 54.3
 
-QAD stopped AA-LCR's runaway generations (6.9% → 0.6% capped) and recovered its score. After
-iteration 100 it gained little more: the mean moved by less than the ~0.5-point noise. With the
-decode-time penalty in place, every QAD checkpoint trails the PTQ model on SciCode. So the
-improvement QAD shows without the penalty mostly comes from fewer runaways, which the penalty
-already removes for free.
+After iteration 100 the mean moved by less than the ~0.5-point noise. With the decode-time
+penalty in place, every QAD checkpoint trails the PTQ model on SciCode, so on SciCode QAD's gain
+comes from fewer runaways, which the penalty also removes. Knowledge recall and RULER-1M did not
+recover (see above). On AA-LCR, where the penalty was not tested, QAD's recovery stands on its
+own.
 
 What It Costs
 *************
