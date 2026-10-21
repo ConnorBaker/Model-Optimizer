@@ -39,8 +39,8 @@ _LINEAR_SUFFIXES = ("weight_quantizer", "input_quantizer", "output_quantizer")
 _KV_SUFFIXES = ("q_bmm_quantizer", "k_bmm_quantizer", "v_bmm_quantizer")
 # Wildcards other than the layer index (experts) are enumerated over these representative values.
 _EXPERT_INDICES = (0, 1)
-# Only the language-model decoder's layer index is enumerated; other layer containers (vision
-# towers, MTP) are left to the original entries.
+# Only the language-model decoder's layer index is enumerated; modules indexed by another layer
+# container (vision towers, MTP layers) are left to the original entries.
 _DECODER_LAYERS = re.compile(r"^(?:language_model\.)?decoder\.layers\.\*")
 
 
@@ -70,9 +70,10 @@ def module_mappings_from_registry(registry: Any) -> list[ModuleMapping]:
     """Read the module-level mappings off a Megatron-Bridge ``MegatronMappingRegistry``.
 
     Only ``registry.mappings`` is read (each item's ``megatron_param`` and ``hf_param``), so any
-    object of that shape works. Mappings that are not module weights, or that do not sit in the
-    language-model decoder, are skipped. Each attention ``linear_qkv`` also yields its
-    ``core_attention``, which hosts the KV-cache quantizers of the transformers attention module.
+    object of that shape works. Mappings that are not module weights, or that are indexed by a
+    layer container other than the language-model decoder's (e.g. nested MTP layers), are skipped.
+    Each attention ``linear_qkv`` also yields its ``core_attention``, which hosts the KV-cache
+    quantizers of the transformers attention module.
     """
     mappings: dict[ModuleMapping, None] = {}
     for mapping in registry.mappings:

@@ -17,6 +17,7 @@ import pytest
 import yaml
 from _test_utils.torch.transformers_models import (
     create_tiny_nemotron_h_dir,
+    create_tiny_qwen3_5_moe_vl_dir,
     create_tiny_qwen3_moe_dir,
     create_tiny_qwen3vl_dir,
 )
@@ -135,6 +136,24 @@ def _projs(prefix, names):
             },
             id="nemotron_h",
         ),
+        # The rows tests/unit/torch/quantization/test_hf_to_megatron.py hand-writes for Qwen3.5-MoE.
+        pytest.param(
+            create_tiny_qwen3_5_moe_vl_dir,
+            {
+                "language_model.output_layer": ("lm_head",),
+                "language_model.decoder.layers.*.self_attention.in_proj": tuple(
+                    f"model.language_model.layers.*.linear_attn.in_proj_{p}"
+                    for p in ("qkv", "z", "b", "a")
+                ),
+                "language_model.decoder.layers.*.mlp.experts.linear_fc1": (
+                    "model.language_model.layers.*.mlp.experts.gate_up_proj",
+                ),
+                "language_model.decoder.layers.*.mlp.shared_experts.linear_fc1": _projs(
+                    "model.language_model.layers.*.mlp.shared_expert", ("gate", "up")
+                ),
+            },
+            id="qwen3_5_moe",
+        ),
     ],
 )
 def test_module_mappings_from_bridge(tmp_path, create_model, expected):
@@ -144,6 +163,8 @@ def test_module_mappings_from_bridge(tmp_path, create_model, expected):
     language model) and recipe translation rests on it, so a Megatron-Bridge change to these rows
     must fail here rather than leave a recipe's globs matching nothing.
     """
-    bridge = AutoBridge.from_hf_pretrained(str(create_model(tmp_path, with_tokenizer=False)))
-    mappings = {mapping.megatron: mapping.hf for mapping in module_mappings_from_bridge(bridge)}
-    assert expected.items() <= mappings.items()
+    bridge = AutoBridge.from_hf_pretrained(str(create_model(tmp_path)))
+    mappings = {
+        mapping.megatron: frozenset(mapping.hf) for mapping in module_mappings_from_bridge(bridge)
+    }
+    assert {module: frozenset(hf) for module, hf in expected.items()}.items() <= mappings.items()

@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 from torch import nn
 
+from modelopt.recipe import load_recipe
 from modelopt.torch.quantization.config import normalize_quant_cfg_list
 from modelopt.torch.quantization.conversion import set_quantizer_by_cfg
 from modelopt.torch.quantization.hf_to_megatron import (
@@ -89,6 +90,46 @@ FUSED_EXPERTS_REGISTRY = SimpleNamespace(
     ]
 )
 
+# The language-model rows of Megatron-Bridge's Qwen3.5-MoE registry: GatedDeltaNet and gated
+# attention layers with MoE MLPs, where Megatron fuses four transformers modules into ``in_proj``.
+_HF_LAYER = "model.language_model.layers.*"
+_MEGATRON_LAYER = "language_model.decoder.layers.*"
+QWEN3_5_MOE_REGISTRY = SimpleNamespace(
+    mappings=[
+        _mapping("language_model.output_layer.weight", "lm_head.weight"),
+        _mapping(f"{_MEGATRON_LAYER}.mlp.router.weight", f"{_HF_LAYER}.mlp.gate.weight"),
+        _mapping(
+            f"{_MEGATRON_LAYER}.self_attention.linear_proj.weight",
+            f"{_HF_LAYER}.self_attn.o_proj.weight",
+        ),
+        _mapping(
+            f"{_MEGATRON_LAYER}.self_attention.linear_qkv.weight",
+            {p: f"{_HF_LAYER}.self_attn.{p}_proj.weight" for p in "qkv"},
+        ),
+        _mapping(
+            f"{_MEGATRON_LAYER}.self_attention.in_proj.weight",
+            {p: f"{_HF_LAYER}.linear_attn.in_proj_{p}.weight" for p in ("qkv", "z", "b", "a")},
+        ),
+        _mapping(
+            f"{_MEGATRON_LAYER}.self_attention.out_proj.weight",
+            f"{_HF_LAYER}.linear_attn.out_proj.weight",
+        ),
+        _mapping(
+            f"{_MEGATRON_LAYER}.self_attention.conv1d.weight",
+            f"{_HF_LAYER}.linear_attn.conv1d.weight",
+        ),
+        _mapping(
+            f"{_MEGATRON_LAYER}.mlp.shared_experts.linear_fc1.weight",
+            {p: f"{_HF_LAYER}.mlp.shared_expert.{p}_proj.weight" for p in ("gate", "up")},
+        ),
+        _mapping(
+            f"{_MEGATRON_LAYER}.mlp.shared_experts.linear_fc2.weight",
+            f"{_HF_LAYER}.mlp.shared_expert.down_proj.weight",
+        ),
+        *FUSED_EXPERTS_REGISTRY.mappings,
+    ]
+)
+
 
 def _names(template, suffixes, layers=LAYERS):
     return {
@@ -114,8 +155,35 @@ ALL_NAMES = (
 )
 
 
-def _apply(cfg, mappings, names, layer_indices=LAYERS):
-    """Apply the translated cfg to a module tree holding one quantizer per name; return enabled."""
+# Qwen3.5-MoE as Megatron-Core builds it: three GatedDeltaNet layers, one gated-attention layer, a
+# MoE MLP in each, and an MTP layer.
+_GATED_DELTA_NET, _ATTENTION, _ALL_LAYERS = (0, 1, 2), (3,), (0, 1, 2, 3)
+_QWEN3_5_MOE_MODULES = {
+    "self_attention.in_proj": _GATED_DELTA_NET,
+    "self_attention.out_proj": _GATED_DELTA_NET,
+    "self_attention.conv1d": _GATED_DELTA_NET,
+    "self_attention.linear_qkv": _ATTENTION,
+    "self_attention.linear_proj": _ATTENTION,
+    "mlp.router": _ALL_LAYERS,
+    "mlp.experts.linear_fc1": _ALL_LAYERS,
+    "mlp.experts.linear_fc2": _ALL_LAYERS,
+    "mlp.shared_experts.linear_fc1": _ALL_LAYERS,
+    "mlp.shared_experts.linear_fc2": _ALL_LAYERS,
+}
+QWEN3_5_MOE_NAMES = (
+    _names("language_model.output_layer", LINEAR)
+    | _names("language_model.decoder.layers.{l}.self_attention.core_attention", KV, _ATTENTION)
+    | _names("language_model.mtp.layers.0.mtp_model_layer.mlp.experts.linear_fc1", LINEAR)
+    | {
+        name
+        for module, layers in _QWEN3_5_MOE_MODULES.items()
+        for name in _names(f"language_model.decoder.layers.{{l}}.{module}", LINEAR, layers)
+    }
+)
+
+
+def _formats(cfg, names):
+    """The format of every quantizer ``cfg`` enables on a module tree with one quantizer per name."""
     model = nn.Module()
     for name in names:
         *path, quantizer = name.split(".")
@@ -125,9 +193,18 @@ def _apply(cfg, mappings, names, layer_indices=LAYERS):
                 setattr(parent, part, nn.Module())
             parent = getattr(parent, part)
         setattr(parent, quantizer, TensorQuantizer())
+    set_quantizer_by_cfg(model, cfg)
+    return {
+        name: module.num_bits
+        for name, module in model.named_modules()
+        if isinstance(module, TensorQuantizer) and module.is_enabled
+    }
+
+
+def _apply(cfg, mappings, names, layer_indices=LAYERS):
+    """Translate ``cfg`` and return the names of the quantizers it enables."""
     translated = translate_quant_cfg_to_megatron([DISABLE_ALL, *cfg], mappings, layer_indices)
-    set_quantizer_by_cfg(model, translated)
-    return {n for n, m in model.named_modules() if isinstance(m, TensorQuantizer) and m.is_enabled}
+    return set(_formats(translated, names))
 
 
 def _entry(glob, **kwargs):
@@ -239,3 +316,60 @@ def test_module_mappings_skip_what_is_not_a_decoder_module_weight():
         )
         in MAPPINGS
     )
+
+
+# The W4A4 NVFP4 / FP8-attention Qwen3.6-MoE recipe written with transformers module names only.
+# Megatron fuses the four GatedDeltaNet ``in_proj_*`` modules, so it treats them alike.
+QWEN3_6_MOE_TRANSFORMERS_RECIPE = """\
+# modelopt-schema: modelopt.recipe.config.ModelOptPTQRecipe
+imports:
+  base_disable_all: configs/ptq/units/base_disable_all
+  fp8: configs/numerics/fp8
+  kv_fp8_cast: configs/ptq/units/kv_fp8_cast
+  nvfp4: configs/numerics/nvfp4
+metadata:
+  description: Qwen3.6-MoE W4A4 NVFP4 with FP8 attention, written with transformers module names.
+quantize:
+  algorithm: max
+  quant_cfg:
+    - $import: base_disable_all
+    - {quantizer_name: '*mlp.experts*weight_quantizer', cfg: {$import: nvfp4}}
+    - {quantizer_name: '*mlp.experts*input_quantizer', cfg: {$import: nvfp4}}
+    - {quantizer_name: '*mlp.shared_expert.*weight_quantizer', cfg: {$import: nvfp4}}
+    - {quantizer_name: '*mlp.shared_expert.*input_quantizer', cfg: {$import: nvfp4}}
+    - {quantizer_name: '*self_attn*weight_quantizer', cfg: {$import: fp8}}
+    - {quantizer_name: '*self_attn*input_quantizer', cfg: {$import: fp8}}
+    - {quantizer_name: '*linear_attn.in_proj*weight_quantizer', cfg: {$import: fp8}}
+    - {quantizer_name: '*linear_attn.in_proj*input_quantizer', cfg: {$import: fp8}}
+    - {quantizer_name: '*linear_attn.out_proj*weight_quantizer', cfg: {$import: fp8}}
+    - {quantizer_name: '*linear_attn.out_proj*input_quantizer', cfg: {$import: fp8}}
+    - $import: kv_fp8_cast
+    - {quantizer_name: '*lm_head*', enable: false}
+    - {quantizer_name: '*mlp.gate.*', enable: false}
+    - {quantizer_name: '*mlp.shared_expert_gate.*', enable: false}
+    - {quantizer_name: '*linear_attn.conv1d*', enable: false}
+    - {quantizer_name: '*mtp*', enable: false}
+    - {quantizer_name: '*lm_head.weight_quantizer', cfg: {$import: nvfp4}}
+    - {quantizer_name: '*lm_head.input_quantizer', cfg: {$import: nvfp4}}
+"""
+
+
+def test_transformers_form_of_the_mcore_recipe_quantizes_the_same_modules(tmp_path):
+    native = load_recipe("model_type/qwen3_6_moe/ptq/w4a4_nvfp4-fp8_attn-kv_fp8_cast_mcore")
+    recipe_path = tmp_path / "w4a4_nvfp4-fp8_attn-kv_fp8_cast.yaml"
+    recipe_path.write_text(QWEN3_6_MOE_TRANSFORMERS_RECIPE)
+    translated = translate_quant_cfg_to_megatron(
+        load_recipe(recipe_path).quantize.quant_cfg,
+        module_mappings_from_registry(QWEN3_5_MOE_REGISTRY),
+        layer_indices=range(4),
+    )
+
+    expected = _formats(native.quantize.quant_cfg, QWEN3_5_MOE_NAMES)
+    assert _formats(translated, QWEN3_5_MOE_NAMES) == expected
+
+    # The comparison is not vacuous: NVFP4 on experts and the output layer, FP8 on both attentions.
+    nvfp4, fp8, layer = (2, 1), (4, 3), "language_model.decoder.layers"
+    assert expected["language_model.output_layer.weight_quantizer"] == nvfp4
+    assert expected[f"{layer}.3.mlp.experts.linear_fc1.weight_quantizer"] == nvfp4
+    assert expected[f"{layer}.0.self_attention.in_proj.weight_quantizer"] == fp8
+    assert expected[f"{layer}.3.self_attention.linear_qkv.weight_quantizer"] == fp8
