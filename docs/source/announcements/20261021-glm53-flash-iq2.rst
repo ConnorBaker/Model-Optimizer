@@ -27,13 +27,13 @@ the level of the FP8 checkpoint.
 Highlights
 **********
 
-* **IQ2_S + NVFP4 matches FP8 with no training.** Over six benchmarks its mean is 0.05 points
-  below FP8, and no benchmark is measurably below it. Its routed experts use 3.21 bits per weight:
-  IQ2_S for gate and up, weight-only NVFP4 for down.
-* **IQ2_S is 25 GB smaller** (2.56 bits per weight on every routed-expert weight) and costs 2.25
+* **IQ2_S + NVFP4 matches FP8 with no training.** Over six benchmarks its mean is within 0.1
+  points of FP8, and no benchmark is measurably below it. Its routed experts use 3.21 bits per
+  weight: IQ2_S for gate and up, weight-only NVFP4 for down.
+* **IQ2_S is 25 GB smaller** (2.56 bits per weight on every routed-expert weight) and costs 2.3
   points on the mean. Most of that loss is on SciCode and AA-LCR, where generations run 2-3x
   longer than FP8's and more often hit the token budget.
-* **QAD on IQ2_S recovered about a third of that gap and no more.** After 300 iterations it was 1.44
+* **QAD on IQ2_S recovered about a third of that gap and no more.** After 300 iterations it was 1.4
   points below FP8. HLE and AA-Omniscience ended below the PTQ model QAD started from and
   RULER-1M did not recover, so we stopped QAD and did not run it on IQ2_S + NVFP4.
 * **The down projections carry most of the IQ2 error.** Moving only them to NVFP4 (+0.65 bits per
@@ -64,8 +64,8 @@ The Two Recipes
      - ~155 GB (2.1x smaller)
    * - Mean delta vs FP8, six benchmarks
      - –
-     - −2.25
-     - **−0.05**
+     - −2.3
+     - **−0.1**
    * - Weight formats
      - FP8
      - GGML only (IQ2_S, Q8_0)
@@ -96,8 +96,8 @@ IQ2_S + NVFP4 (no QAD) and the dotted line is IQ2_S. Bars are ±1 sem.
 ``mean ± sem`` across repeats (GPQA-D: one run of 16 repeats); the run count is in brackets. All
 evaluations use a 131K-token generation budget and a BF16 KV cache, served by vLLM 0.31 with
 prefix caching on. vLLM 0.31 fixes a GLM-5.3-Flash prefix-caching bug that lowers long-context
-scores on earlier versions; with caching off, FP8 AA-LCR moves by 1.2 points (76.12 ± 0.83 vs
-74.88 ± 0.87, 8 runs each), within noise.
+scores on earlier versions; with caching off, FP8 AA-LCR moves by 1.2 points (76.1 ± 0.8 vs
+74.9 ± 0.9, 8 runs each), within noise.
 
 .. list-table::
    :header-rows: 1
@@ -109,45 +109,45 @@ scores on earlier versions; with caching off, FP8 AA-LCR moves by 1.2 points (76
      - **IQ2_S + NVFP4**
      - IQ2_S + QAD 300
    * - AA-LCR (8)
-     - 74.88 ± 0.87
-     - 70.00 ± 1.89
-     - **73.62 ± 0.75**
-     - 74.00 ± 1.48
+     - 74.9 ± 0.9
+     - 70.0 ± 1.9
+     - **73.6 ± 0.8**
+     - 74.0 ± 1.5
    * - GPQA-D (16 repeats)
-     - 91.16
-     - 90.15
-     - **90.34**
-     - 89.96
+     - 91.2
+     - 90.2
+     - **90.3**
+     - 90.0
    * - IFBench (8)
-     - 61.61 ± 0.28
-     - 62.34 ± 0.38
-     - **64.53 ± 0.34**
-     - 62.40 ± 0.45
+     - 61.6 ± 0.3
+     - 62.3 ± 0.4
+     - **64.5 ± 0.3**
+     - 62.4 ± 0.5
    * - MMMU-Pro (8)
-     - 76.66 ± 0.14
-     - 75.20 ± 0.23
-     - **76.37 ± 0.17**
-     - 75.00 ± 0.18
+     - 76.7 ± 0.1
+     - 75.2 ± 0.2
+     - **76.4 ± 0.2**
+     - 75.0 ± 0.2
    * - SciCode (8)
-     - 53.70 ± 0.95
-     - 47.19 ± 0.49
-     - **53.07 ± 0.74**
-     - 48.34 ± 0.80
+     - 53.7 ± 1.0
+     - 47.2 ± 0.5
+     - **53.1 ± 0.7**
+     - 48.3 ± 0.8
    * - tau2-bench Telecom (3)
-     - 98.61 ± 0.04
-     - 98.21 ± 0.10
-     - **98.36 ± 0.33**
-     - 98.25 ± 0.29
+     - 98.6 ± <0.1
+     - 98.2 ± 0.1
+     - **98.4 ± 0.3**
+     - 98.3 ± 0.3
    * - **Mean delta vs FP8**
      - –
-     - −2.25
-     - **−0.05**
-     - −1.44
+     - −2.3
+     - **−0.1**
+     - −1.4
    * - SciCode, ``presence_penalty`` 1.5 (8)
-     - 54.33 ± 0.81
-     - 51.59 ± 0.81
-     - **54.18 ± 0.74**
-     - 49.15 ± 0.50
+     - 54.3 ± 0.8
+     - 51.6 ± 0.8
+     - **54.2 ± 0.7**
+     - 49.2 ± 0.5
    * - SciCode sub-steps hitting the token budget
      - 2.2%
      - 19.8%
@@ -177,15 +177,15 @@ each).
      - IQ2_S + NVFP4
      - IQ2_S + QAD 300
    * - HLE accuracy
-     - 33.50
-     - 31.37
-     - 32.53
-     - 28.13
+     - 33.5
+     - 31.4
+     - 32.5
+     - 28.1
    * - AA-Omniscience accuracy
-     - 31.78
-     - 29.18
-     - 29.60
-     - 28.53
+     - 31.8
+     - 29.2
+     - 29.6
+     - 28.5
    * - AA-Omniscience hallucination rate
      - 27.7%
      - 32.9%
@@ -229,19 +229,19 @@ tokens only, 3,840 conversations (~16.8M tokens) per step, top-4096 logit KL, an
      - QAD 300
      - FP8
    * - Mean delta vs FP8
-     - −2.25
-     - −2.56
-     - −1.76
-     - −1.91
-     - −1.44
+     - −2.3
+     - −2.6
+     - −1.8
+     - −1.9
+     - −1.4
      - –
    * - SciCode, ``presence_penalty`` 1.5
-     - 51.59
-     - 50.44
-     - 50.67
-     - 49.56
-     - 49.15
-     - 54.33
+     - 51.6
+     - 50.4
+     - 50.7
+     - 49.6
+     - 49.2
+     - 54.3
 
 QAD stopped AA-LCR's runaway generations (6.9% → 0.6% capped) and recovered its score. After
 iteration 100 it gained little more: the mean moved by less than the ~0.5-point noise. With the
