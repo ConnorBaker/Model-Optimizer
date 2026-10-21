@@ -91,16 +91,24 @@ def test_quantize_and_export(
     quantize_parallelism,
     export_parallelism,
     quantized_weight,
+    fake_hub_checkpoint,
 ):
-    """Quantize a tiny model via a YAML recipe and export it to a unified HF checkpoint."""
+    """Quantize a tiny model via a YAML recipe and export it to a unified HF checkpoint.
+
+    The model is passed as a Hub ID (see ``fake_hub_checkpoint``): both steps load and export from
+    its local copy, and the Megatron checkpoint records the Hub ID as its tokenizer.
+    """
     hf_model_path = create_model(tmp_path, with_tokenizer=True, **model_kwargs)
+    model_arg = fake_hub_checkpoint.serve(
+        hf_model_path, "quantize.py", "export_quantized_megatron_to_hf.py", nproc=num_gpus
+    )
     megatron_path = tmp_path / "quantized_megatron"
     hf_export_path = tmp_path / "quantized_hf"
 
     # Step 1: quantize and save a Megatron checkpoint
     quantize_cmd = extend_cmd_parts(
         ["torchrun", f"--nproc_per_node={num_gpus}", "quantize.py", "--skip_generate"],
-        hf_model_name_or_path=hf_model_path,
+        hf_model_name_or_path=model_arg,
         recipe=recipe,
         **{quantize_parallelism: num_gpus},
         calib_dataset_name="cnn_dailymail",
@@ -112,11 +120,16 @@ def test_quantize_and_export(
     run_example_command(quantize_cmd, example_path="megatron_bridge", setup_free_port=True)
     assert (megatron_path / "latest_checkpointed_iteration.txt").exists()
     assert_has_modelopt_state(megatron_path)
+    if fake_hub_checkpoint.active:
+        assert (
+            fake_hub_checkpoint.saved_tokenizer_model(megatron_path)
+            == fake_hub_checkpoint.hub_model_id
+        )
 
     # Step 2: export to HF
     export_cmd = extend_cmd_parts(
         ["torchrun", f"--nproc_per_node={num_gpus}", "export_quantized_megatron_to_hf.py"],
-        hf_model_name_or_path=hf_model_path,
+        hf_model_name_or_path=model_arg,
         megatron_path=megatron_path,
         export_unified_hf_path=hf_export_path,
         **{export_parallelism: num_gpus},
@@ -130,6 +143,8 @@ def test_quantize_and_export(
         assert any(key.endswith(f"{quantized_weight}.weight_scale") for key in exported), (
             f"{quantized_weight} was exported unquantized"
         )
+    if fake_hub_checkpoint.active:
+        assert (hf_export_path / fake_hub_checkpoint.marker).exists()
 
     # The exported unified checkpoint should be loadable and runnable by vLLM. The deployment check below
     # is disabled because it takes too long in CI (likely because of first run)
