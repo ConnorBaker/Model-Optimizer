@@ -509,7 +509,13 @@ def export_sparse_attention_config(
                 tsf["coefficients"] = phases.get("prefill") or next(iter(phases.values()))
             ratio = skip_group.get("target_sparsity")
             if isinstance(ratio, dict):
-                skip_group["target_sparsity"] = ratio.get("prefill", next(iter(ratio.values())))
+                scalar = (
+                    ratio["prefill"] if "prefill" in ratio else next(iter(ratio.values()), None)
+                )
+                if scalar is None:
+                    del skip_group["target_sparsity"]  # VisualGen needs a scalar
+                else:
+                    skip_group["target_sparsity"] = scalar
         config_groups[f"group_{group_idx}"] = skip_group
         group_idx += 1
 
