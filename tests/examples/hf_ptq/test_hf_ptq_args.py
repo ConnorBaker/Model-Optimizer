@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 from modelopt.recipe import load_recipe
 from modelopt.recipe.config import AutoQuantizeConfig, AutoQuantizeConstraints
@@ -58,6 +59,16 @@ def test_autoquant_recipe_builds_mtq_inputs(monkeypatch):
     assert inputs["method"] == "gradient"
     assert inputs["score_boundary"] is None
     assert inputs["score_size"] == 128
+    assert inputs["kl_log_prob_fallback"] is None
+    assert inputs["num_candidates"] == 1
+    assert inputs["candidate_pool_size"] is None
+    assert inputs["candidate_min_hamming_distance"] == 1
+    assert inputs["candidate_diversity_group_patterns"] is None
+    assert inputs["candidate_max_objective_regret"] is None
+    assert inputs["candidate_pool_selection"] == "objective"
+    assert inputs["candidate_distance_fallback"] == "none"
+    assert inputs["candidate_selection_size"] == 0
+    assert inputs["candidate_selection_metric"] == "kl_div"
     assert inputs["fixed_quantization_config"] is None
     assert inputs["module_search_spaces"] == []
     # disabled_layers come straight from the recipe (no model introspection).
@@ -148,6 +159,119 @@ def test_autoquant_warns_on_custom_candidate(monkeypatch):
     )
     with pytest.warns(UserWarning, match="export compatibility cannot be verified"):
         hf_ptq._mtq_inputs_from_auto_quantize_config(aq, args)
+
+
+def test_autoquant_two_stage_hidden_recon_maps_to_mtq_inputs(monkeypatch):
+    hf_ptq, args = _parse_hf_ptq_args(
+        monkeypatch, "--pyt_ckpt_path", "dummy", "--kv_cache_qformat", "none"
+    )
+    aq = AutoQuantizeConfig(
+        constraints=AutoQuantizeConstraints(effective_bits=5.5),
+        candidate_formats=[QuantizeConfig(**QUANT_CFG_CHOICES["fp8"])],
+        auto_quantize_method="hidden_recon",
+        num_candidates=20,
+        candidate_selection_size=512,
+    )
+
+    inputs = hf_ptq._mtq_inputs_from_auto_quantize_config(aq, args)
+
+    assert inputs["method"] == "hidden_recon"
+    assert inputs["num_candidates"] == 20
+    assert inputs["candidate_selection_size"] == 512
+
+
+def test_autoquant_candidate_selection_split_is_disjoint(monkeypatch):
+    hf_ptq = _import_hf_ptq(monkeypatch)
+    source = torch.utils.data.DataLoader(list(range(10)), batch_size=2, shuffle=False)
+
+    first_stage, held_out = hf_ptq._split_dataloader_for_candidate_selection(source, 6, 4)
+
+    assert torch.cat(list(first_stage)).tolist() == list(range(6))
+    assert torch.cat(list(held_out)).tolist() == list(range(6, 10))
+    assert set(first_stage.dataset.indices).isdisjoint(held_out.dataset.indices)
+
+
+def test_skip_export_flag_is_opt_in(monkeypatch):
+    _, default_args = _parse_hf_ptq_args(monkeypatch, "--pyt_ckpt_path", "dummy")
+    _, skip_args = _parse_hf_ptq_args(
+        monkeypatch,
+        "--pyt_ckpt_path",
+        "dummy",
+        "--skip_export",
+    )
+
+    assert default_args.skip_export is False
+    assert skip_args.skip_export is True
+
+
+@pytest.mark.parametrize(
+    ("num_candidates", "selection_size", "error"),
+    [
+        (0, 0, "num_candidates must be positive"),
+        (2, 0, "candidate_selection_size must be positive"),
+        (1, 1, "requires num_candidates greater than 1"),
+    ],
+)
+def test_autoquant_two_stage_config_validation(num_candidates, selection_size, error):
+    with pytest.raises(ValueError, match=error):
+        AutoQuantizeConfig(
+            constraints=AutoQuantizeConstraints(effective_bits=5.5),
+            candidate_formats=[QuantizeConfig(**QUANT_CFG_CHOICES["fp8"])],
+            num_candidates=num_candidates,
+            candidate_selection_size=selection_size,
+        )
+
+
+def test_autoquant_diverse_candidate_pool_maps_to_mtq_inputs(monkeypatch):
+    hf_ptq, args = _parse_hf_ptq_args(
+        monkeypatch, "--pyt_ckpt_path", "dummy", "--kv_cache_qformat", "none"
+    )
+    aq = AutoQuantizeConfig(
+        constraints=AutoQuantizeConstraints(effective_bits=5.5),
+        candidate_formats=[QuantizeConfig(**QUANT_CFG_CHOICES["fp8"])],
+        num_candidates=10,
+        candidate_pool_size=40,
+        candidate_min_hamming_distance=8,
+        candidate_diversity_group_patterns=["*self_attn*", "*linear_attn*"],
+        candidate_max_objective_regret=0.05,
+        candidate_pool_selection="farthest",
+        candidate_distance_fallback="relax",
+        candidate_selection_size=512,
+        candidate_selection_metric="ear",
+    )
+
+    inputs = hf_ptq._mtq_inputs_from_auto_quantize_config(aq, args)
+
+    assert inputs["candidate_pool_size"] == 40
+    assert inputs["candidate_min_hamming_distance"] == 8
+    assert inputs["candidate_diversity_group_patterns"] == [
+        "*self_attn*",
+        "*linear_attn*",
+    ]
+    assert inputs["candidate_max_objective_regret"] == pytest.approx(0.05)
+    assert inputs["candidate_pool_selection"] == "farthest"
+    assert inputs["candidate_distance_fallback"] == "relax"
+    assert inputs["candidate_selection_metric"] == "ear"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"candidate_pool_size": 9}, "candidate_pool_size must be at least"),
+        ({"candidate_min_hamming_distance": 0}, "candidate_min_hamming_distance must be positive"),
+        ({"candidate_max_objective_regret": -0.01}, "candidate_max_objective_regret cannot"),
+        ({"candidate_diversity_group_patterns": []}, "cannot be empty"),
+    ],
+)
+def test_autoquant_diverse_candidate_pool_validation(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        AutoQuantizeConfig(
+            constraints=AutoQuantizeConstraints(effective_bits=5.5),
+            candidate_formats=[QuantizeConfig(**QUANT_CFG_CHOICES["fp8"])],
+            num_candidates=10,
+            candidate_selection_size=512,
+            **overrides,
+        )
 
 
 def test_autoquant_export_guard_not_bypassed_by_effective_bits(monkeypatch):

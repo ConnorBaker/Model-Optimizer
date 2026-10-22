@@ -38,6 +38,7 @@ from modelopt.torch.utils import atomic_print
 
 from .algorithms import (
     AutoQuantizeGradientSearcher,
+    AutoQuantizeHiddenReconSearcher,
     AutoQuantizeKLDivSearcher,
     QuantRecipe,
     _resolve_auto_quantize_score_boundary,
@@ -288,17 +289,33 @@ def auto_quantize(
     module_search_spaces: list[dict[str, Any]] | None = None,
     fixed_quantization_config: dict[str, Any] | str | None = None,
     score_boundary: str | None = None,
+    kl_log_prob_fallback: float | None = None,
+    num_candidates: int = 1,
+    candidate_pool_size: int | None = None,
+    candidate_min_hamming_distance: int = 1,
+    candidate_diversity_group_patterns: list[str] | str | None = None,
+    candidate_max_objective_regret: float | None = None,
+    candidate_pool_selection: str = "objective",
+    candidate_distance_fallback: str = "none",
+    candidate_selection_data_loader: Iterable | None = None,
+    candidate_selection_forward_step: Callable[[nn.Module, Any], torch.Tensor] | None = None,
+    candidate_selection_metric: str = "kl_div",
+    num_candidate_selection_steps: int = 128,
 ):
     r"""Perform optimal per-layer quantization by searching for the best quantization formats per-layer.
 
     ``auto_quantize`` uses sensitivity scores to rank the per-layer quantization formats and search
-    for the best quantization formats per-layer. The sensitivity score can be computed using gradient-based
-    methods (default) or KL divergence loss, controlled by the ``method`` parameter.
+    for the best quantization formats per-layer. The sensitivity score can be computed using
+    gradient-based methods (default), direct hidden-output reconstruction error, or KL divergence
+    loss, controlled by the ``method`` parameter.
 
-    Internally this API runs two main phases:
+    Internally this API runs two main phases, with an optional third phase:
 
     #. Calibrate the quantized model exactly like :func:`quantize` would.
-    #. Estimate per-layer sensitivity scores to decide which format to keep.
+    #. Estimate per-layer sensitivity scores and solve for one or more complete recipes.
+    #. When ``num_candidates > 1``, evaluate every complete recipe by KL divergence and
+       expected acceptance rate on a distinct held-out loader, then select by the configured
+       fidelity metric.
 
     The sensitivity scoring phase typically dominates the runtime of ``auto_quantize``, so decreasing the number of
     samples used for scoring (see ``num_score_steps``) is the recommended way for improving overall auto_quantize time
@@ -442,10 +459,28 @@ def auto_quantize(
         num_score_steps: Number of batches to use for estimating ``auto_quantize`` scores. Suggested value is 128.
             A higher value could increase the time taken for performing ``auto_quantize``; reducing it speeds up the
             sensitivity score estimation phase and typically affects accuracy less than lowering ``num_calib_steps``.
+        num_candidates: Number of feasible, first-stage recipes to generate. The default of 1
+            preserves the established one-stage behavior. Values greater than 1 enable held-out
+            fidelity selection. Gradient and hidden-reconstruction methods use additive LP
+            enumeration with no-good cuts. The KL method preserves its established
+            minimax-threshold recipe at rank 0 and enumerates additional threshold-induced
+            recipes, using additive LP solutions as a secondary pool when needed.
+        candidate_selection_data_loader: Held-out batches for second-stage candidate selection.
+            Required when ``num_candidates > 1``. It must be a distinct loader containing samples
+            disjoint from those in ``data_loader``.
+        candidate_selection_forward_step: Callable that returns model logits for a held-out batch.
+            Required when ``num_candidates > 1``.
+        candidate_selection_metric: Metric used to select the held-out winner: ``"kl_div"``
+            minimizes full-vocabulary forward KL divergence (default), while ``"ear"`` maximizes
+            exact full-vocabulary expected acceptance rate. Both metrics are recorded for every
+            evaluated candidate regardless of the selection metric.
+        num_candidate_selection_steps: Maximum held-out batches used to evaluate every candidate.
         verbose: If True, prints the search progress/intermediate results.
         method: Method to use for estimating sensitivity loss. Higher loss indicates greater sensitivity
             to quantization. Options are ``"gradient"`` (default; uses gradient-based loss estimation,
-            linear programming search, and requires ``loss_func`` or ``forward_backward_step``) and
+            linear programming search, and requires ``loss_func`` or ``forward_backward_step``),
+            ``"hidden_recon"`` (uses normalized quantized-versus-reference hidden-output
+            reconstruction error at the target score boundary, without a backward pass), and
             ``"kl_div"`` (uses KL divergence between unquantized and quantized outputs, relies on
             threshold-based binary search, and only requires ``forward_step`` returning logits).
         score_boundary: Boundary used to measure perturbations. ``"local"``
@@ -456,8 +491,13 @@ def auto_quantize(
             parent MLP/mixer score boundary in either mode. This does not group recipe decisions
             or force attention modules to use the same quantization format. Parent replay rejects
             explicit mutable cache inputs; omit past/cache state from ``forward_step``. Defaults
-            to ``"group"`` for ``method="gradient"`` and ``"local"`` for
+            to ``"group"`` for ``method="gradient"`` and ``method="hidden_recon"``, and ``"local"`` for
             ``method="kl_div"``.
+        kl_log_prob_fallback: Optional finite negative log-probability used only when
+            ``method="kl_div"`` encounters a non-finite candidate log-probability during
+            first-stage scoring. ``None`` preserves exact KL behavior. This is intended as
+            an explicitly recorded recovery mechanism for numerically unstable forwards;
+            finite candidate log-probabilities are never clipped.
         checkpoint: (Optional) Path to checkpoint file for saving/restoring auto_quantize search state.
             If the checkpoint file exists, the search state will be restored from it, skipping the
             expensive score estimation step.
@@ -475,6 +515,19 @@ def auto_quantize(
             active while searched modules are scored, is calibrated only with its own algorithm,
             and remains part of the effective-bits numerator and denominator. This is one
             integrated AutoQuantize operation, not staged PTQ followed by AutoQuantize.
+        num_candidates: Number of complete recipes evaluated with held-out fidelity metrics.
+        candidate_pool_size: Number of feasible recipes enumerated before selecting
+            ``num_candidates`` for held-out evaluation. Defaults to ``num_candidates``.
+        candidate_min_hamming_distance: Minimum number of differing runtime-grouped decisions
+            between enumerated recipes. One preserves historical exact no-good enumeration.
+        candidate_diversity_group_patterns: Optional glob patterns selecting the decision groups
+            counted by Hamming distance. Defaults to all runtime-grouped decisions.
+        candidate_max_objective_regret: Optional maximum relative first-stage-score regret versus
+            rank zero.
+        candidate_pool_selection: ``"objective"`` or deterministic greedy ``"farthest"``.
+        candidate_distance_fallback: ``"none"`` returns a partial pool when the requested
+            distance is infeasible; ``"relax"`` fills from exact no-good alternatives and records
+            the fallback.
 
     Returns: A tuple (model, state_dict) where ``model`` is the searched and quantized model and
         ``state_dict`` contains the history and detailed stats of the search procedure.
@@ -639,6 +692,8 @@ def auto_quantize(
     # Select the appropriate searcher based on method
     if method == "gradient":
         searcher = AutoQuantizeGradientSearcher()
+    elif method == "hidden_recon":
+        searcher = AutoQuantizeHiddenReconSearcher()
     else:
         assert method == "kl_div"
         searcher = AutoQuantizeKLDivSearcher()
@@ -658,7 +713,19 @@ def auto_quantize(
         "forward_backward_step": forward_backward_step,
         "num_calib_steps": num_calib_steps,
         "num_score_steps": num_score_steps,
+        "num_candidates": num_candidates,
+        "candidate_pool_size": candidate_pool_size,
+        "candidate_min_hamming_distance": candidate_min_hamming_distance,
+        "candidate_diversity_group_patterns": candidate_diversity_group_patterns,
+        "candidate_max_objective_regret": candidate_max_objective_regret,
+        "candidate_pool_selection": candidate_pool_selection,
+        "candidate_distance_fallback": candidate_distance_fallback,
+        "candidate_selection_data_loader": candidate_selection_data_loader,
+        "candidate_selection_forward_step": candidate_selection_forward_step,
+        "candidate_selection_metric": candidate_selection_metric,
+        "num_candidate_selection_steps": num_candidate_selection_steps,
         "score_boundary": score_boundary,
+        "kl_log_prob_fallback": kl_log_prob_fallback,
         "disabled_layers": disabled_layers,
         "verbose": verbose,
         "checkpoint": checkpoint,

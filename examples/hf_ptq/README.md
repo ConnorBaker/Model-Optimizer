@@ -385,11 +385,14 @@ scripts/huggingface_example.sh --model $HF_PATH --recipe general/auto_quantize/n
 The recipe quantizes the less accuracy-sensitive layers with the more aggressive format (e.g. NVFP4) and
 keeps the more sensitive ones at higher precision (or unquantized), so the model meets the recipe's
 `effective_bits` target. To author your own, copy a shipped recipe and adjust `candidate_formats`,
-`constraints.effective_bits`, `auto_quantize_method` (`gradient` / `kl_div`), `score_size`,
+`constraints.effective_bits`, `auto_quantize_method` (`gradient` / `hidden_recon` / `kl_div`),
+`score_size`, `kl_log_prob_fallback`, `num_candidates`, `candidate_pool_size`,
+`candidate_min_hamming_distance`,
+`candidate_max_objective_regret`, `candidate_pool_selection`, `candidate_selection_size`,
 `module_search_spaces` (optional per-module candidate overrides), `disabled_layers` (excluded from
 the search), and `cost_excluded_layers` (kept out of the bit-budget accounting — e.g. VL vision
-towers), and `score_boundary` (`local` / `group`). Group scoring is the default for gradient; it
-changes the measurement boundary but does not force attention projections to share one recipe
+towers), and `score_boundary` (`local` / `group`). Group scoring is the default for gradient and
+`hidden_recon`; it changes the measurement boundary but does not force attention projections to share one recipe
 decision. Set `score_boundary: local` in the recipe to restore leaf-output attention scoring;
 expert projections retain their established parent MLP/mixer scoring boundary. Attention parent
 names ending in `attn` or `attention` are recognized across fused and split projection layouts.
@@ -398,6 +401,37 @@ of the uncalled container. Group scoring rejects explicit past/cache/recurrent-s
 replaying mutable state would compare candidates at different sequence positions. Recipes can splice
 a shared base `disabled_layers` set via `$import` (see
 `modelopt_recipes/configs/auto_quantize/units/base_disabled_layers`).
+
+Set `num_candidates` above 1 to enable two-stage selection. It controls how many complete recipes
+receive held-out KL evaluation. `candidate_pool_size` can independently request a larger first-stage
+pool; it defaults to `num_candidates`. The first-stage and held-out samples are disjoint.
+
+By default, candidates remain objective-ranked and the exact no-good cut requires only one changed
+runtime-grouped decision, preserving historical behavior. Set `candidate_min_hamming_distance` above
+1 to require pairwise format-placement diversity. Optional `candidate_diversity_group_patterns`
+restrict which grouped decisions count toward distance, while
+`candidate_max_objective_regret: 0.05` keeps every alternative within 5% of rank 0.
+`candidate_pool_selection: farthest` always retains rank 0, then deterministically selects the recipe
+maximizing its minimum Hamming distance to those already selected. If a requested distance cannot
+fill the pool, `candidate_distance_fallback: none` returns a reported partial pool; `relax` fills from
+exact no-good alternatives and records the relaxation in candidate-selection provenance.
+
+Gradient and `hidden_recon` scoring enumerate additive-objective LP solutions. KL scoring keeps the
+established minimax-threshold recipe at rank 0, then enumerates additional feasible
+threshold-induced recipes (with additive LP solutions as a secondary pool when needed). The
+`kl_log_prob_fallback` default is `null`, which preserves exact forward KL. A finite negative value
+is an opt-in recovery penalty used only when a candidate forward produces a non-finite
+log-probability; finite candidate terms are not clipped. Record this setting with experimental
+provenance whenever it is enabled.
+The
+`hidden_recon` scorer measures normalized squared
+error between the unquantized and quantized hidden outputs at the selected score boundary and does
+not require labels or a backward pass. It adapts
+[UniQL's layer input/output-change idea](https://github.com/enyac-group/UniQL/blob/da457914ceddb52bb83067d85bf8798c443f6c77/compress/get_layer_ratio.py#L66)
+into a recipe-specific score: instead of assigning one input/output cosine ratio to a layer, it
+measures the output perturbation caused by each candidate quantization recipe. The defaults
+`num_candidates: 1`, `candidate_pool_size: null`, and `candidate_min_hamming_distance: 1` preserve
+the established one-stage and exact no-good behavior.
 
 AutoQuantize recipes support two mutually exclusive search-space styles:
 
@@ -462,8 +496,8 @@ The example scripts above also have an additional flag `--tasks`, where the actu
 > *If GPU out-of-memory error is reported running the scripts, please try editing the scripts and reducing the max batch size to save GPU memory.*
 
 > *NOTE: AutoQuantize requires backpropagation of the model. Models without backpropagation support
-> (e.g., Llama-4) will not work with AutoQuantize when using the `gradient` method. The `kl_div`
-> method does not require backpropagation.*
+> (e.g., Llama-4) will not work with AutoQuantize when using the `gradient` method. The
+> `hidden_recon` and `kl_div` methods do not require backpropagation.*
 
 ## Real Quant
 

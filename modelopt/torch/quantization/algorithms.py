@@ -19,6 +19,7 @@ import copy
 import fnmatch
 import gc
 import inspect
+import math
 import types
 import warnings
 from abc import ABC, abstractmethod
@@ -30,7 +31,6 @@ from typing import Any
 import regex as re
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from tqdm import tqdm
 
 from modelopt.torch.opt.conversion import ModeloptStateManager
@@ -533,6 +533,15 @@ class QuantRecipeHparam(Hparam):
                 continue
 
             parallel_state = getattr(score_module, "parallel_state", None)
+            if parallel_state is None:
+                parallel_state = next(
+                    (
+                        module.parallel_state
+                        for module in self.quant_modules
+                        if getattr(module, "parallel_state", None) is not None
+                    ),
+                    None,
+                )
 
             if parallel_state is None:
                 total_score += importance.cpu().item()
@@ -633,8 +642,10 @@ AUTO_QUANTIZE_SCORE_BOUNDARIES = frozenset(
 
 
 def _resolve_auto_quantize_score_boundary(method: str, score_boundary: str | None) -> str:
-    if method not in {"gradient", "kl_div"}:
-        raise ValueError(f"Invalid method: {method}. Valid options are 'gradient' or 'kl_div'.")
+    if method not in {"gradient", "hidden_recon", "kl_div"}:
+        raise ValueError(
+            f"Invalid method: {method}. Valid options are 'gradient', 'hidden_recon', or 'kl_div'."
+        )
     if score_boundary is None:
         score_boundary = (
             AUTO_QUANTIZE_SCORE_BOUNDARY_LOCAL
@@ -643,8 +654,13 @@ def _resolve_auto_quantize_score_boundary(method: str, score_boundary: str | Non
         )
     if score_boundary not in AUTO_QUANTIZE_SCORE_BOUNDARIES:
         raise ValueError(f"score_boundary must be one of {sorted(AUTO_QUANTIZE_SCORE_BOUNDARIES)}.")
-    if method != "gradient" and score_boundary != AUTO_QUANTIZE_SCORE_BOUNDARY_LOCAL:
-        raise ValueError("score_boundary='group' is supported only with method='gradient'.")
+    if (
+        method not in {"gradient", "hidden_recon"}
+        and score_boundary != AUTO_QUANTIZE_SCORE_BOUNDARY_LOCAL
+    ):
+        raise ValueError(
+            "score_boundary='group' is supported only with method='gradient' or method='hidden_recon'."
+        )
     return score_boundary
 
 
@@ -826,6 +842,18 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
             "cost": {},
             "active_moe_expert_ratio": None,
             "score_boundary": None,
+            "kl_log_prob_fallback": None,
+            "num_candidates": 1,
+            "candidate_pool_size": None,
+            "candidate_min_hamming_distance": 1,
+            "candidate_diversity_group_patterns": None,
+            "candidate_max_objective_regret": None,
+            "candidate_pool_selection": "objective",
+            "candidate_distance_fallback": "none",
+            "candidate_selection_data_loader": None,
+            "candidate_selection_forward_step": None,
+            "candidate_selection_metric": "kl_div",
+            "num_candidate_selection_steps": 128,
         }
 
     @property
@@ -837,6 +865,7 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
             "cost": {},
             "active_moe_expert_ratio": None,
             "score_boundary": AUTO_QUANTIZE_SCORE_BOUNDARY_LOCAL,
+            "kl_log_prob_fallback": None,
             "cost_denominator": None,
             "quantization_formats_signature": None,
             "fixed_quantization_config_signature": None,
@@ -846,7 +875,14 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
             "disabled_layers": None,
             "candidate_stats": defaultdict(dict),
             "quantizer_states": {},
-            "best": {"recipe": {}, "constraints": {}, "score": float("inf"), "is_satisfied": False},
+            "best": {
+                "recipe": {},
+                "constraints": {},
+                "score": float("inf"),
+                "is_satisfied": False,
+                "candidates": [],
+                "candidate_selection": None,
+            },
         }
 
     def sanitize_search_config(self, config: SearchConfig | None) -> SearchConfig:
@@ -863,6 +899,86 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
         config["score_boundary"] = _resolve_auto_quantize_score_boundary(
             self.method_name, config["score_boundary"]
         )
+        kl_log_prob_fallback = config["kl_log_prob_fallback"]
+        if kl_log_prob_fallback is not None:
+            if self.method_name != "kl_div":
+                raise ValueError("kl_log_prob_fallback is supported only with method='kl_div'.")
+            if (
+                isinstance(kl_log_prob_fallback, bool)
+                or not isinstance(kl_log_prob_fallback, int | float)
+                or not math.isfinite(kl_log_prob_fallback)
+                or kl_log_prob_fallback >= 0
+            ):
+                raise ValueError("kl_log_prob_fallback must be a finite negative number or None.")
+            config["kl_log_prob_fallback"] = float(kl_log_prob_fallback)
+        if isinstance(config["num_candidates"], bool) or not isinstance(
+            config["num_candidates"], int
+        ):
+            raise TypeError("num_candidates must be an integer.")
+        if config["num_candidates"] <= 0:
+            raise ValueError("num_candidates must be positive.")
+        if config["candidate_pool_size"] is None:
+            config["candidate_pool_size"] = config["num_candidates"]
+        if isinstance(config["candidate_pool_size"], bool) or not isinstance(
+            config["candidate_pool_size"], int
+        ):
+            raise TypeError("candidate_pool_size must be an integer or None.")
+        if config["candidate_pool_size"] < config["num_candidates"]:
+            raise ValueError("candidate_pool_size must be at least num_candidates.")
+        if config["num_candidates"] == 1 and config["candidate_pool_size"] != 1:
+            raise ValueError("candidate_pool_size must be 1 when num_candidates is 1.")
+        if isinstance(config["candidate_min_hamming_distance"], bool) or not isinstance(
+            config["candidate_min_hamming_distance"], int
+        ):
+            raise TypeError("candidate_min_hamming_distance must be an integer.")
+        if config["candidate_min_hamming_distance"] <= 0:
+            raise ValueError("candidate_min_hamming_distance must be positive.")
+        patterns = config["candidate_diversity_group_patterns"]
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        if patterns is not None and (
+            not isinstance(patterns, list)
+            or not patterns
+            or not all(isinstance(pattern, str) and pattern for pattern in patterns)
+        ):
+            raise ValueError(
+                "candidate_diversity_group_patterns must be a non-empty string list or None."
+            )
+        config["candidate_diversity_group_patterns"] = patterns
+        regret = config["candidate_max_objective_regret"]
+        if regret is not None:
+            if isinstance(regret, bool) or not isinstance(regret, int | float):
+                raise TypeError("candidate_max_objective_regret must be a number or None.")
+            if regret < 0:
+                raise ValueError("candidate_max_objective_regret cannot be negative.")
+            config["candidate_max_objective_regret"] = float(regret)
+        if config["candidate_pool_selection"] not in {"objective", "farthest"}:
+            raise ValueError("candidate_pool_selection must be 'objective' or 'farthest'.")
+        if config["candidate_distance_fallback"] not in {"none", "relax"}:
+            raise ValueError("candidate_distance_fallback must be 'none' or 'relax'.")
+        if config["candidate_selection_metric"] not in {"kl_div", "ear"}:
+            raise ValueError("candidate_selection_metric must be 'kl_div' or 'ear'.")
+        if isinstance(config["num_candidate_selection_steps"], bool) or not isinstance(
+            config["num_candidate_selection_steps"], int
+        ):
+            raise TypeError("num_candidate_selection_steps must be an integer.")
+        if config["num_candidate_selection_steps"] <= 0:
+            raise ValueError("num_candidate_selection_steps must be positive.")
+        if config["num_candidates"] > 1:
+            if config["candidate_selection_data_loader"] is None:
+                raise ValueError(
+                    "candidate_selection_data_loader is required when num_candidates > 1."
+                )
+            if config["candidate_selection_data_loader"] is config["data_loader"]:
+                raise ValueError(
+                    "candidate_selection_data_loader must be a distinct loader containing "
+                    "samples disjoint from first-stage calibration and scoring."
+                )
+            if config["candidate_selection_forward_step"] is None:
+                raise ValueError(
+                    "candidate_selection_forward_step is required when num_candidates > 1 "
+                    "and must return model logits."
+                )
         return config
 
     def _get_score_module_rules(self):
@@ -1238,7 +1354,12 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
             if not isinstance(hparam, QuantRecipeHparam):
                 continue
 
-            formats, scores, costs = [], [], []
+            # ``candidate_stats`` is a defaultdict for a fresh search, but serialized
+            # calibration-only checkpoints restore it as a plain dict. Recreate the
+            # per-group entry before populating scores so a resumed search also covers
+            # cost-excluded (zero-weight) groups.
+            candidate_stat = self.candidate_stats.setdefault(name, {})
+            formats, raw_scores, scores, costs = [], [], [], []
             prev_score = float("inf")
             for recipe in hparam.solver_choices:
                 formats.append(recipe)
@@ -1246,22 +1367,27 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
                 score = hparam.get_score(recipe)
                 cost = hparam.get_cost(recipe)
 
+                raw_scores.append(score)
                 score = min(score, prev_score)  # TODO: Should we get rid of this?
                 scores.append(score)
                 costs.append(cost)
                 prev_score = score
 
-            self.candidate_stats[name]["formats"] = formats
-            self.candidate_stats[name]["scores"] = scores
-            self.candidate_stats[name]["costs"] = costs
-            self.candidate_stats[name]["module_names"] = hparam.quant_module_names
-            self.candidate_stats[name]["quantizer_attrs"] = hparam.quant_module_replay_attrs
-            self.candidate_stats[name]["cost_weight"] = hparam.cost_weight
-            self.candidate_stats[name]["allow_no_quant"] = hparam.allow_no_quant
-            self.candidate_stats[name]["is_fixed"] = hparam.is_fixed
+            candidate_stat["formats"] = formats
+            # Preserve the additive scorer output before the monotonic solver
+            # projection. This permits independently scored data shards to be
+            # merged exactly in score space and projected only once afterward.
+            candidate_stat["raw_scores"] = raw_scores
+            candidate_stat["scores"] = scores
+            candidate_stat["costs"] = costs
+            candidate_stat["module_names"] = hparam.quant_module_names
+            candidate_stat["quantizer_attrs"] = hparam.quant_module_replay_attrs
+            candidate_stat["cost_weight"] = hparam.cost_weight
+            candidate_stat["allow_no_quant"] = hparam.allow_no_quant
+            candidate_stat["is_fixed"] = hparam.is_fixed
             # Keep the no-quant cost as denominator metadata even when no-quant is not
             # solver-selectable for this hparam. Fixed formats must remain in the cost model.
-            self.candidate_stats[name]["uncompressed_cost"] = hparam.get_cost(no_quant_recipe)
+            candidate_stat["uncompressed_cost"] = hparam.get_cost(no_quant_recipe)
 
     def _run_func(self, func, num_iters=1, desc=""):
         for i, data in tqdm(
@@ -1281,11 +1407,13 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
 
         super().before_search()
         self.constraints = normalize_auto_quantize_constraints(self.model, self.constraints)
-        if (
-            self.method_name != "gradient"
-            and self.config["score_boundary"] != AUTO_QUANTIZE_SCORE_BOUNDARY_LOCAL
+        if self.method_name not in {"gradient", "hidden_recon"} and (
+            self.config["score_boundary"] != AUTO_QUANTIZE_SCORE_BOUNDARY_LOCAL
         ):
-            raise ValueError("score_boundary='group' is supported only with method='gradient'.")
+            raise ValueError(
+                "score_boundary='group' is supported only with method='gradient' "
+                "or method='hidden_recon'."
+            )
         self.config["cost_model"] = self.constraints["cost_model"]
         self.config["cost"] = self.constraints.get("cost", {})
         self.config["active_moe_expert_ratio"] = self.config["cost"].get(
@@ -1319,11 +1447,20 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
                 f"checkpoint={restored_score_boundary}, current={self.config['score_boundary']}. "
                 "Use a different checkpoint path."
             )
+        if (
+            self.candidate_stats
+            and getattr(self, "kl_log_prob_fallback", None) != self.config["kl_log_prob_fallback"]
+        ):
+            raise ValueError(
+                "Checkpoint AutoQuantize KL log-probability fallback does not match current "
+                "search config. Use a different checkpoint path."
+            )
         self.method = self.method_name
         self.cost_model = self.config["cost_model"]
         self.cost = self.config["cost"]
         self.active_moe_expert_ratio = self.config["active_moe_expert_ratio"]
         self.score_boundary = self.config["score_boundary"]
+        self.kl_log_prob_fallback = self.config["kl_log_prob_fallback"]
         self.disabled_layers = self.config["disabled_layers"]
         self.cost_denominator = getattr(self, "cost_denominator", None)
 
@@ -1555,6 +1692,465 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
             return [0.99, 0.90, None]
         return [None, 0.99, 0.90]
 
+    def _build_candidate_lps(self, max_weight_size, lower_bound=None, verbose=False):
+        constraints, constraint_name = self._get_constraints_for_search(
+            max_weight_size, lower_bound
+        )
+        return LPS(
+            name="AutoQuantize",
+            constraints=constraints,
+            constraints_to_candidate_costs={
+                constraint_name: [
+                    candidate_stat["costs"] for candidate_stat in self.candidate_stats.values()
+                ]
+            },
+            candidate_scores=[
+                candidate_stat["scores"] for candidate_stat in self.candidate_stats.values()
+            ],
+            objective_type="minimize",
+            verbose=verbose,
+        )
+
+    def _resolve_diversity_group_indices(self) -> list[int]:
+        """Resolve configured name patterns to runtime-grouped LP decision rows."""
+        patterns = getattr(self, "config", {}).get("candidate_diversity_group_patterns")
+        if patterns is None:
+            return list(range(len(self.candidate_stats)))
+
+        group_indices = []
+        for group_index, (group_name, stats) in enumerate(self.candidate_stats.items()):
+            group_aliases = [
+                group_name,
+                group_name.removesuffix(".quant_recipe"),
+                *stats.get("module_names", []),
+            ]
+            if any(
+                fnmatch.fnmatch(alias, pattern) for alias in group_aliases for pattern in patterns
+            ):
+                group_indices.append(group_index)
+
+        if not group_indices:
+            raise ValueError(
+                "candidate_diversity_group_patterns did not match any AutoQuantize decision groups."
+            )
+        return group_indices
+
+    @staticmethod
+    def _selection_signature(packet: dict[str, Any], group_names: Sequence[str]) -> tuple[int, ...]:
+        return tuple(int(packet["selection"][name]) for name in group_names)
+
+    @staticmethod
+    def _hamming_distance(
+        lhs: Sequence[int], rhs: Sequence[int], group_indices: Sequence[int]
+    ) -> int:
+        return sum(lhs[group_index] != rhs[group_index] for group_index in group_indices)
+
+    @classmethod
+    def _pairwise_distance_stats(
+        cls,
+        packets: Sequence[dict[str, Any]],
+        group_names: Sequence[str],
+        group_indices: Sequence[int],
+    ) -> dict[str, float | int | None]:
+        signatures = [cls._selection_signature(packet, group_names) for packet in packets]
+        distances = [
+            cls._hamming_distance(lhs, rhs, group_indices)
+            for lhs_index, lhs in enumerate(signatures)
+            for rhs in signatures[lhs_index + 1 :]
+        ]
+        if not distances:
+            return {"minimum": None, "mean": None, "median": None, "maximum": None}
+        ordered = sorted(distances)
+        midpoint = len(ordered) // 2
+        median = (
+            float(ordered[midpoint])
+            if len(ordered) % 2
+            else (ordered[midpoint - 1] + ordered[midpoint]) / 2
+        )
+        return {
+            "minimum": min(ordered),
+            "mean": sum(ordered) / len(ordered),
+            "median": median,
+            "maximum": max(ordered),
+        }
+
+    def _annotate_candidate_pool(
+        self,
+        packets: list[dict[str, Any]],
+        group_indices: Sequence[int],
+    ) -> None:
+        """Attach objective-regret and distance provenance to an enumerated pool."""
+        if not packets:
+            return
+        group_names = list(self.candidate_stats)
+        signatures = [self._selection_signature(packet, group_names) for packet in packets]
+        rank_zero_score = float(packets[0]["first_stage_score"])
+        regret_denominator = max(abs(rank_zero_score), 1e-12)
+
+        for pool_rank, (packet, signature) in enumerate(zip(packets, signatures)):
+            packet["pool_rank"] = pool_rank
+            packet["first_stage_rank"] = pool_rank
+            packet["distance_from_rank_zero"] = self._hamming_distance(
+                signature, signatures[0], group_indices
+            )
+            packet["first_stage_regret"] = (
+                0.0
+                if pool_rank == 0
+                else max(
+                    0.0,
+                    (float(packet["first_stage_score"]) - rank_zero_score) / regret_denominator,
+                )
+            )
+
+    def _select_candidate_pool(
+        self,
+        packets: list[dict[str, Any]],
+        num_candidates: int,
+        group_indices: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        """Select held-out-KL candidates, retaining rank zero deterministically."""
+        if len(packets) <= num_candidates:
+            selected = list(packets)
+        elif (
+            getattr(self, "config", {}).get("candidate_pool_selection", "objective") == "objective"
+        ):
+            selected = packets[:num_candidates]
+        else:
+            group_names = list(self.candidate_stats)
+            signatures = {
+                int(packet["pool_rank"]): self._selection_signature(packet, group_names)
+                for packet in packets
+            }
+            selected = [packets[0]]
+            remaining = list(packets[1:])
+            while remaining and len(selected) < num_candidates:
+                selected_signatures = [signatures[int(packet["pool_rank"])] for packet in selected]
+
+                def farthest_key(packet):
+                    signature = signatures[int(packet["pool_rank"])]
+                    minimum_distance = min(
+                        self._hamming_distance(signature, selected_signature, group_indices)
+                        for selected_signature in selected_signatures
+                    )
+                    return (
+                        -minimum_distance,
+                        float(packet["first_stage_score"]),
+                        signature,
+                    )
+
+                selected.append(min(remaining, key=farthest_key))
+                remaining.remove(selected[-1])
+
+        for selection_rank, packet in enumerate(selected):
+            packet["packet_id"] = selection_rank
+            packet["pool_selected"] = True
+            packet["pool_selection_rank"] = selection_rank
+        return selected
+
+    def _candidate_packet_from_selection(
+        self,
+        packet_id: int,
+        selections: list[int],
+        total_weight_size: float,
+    ) -> dict[str, Any]:
+        recipe_info = {}
+        for name, selected_idx in zip(self.candidate_stats, selections):
+            stats = self.candidate_stats[name]
+            recipe_info[name] = {
+                "format": stats["formats"][selected_idx],
+                "costs": stats["costs"][selected_idx],
+                "scores": stats["scores"][selected_idx],
+            }
+
+        total_cost = sum(info["costs"] for info in recipe_info.values())
+        return {
+            "packet_id": packet_id,
+            "first_stage_rank": packet_id,
+            "selection": {
+                name: int(selected_idx)
+                for name, selected_idx in zip(self.candidate_stats, selections)
+            },
+            "recipe": {name: info["format"] for name, info in recipe_info.items()},
+            "recipe_info": recipe_info,
+            "first_stage_score": sum(info["scores"] for info in recipe_info.values()),
+            "cost": total_cost,
+            "effective_bits": total_cost / total_weight_size * 16,
+        }
+
+    def _enumerate_candidate_packets(
+        self,
+        max_weight_size: float,
+        total_weight_size: float,
+        num_candidates: int,
+        verbose: bool,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Enumerate and deterministically select feasible first-stage recipes."""
+        config = getattr(self, "config", {})
+        pool_size = config.get("candidate_pool_size") or num_candidates
+        min_hamming_distance = config.get("candidate_min_hamming_distance", 1)
+        max_objective_regret = config.get("candidate_max_objective_regret")
+        group_indices = self._resolve_diversity_group_indices()
+        solutions = []
+        strict_solve_metadata = {}
+        selected_lower_bound = None
+        for lower_bound in self._get_search_lower_bounds():
+            solver = self._build_candidate_lps(max_weight_size, lower_bound, verbose)
+            solutions = solver.solve_top_k(
+                pool_size,
+                min_hamming_distance=min_hamming_distance,
+                hamming_group_indices=group_indices,
+                max_objective_regret=max_objective_regret,
+            )
+            strict_solve_metadata = solver.last_solve_metadata
+            self.status = solutions[0][1] if solutions else "Infeasible"
+            if self.status == "Optimal":
+                selected_lower_bound = lower_bound
+                break
+
+        is_satisfied = self.status == "Optimal"
+        if not is_satisfied:
+            warnings.warn(
+                "AutoQuantize FAILED to find a solution! The searched model might not meet all "
+                "constraints."
+            )
+            return [], False
+
+        strict_solution_count = len(solutions)
+        fallback_solve_metadata = None
+        fallback_used = False
+        if (
+            len(solutions) < pool_size
+            and min_hamming_distance > 1
+            and config.get("candidate_distance_fallback", "none") == "relax"
+        ):
+            fallback_solver = self._build_candidate_lps(
+                max_weight_size, selected_lower_bound, verbose
+            )
+            fallback_solutions = fallback_solver.solve_top_k(
+                pool_size,
+                min_hamming_distance=1,
+                hamming_group_indices=group_indices,
+                max_objective_regret=max_objective_regret,
+            )
+            fallback_solve_metadata = fallback_solver.last_solve_metadata
+            seen = {tuple(selection) for selection, _ in solutions}
+            for selection, status in fallback_solutions:
+                signature = tuple(selection)
+                if signature in seen:
+                    continue
+                solutions.append((selection, status))
+                seen.add(signature)
+                fallback_used = True
+                if len(solutions) == pool_size:
+                    break
+
+        packets = [
+            self._candidate_packet_from_selection(packet_id, selection, total_weight_size)
+            for packet_id, (selection, status) in enumerate(solutions)
+            if status == "Optimal"
+        ]
+        self._annotate_candidate_pool(packets, group_indices)
+        selected_packets = self._select_candidate_pool(packets, num_candidates, group_indices)
+        group_names = list(self.candidate_stats)
+        self._candidate_pool_provenance = {
+            "requested_pool_size": pool_size,
+            "enumerated_pool_size": len(packets),
+            "requested_candidates": num_candidates,
+            "selected_candidates": len(selected_packets),
+            "pool_selection": config.get("candidate_pool_selection", "objective"),
+            "min_hamming_distance": min_hamming_distance,
+            "diversity_group_patterns": config.get("candidate_diversity_group_patterns"),
+            "diversity_group_count": len(group_indices),
+            "max_objective_regret": max_objective_regret,
+            "distance_fallback": config.get("candidate_distance_fallback", "none"),
+            "fallback_used": fallback_used,
+            "strict_pool_size": strict_solution_count,
+            "strict_solver": strict_solve_metadata,
+            "fallback_solver": fallback_solve_metadata,
+            "pool_pairwise_hamming_distance": self._pairwise_distance_stats(
+                packets, group_names, group_indices
+            ),
+            "selected_pairwise_hamming_distance": self._pairwise_distance_stats(
+                selected_packets, group_names, group_indices
+            ),
+        }
+        if fallback_used:
+            warnings.warn(
+                f"AutoQuantize could not fill the requested pool at minimum Hamming distance "
+                f"{min_hamming_distance}; it relaxed the distance to 1 for "
+                f"{len(packets) - strict_solution_count} candidates."
+            )
+        elif len(packets) < pool_size:
+            warnings.warn(
+                f"AutoQuantize requested a pool of {pool_size} candidates with minimum Hamming "
+                f"distance {min_hamming_distance}, but found {len(packets)} candidates within "
+                "the configured cost and objective-regret constraints."
+            )
+        return selected_packets, True
+
+    def _set_configurable_recipe(self, recipe_info: dict[str, dict[str, Any]]) -> None:
+        for name, info in recipe_info.items():
+            hparam = get_hparam(self.model, name)
+            if isinstance(hparam, QuantRecipeHparam) and hparam.is_configurable:
+                hparam.active = info["format"]
+
+    def _set_configurable_unquantized(self) -> None:
+        no_quant_recipe = QuantRecipe(quant_cfg=None)
+        for _, hparam in named_hparams(self.model, unique=True):
+            if isinstance(hparam, QuantRecipeHparam) and hparam.is_configurable:
+                hparam.active = no_quant_recipe
+
+    @torch.inference_mode()
+    def _select_candidate_with_kl_div(
+        self, packets: list[dict[str, Any]]
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], int]:
+        """Evaluate held-out KL and EAR, then select by the configured fidelity metric."""
+        if not packets:
+            return {}, [], 0
+
+        kl_sums = [0.0] * len(packets)
+        ear_sums = [0.0] * len(packets)
+        token_counts = [0] * len(packets)
+        num_steps = 0
+        forward_step = self.config["candidate_selection_forward_step"]
+        selection_metric = self.config["candidate_selection_metric"]
+        lm_head = _get_lm_head(self.model)
+        parallel_state = getattr(lm_head, "parallel_state", None)
+        if parallel_state is None:
+            parallel_state = next(
+                (
+                    module.parallel_state
+                    for module in self.model.modules()
+                    if getattr(module, "parallel_state", None) is not None
+                ),
+                ParallelState(),
+            )
+        reference_invalid = False
+        self.model.eval()
+
+        for _, data in tqdm(
+            zip(
+                range(self.config["num_candidate_selection_steps"]),
+                self.config["candidate_selection_data_loader"],
+            ),
+            desc=f"Selecting AutoQuantize candidate with {selection_metric}",
+            total=self.config["num_candidate_selection_steps"],
+        ):
+            num_steps += 1
+            self._set_configurable_unquantized()
+            reference_logits = forward_step(self.model, data)
+            if not isinstance(reference_logits, torch.Tensor):
+                raise TypeError(
+                    "candidate_selection_forward_step must return a logits Tensor, "
+                    f"got {type(reference_logits)!r}."
+                )
+            reference_shape = reference_logits.shape
+            reference_log_prob = _get_log_prob(reference_logits, lm_head=lm_head)
+            attention_mask = data.get("attention_mask") if isinstance(data, dict) else None
+            # amax propagates NaNs without a vocabulary-sized boolean temporary.
+            invalid_reference_tokens = reference_log_prob.amax(dim=-1).isnan()
+            if attention_mask is not None:
+                if attention_mask.shape != invalid_reference_tokens.shape:
+                    raise ValueError(
+                        "attention_mask and per-token KL must have the same shape, "
+                        f"got {tuple(attention_mask.shape)} and "
+                        f"{tuple(invalid_reference_tokens.shape)}."
+                    )
+                invalid_reference_tokens = invalid_reference_tokens.masked_select(
+                    attention_mask.to(device=reference_log_prob.device, dtype=torch.bool)
+                )
+            reference_invalid |= bool(invalid_reference_tokens.any().item())
+            del reference_logits
+
+            for packet_id, packet in enumerate(packets):
+                self._set_configurable_recipe(packet["recipe_info"])
+                candidate_logits = forward_step(self.model, data)
+                if not isinstance(candidate_logits, torch.Tensor):
+                    raise TypeError(
+                        "candidate_selection_forward_step must return a logits Tensor, "
+                        f"got {type(candidate_logits)!r}."
+                    )
+                if candidate_logits.shape != reference_shape:
+                    raise ValueError(
+                        "Reference and candidate logits must have the same shape, "
+                        f"got {tuple(reference_shape)} and "
+                        f"{tuple(candidate_logits.shape)}."
+                    )
+                candidate_log_prob = _get_log_prob(candidate_logits, lm_head=lm_head)
+                token_kl = _reduce_token_metric_across_tensor_parallel(
+                    _get_kl_div_from_log_probs(reference_log_prob, candidate_log_prob), lm_head
+                )
+                token_ear = _reduce_token_metric_across_tensor_parallel(
+                    _get_expected_acceptance_rate_from_log_probs(
+                        reference_log_prob, candidate_log_prob
+                    ),
+                    lm_head,
+                )
+                if attention_mask is not None:
+                    valid_tokens = attention_mask.to(device=token_kl.device, dtype=torch.bool)
+                    kl_sums[packet_id] += float(token_kl.masked_select(valid_tokens).sum().item())
+                    ear_sums[packet_id] += float(token_ear.masked_select(valid_tokens).sum().item())
+                    token_counts[packet_id] += int(valid_tokens.sum().item())
+                else:
+                    kl_sums[packet_id] += float(token_kl.sum().item())
+                    ear_sums[packet_id] += float(token_ear.sum().item())
+                    token_counts[packet_id] += token_kl.numel()
+
+        self._set_configurable_unquantized()
+        if num_steps == 0:
+            raise ValueError(
+                "candidate_selection_data_loader produced no batches; at least one is required."
+            )
+
+        reference_invalid = DistributedProcessGroup.get_dist_syncd_obj(
+            reference_invalid, parallel_state.data_parallel_group, any
+        )
+        if reference_invalid:
+            raise ValueError(
+                "Candidate selection encountered non-finite reference log-probabilities."
+            )
+        metrics = DistributedProcessGroup.get_dist_syncd_obj(
+            torch.tensor(list(zip(kl_sums, ear_sums, token_counts)), dtype=torch.float64),
+            parallel_state.data_parallel_group,
+            sum,
+        ).tolist()
+        for packet, (kl_sum, ear_sum, token_count) in zip(packets, metrics):
+            if token_count <= 0:
+                raise ValueError(
+                    "Candidate selection found no valid tokens after applying attention_mask."
+                )
+            if not (math.isfinite(kl_sum) and math.isfinite(ear_sum)):
+                kl_sum, ear_sum = math.inf, -math.inf
+            packet["validation_kl_div_sum"] = kl_sum
+            packet["validation_ear_sum"] = ear_sum
+            packet["validation_token_count"] = int(token_count)
+            packet["validation_kl_div"] = kl_sum / token_count
+            packet["validation_ear"] = ear_sum / token_count
+
+        if not any(math.isfinite(packet["validation_kl_div"]) for packet in packets):
+            raise ValueError("No candidate produced finite held-out validation metrics.")
+
+        if selection_metric == "kl_div":
+            packets.sort(
+                key=lambda packet: (
+                    packet["validation_kl_div"],
+                    packet["first_stage_rank"],
+                )
+            )
+        else:
+            packets.sort(
+                key=lambda packet: (
+                    -packet["validation_ear"],
+                    packet["validation_kl_div"],
+                    packet["first_stage_rank"],
+                )
+            )
+        for selection_rank, packet in enumerate(packets):
+            packet["selection_rank"] = selection_rank
+            packet["selected"] = selection_rank == 0
+
+        return packets[0]["recipe_info"], packets, num_steps
+
     @abstractmethod
     def run_search_with_stats(self, max_weight_size, verbose=False):
         """Run the search with stats to get the best recipe and whether the constraints are satisfied."""
@@ -1576,6 +2172,7 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
         total_weight_size = self._get_total_weight_size_from_candidate_stats(self.candidate_stats)
         self.cost_denominator = total_weight_size
         max_weight_size = total_weight_size * compression
+        num_candidates = self.config.get("num_candidates", 1)
         if verbose:
             print_rank_0(
                 "AutoQuantize cost model: "
@@ -1587,8 +2184,45 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
                 )
             )
 
-        # Run the search with stats to get the best recipe and whether the constraints are satisfied
-        best_recipe_info, is_satisfied = self.run_search_with_stats(max_weight_size, verbose)
+        if num_candidates > 1:
+            packets, is_satisfied = self._enumerate_candidate_packets(
+                max_weight_size,
+                total_weight_size,
+                num_candidates,
+                verbose,
+            )
+            best_recipe_info, packets, num_selection_steps = self._select_candidate_with_kl_div(
+                packets
+            )
+            self.best["candidates"] = packets
+            pool_provenance = getattr(self, "_candidate_pool_provenance", {})
+            strict_solver_time = (
+                pool_provenance.get("strict_solver", {}).get("solver_time_seconds", 0.0)
+                if pool_provenance.get("strict_solver")
+                else 0.0
+            )
+            fallback_solver_time = (
+                pool_provenance.get("fallback_solver", {}).get("solver_time_seconds", 0.0)
+                if pool_provenance.get("fallback_solver")
+                else 0.0
+            )
+            self.best["candidate_selection"] = {
+                "metric": self.config["candidate_selection_metric"],
+                "reported_metrics": ["kl_div", "ear"],
+                "ear_definition": "full_vocabulary_probability_overlap",
+                "requested_candidates": num_candidates,
+                "evaluated_candidates": len(packets),
+                "requested_steps": self.config["num_candidate_selection_steps"],
+                "evaluated_steps": num_selection_steps,
+                "requires_disjoint_samples": True,
+                "solver_time_seconds": strict_solver_time + fallback_solver_time,
+                **pool_provenance,
+            }
+        else:
+            # Preserve the established one-stage method-specific search.
+            self.best["candidates"] = []
+            self.best["candidate_selection"] = None
+            best_recipe_info, is_satisfied = self.run_search_with_stats(max_weight_size, verbose)
         self.best["is_satisfied"] = is_satisfied
 
         best_recipe = {}
@@ -1624,6 +2258,8 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
         self.best["score"] = best_scores
 
         QuantRecipe.fold_pqs_to_weights(self.model)
+        if self.config.get("checkpoint") is not None:
+            self.save_search_checkpoint(verbose=verbose)
 
 
 def _get_auto_quantize_score(grad_output, output_diff):
@@ -1995,6 +2631,157 @@ def _restore_model_use_cache(originals) -> None:
         config.use_cache = use_cache
 
 
+def _get_primary_output_tensor(output: Any) -> torch.Tensor:
+    """Return the tensor carrying a score module's hidden states."""
+    if isinstance(output, torch.Tensor):
+        return output
+    if isinstance(output, tuple | list) and output and isinstance(output[0], torch.Tensor):
+        return output[0]
+    raise TypeError(
+        "AutoQuantize hidden_recon scoring expects a Tensor or a tuple/list whose first "
+        f"element is a Tensor, got {type(output)!r}."
+    )
+
+
+def _get_hidden_recon_score(
+    reference_output: Any,
+    quantized_output: Any,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return normalized output reconstruction error at the selected score boundary."""
+    reference = _get_primary_output_tensor(reference_output)
+    quantized = _get_primary_output_tensor(quantized_output)
+    if reference.shape != quantized.shape:
+        raise ValueError(
+            "Reference and quantized score-module outputs must have the same shape, "
+            f"got {tuple(reference.shape)} and {tuple(quantized.shape)}."
+        )
+    if reference.numel() == 0:
+        return torch.zeros((), dtype=torch.float32, device=reference.device)
+
+    reference = reference.float()
+    quantized = quantized.float()
+    squared_error = (quantized - reference).square()
+    squared_reference = reference.square()
+    if attention_mask is not None:
+        valid = attention_mask.to(device=reference.device, dtype=torch.bool)
+        if tuple(attention_mask.shape) != tuple(reference.shape[: attention_mask.ndim]):
+            if valid.numel() != reference.shape[0]:
+                raise ValueError(
+                    "attention_mask shape must match the hidden-output token dimensions, "
+                    f"got {tuple(attention_mask.shape)} and {tuple(reference.shape)}."
+                )
+            valid = valid.reshape(reference.shape[0])
+        for _ in range(reference.ndim - valid.ndim):
+            valid = valid.unsqueeze(-1)
+        squared_error = squared_error.masked_select(valid.expand_as(squared_error))
+        squared_reference = squared_reference.masked_select(valid.expand_as(squared_reference))
+        if squared_reference.numel() == 0:
+            return torch.zeros((), dtype=torch.float32, device=reference.device)
+    return squared_error.mean() / squared_reference.mean().clamp_min(1e-12)
+
+
+class AutoQuantizeHiddenReconSearcher(AutoQuantizeGradientSearcher):
+    """Score recipes by direct hidden-output reconstruction error.
+
+    The score boundary rules are shared with gradient AutoQuantize, but this
+    method compares the quantized and unquantized outputs directly and does not
+    require a backward pass. It adapts UniQL's layer input/output-difference
+    concept to produce a recipe-specific quantization perturbation score.
+    """
+
+    method_name = "hidden_recon"
+
+    def sanitize_search_config(self, config: SearchConfig | None) -> SearchConfig:
+        """Ignore backward-only inputs and validate the common AutoQuantize config."""
+        config = config or {}
+        if "score_func" in config:
+            warnings.warn("`score_func` is ignored for hidden_recon based `auto_quantize`.")
+            config.pop("score_func")
+        for ignored_key in ("loss_func", "forward_backward_step"):
+            if config.get(ignored_key) is not None:
+                warnings.warn(f"`{ignored_key}` is ignored for hidden_recon based `auto_quantize`.")
+            config[ignored_key] = None
+        return _AutoQuantizeBaseSearcher.sanitize_search_config(self, config)
+
+    @torch.inference_mode()
+    def estimate_sensitivity_scores(self) -> None:
+        """Accumulate normalized reconstruction error for every recipe and boundary."""
+        active_attention_mask = None
+        replaying = False
+
+        def hidden_recon_forward(module, *args, **kwargs):
+            nonlocal replaying
+            if replaying:
+                return module._forward_original(*args, **kwargs)
+            if self.config["score_boundary"] == AUTO_QUANTIZE_SCORE_BOUNDARY_GROUP:
+                _validate_group_score_replay_inputs(module, args, kwargs)
+            hparams = [hparam for hparam in module._hparams_for_scoring if hparam.is_configurable]
+            if not hparams:
+                return module._forward_original(*args, **kwargs)
+
+            for hparam in hparams:
+                hparam.active = QuantRecipe(quant_cfg=None)
+            reference_output = module._forward_original(*args, **kwargs)
+
+            for hparam in hparams:
+                for recipe in hparam.choices:
+                    if recipe == QuantRecipe(quant_cfg=None):
+                        continue
+                    hparam.active = recipe
+                    replaying = True
+                    try:
+                        quantized_output = module._forward_original(*args, **kwargs)
+                    finally:
+                        replaying = False
+                    score = _get_hidden_recon_score(
+                        reference_output,
+                        quantized_output,
+                        active_attention_mask,
+                    )
+                    if hparam._importance_dict[recipe][module] is None:
+                        hparam._importance_dict[recipe][module] = score
+                    else:
+                        hparam._importance_dict[recipe][module] += score
+                hparam.active = QuantRecipe(quant_cfg=None)
+
+            return reference_output
+
+        score_modules = set()
+        for module in self.model.modules():
+            if (
+                hasattr(module, "_hparams_for_scoring")
+                and any(hparam.is_configurable for hparam in module._hparams_for_scoring)
+                and module not in score_modules
+            ):
+                module._forward_original = module.forward
+                module.forward = types.MethodType(hidden_recon_forward, module)
+                score_modules.add(module)
+
+        self.model.eval()
+        cache_originals = []
+        try:
+            cache_originals = _set_model_use_cache(self.model, False)
+            for _, data in tqdm(
+                zip(range(self.config["num_score_steps"]), self.config["data_loader"]),
+                desc="Estimating hidden reconstruction scores",
+                total=self.config["num_score_steps"],
+            ):
+                active_attention_mask = (
+                    data.get("attention_mask") if isinstance(data, dict) else None
+                )
+                self.config["forward_step"](self.model, data)
+        finally:
+            active_attention_mask = None
+            try:
+                _restore_model_use_cache(cache_originals)
+            finally:
+                for module in score_modules:
+                    module.forward = module._forward_original
+                    del module._forward_original
+        gc.collect()
+
+
 @torch.compile(dynamic=True)
 def _get_log_softmax_dist(logits: torch.Tensor, tp_group) -> torch.Tensor:
     dtype = logits.dtype
@@ -2016,10 +2803,106 @@ def _get_log_prob(logits: torch.Tensor, lm_head: nn.Module = None) -> torch.Tens
 
 
 def _get_kl_div_loss(
-    log_prob_unquant: torch.Tensor, logits_quant: torch.Tensor, lm_head: nn.Module = None
+    log_prob_unquant: torch.Tensor,
+    logits_quant: torch.Tensor,
+    lm_head: nn.Module = None,
+    log_prob_fallback: float | None = None,
 ) -> torch.Tensor:
     log_prob_quant = _get_log_prob(logits_quant, lm_head=lm_head)
-    return F.kl_div(log_prob_quant, log_prob_unquant, reduction="sum", log_target=True)
+    return _get_kl_div_from_log_probs(
+        log_prob_unquant,
+        log_prob_quant,
+        log_prob_fallback=log_prob_fallback,
+    ).sum()
+
+
+def _get_kl_div_from_log_probs(
+    log_prob_unquant: torch.Tensor,
+    log_prob_quant: torch.Tensor,
+    log_prob_fallback: float | None = None,
+) -> torch.Tensor:
+    """Return forward KL per token while treating zero-probability target terms as zero.
+
+    ``torch.nn.functional.kl_div(..., log_target=True)`` evaluates each contribution
+    as ``exp(log_p) * (log_p - log_q)``. When ``log_p`` is negative infinity, that
+    expression becomes ``0 * -inf`` and can produce NaN even though its mathematical
+    contribution is zero. Large-vocabulary models can emit exact zero probabilities,
+    so mask those terms explicitly while retaining positive infinity when the
+    candidate assigns zero probability to a positive-probability target token.
+
+    ``log_prob_fallback`` is an opt-in recovery mechanism for numerically unstable
+    candidate forwards. When set, only non-finite candidate log-probabilities are
+    replaced by this finite negative penalty. Finite values are never clipped, and
+    the default ``None`` preserves exact forward-KL behavior.
+    """
+    if log_prob_unquant.shape != log_prob_quant.shape:
+        raise ValueError(
+            "Reference and candidate log-probabilities must have the same shape, "
+            f"got {tuple(log_prob_unquant.shape)} and {tuple(log_prob_quant.shape)}."
+        )
+    if log_prob_fallback is not None:
+        if (
+            isinstance(log_prob_fallback, bool)
+            or not isinstance(log_prob_fallback, int | float)
+            or not math.isfinite(log_prob_fallback)
+            or log_prob_fallback >= 0
+        ):
+            raise ValueError("log_prob_fallback must be a finite negative number or None.")
+        fallback = torch.as_tensor(
+            log_prob_fallback,
+            dtype=log_prob_quant.dtype,
+            device=log_prob_quant.device,
+        )
+        log_prob_quant = torch.where(torch.isfinite(log_prob_quant), log_prob_quant, fallback)
+    target_prob = log_prob_unquant.exp()
+    log_ratio = log_prob_unquant - log_prob_quant
+    contributions = torch.where(
+        target_prob == 0,
+        torch.zeros((), dtype=log_ratio.dtype, device=log_ratio.device),
+        target_prob * log_ratio,
+    )
+    return contributions.sum(dim=-1)
+
+
+def _get_expected_acceptance_rate_from_log_probs(
+    log_prob_unquant: torch.Tensor, log_prob_quant: torch.Tensor
+) -> torch.Tensor:
+    """Return exact per-token probability overlap between reference and candidate.
+
+    This is ``1 - total_variation_distance`` and equals the maximum probability that
+    samples from the two distributions agree under an optimal coupling.
+    """
+    if log_prob_unquant.shape != log_prob_quant.shape:
+        raise ValueError(
+            "Reference and candidate log-probabilities must have the same shape, "
+            f"got {tuple(log_prob_unquant.shape)} and {tuple(log_prob_quant.shape)}."
+        )
+    return torch.minimum(log_prob_unquant.exp(), log_prob_quant.exp()).sum(dim=-1)
+
+
+def _reduce_token_metric_across_tensor_parallel(
+    token_metric: torch.Tensor, lm_head: nn.Module = None
+) -> torch.Tensor:
+    """Sum a vocabulary-sharded per-token metric across tensor-parallel ranks."""
+    parallel_state: ParallelState | None = (
+        getattr(lm_head, "parallel_state", None) if lm_head is not None else None
+    )
+    if parallel_state is not None and parallel_state.tensor_parallel_group.is_initialized():
+        torch.distributed.all_reduce(
+            token_metric,
+            op=torch.distributed.ReduceOp.SUM,
+            group=parallel_state.tensor_parallel_group.group,
+        )
+    return token_metric
+
+
+def _get_kl_div_per_token(
+    log_prob_unquant: torch.Tensor, logits_quant: torch.Tensor, lm_head: nn.Module = None
+) -> torch.Tensor:
+    """Return forward KL summed over vocabulary, retaining batch/sequence dimensions."""
+    log_prob_quant = _get_log_prob(logits_quant, lm_head=lm_head)
+    token_kl = _get_kl_div_from_log_probs(log_prob_unquant, log_prob_quant)
+    return _reduce_token_metric_across_tensor_parallel(token_kl, lm_head)
 
 
 def _get_lm_head(model: nn.Module) -> nn.Module:
@@ -2101,13 +2984,256 @@ class AutoQuantizeKLDivSearcher(_AutoQuantizeBaseSearcher):
                     hparam.active = recipe
                     logits_quant = self.config["forward_step"](self.model, data)
                     score = _get_kl_div_loss(
-                        log_prob_unquant, logits_quant, _get_lm_head(self.model)
+                        log_prob_unquant,
+                        logits_quant,
+                        _get_lm_head(self.model),
+                        log_prob_fallback=self.config["kl_log_prob_fallback"],
                     )
                     if hparam._importance_dict[recipe][hparam.score_modules[0]] is None:
                         hparam._importance_dict[recipe][hparam.score_modules[0]] = score
                     else:
                         hparam._importance_dict[recipe][hparam.score_modules[0]] += score
                 hparam.active = QuantRecipe(quant_cfg=None)
+
+    def _enumerate_candidate_packets(
+        self,
+        max_weight_size: float,
+        total_weight_size: float,
+        num_candidates: int,
+        verbose: bool,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Enumerate KL-minimax candidates while preserving the established rank-0 recipe.
+
+        One-stage KL AutoQuantize uses threshold search to minimize the maximum local
+        KL sensitivity. Fill any remaining slots after threshold filtering with
+        additive-LP solutions subject to the same diversity and regret constraints.
+        """
+        config = getattr(self, "config", {})
+        pool_size = config.get("candidate_pool_size") or num_candidates
+        default_recipe_info, is_satisfied = self.run_search_with_stats(
+            max_weight_size,
+            verbose=verbose,
+        )
+        if not is_satisfied:
+            self.status = "Infeasible"
+            return [], False
+
+        def selection_from_recipe_info(recipe_info: dict[str, dict[str, Any]]) -> list[int]:
+            return [
+                self.candidate_stats[name]["formats"].index(recipe_info[name]["format"])
+                for name in self.candidate_stats
+            ]
+
+        def selection_signature(packet: dict[str, Any]) -> tuple[int, ...]:
+            return tuple(int(packet["selection"][name]) for name in self.candidate_stats)
+
+        def minimax_score(packet: dict[str, Any]) -> float:
+            return max(float(info["scores"]) for info in packet["recipe_info"].values())
+
+        default_selection = selection_from_recipe_info(default_recipe_info)
+        default_packet = self._candidate_packet_from_selection(
+            0,
+            default_selection,
+            total_weight_size,
+        )
+        default_packet["first_stage_score"] = minimax_score(default_packet)
+        packets = [default_packet]
+        seen = {selection_signature(default_packet)}
+
+        thresholds = sorted(
+            {float(score) for stats in self.candidate_stats.values() for score in stats["scores"]}
+        )
+        cost_tolerance = max(1.0, abs(float(max_weight_size))) * 1e-12
+        for threshold in thresholds:
+            selections = []
+            for stats in self.candidate_stats.values():
+                selected_idx = 0
+                for candidate_idx, score in enumerate(stats["scores"]):
+                    if float(score) <= threshold:
+                        selected_idx = candidate_idx
+                        break
+                selections.append(selected_idx)
+
+            packet = self._candidate_packet_from_selection(
+                len(packets),
+                selections,
+                total_weight_size,
+            )
+            signature = selection_signature(packet)
+            if signature in seen or float(packet["cost"]) > float(max_weight_size) + cost_tolerance:
+                continue
+            packet["first_stage_score"] = minimax_score(packet)
+            packets.append(packet)
+            seen.add(signature)
+
+        threshold_candidate_count = len(seen)
+        default_score = float(default_packet["first_stage_score"])
+        score_tolerance = max(1.0, abs(default_score)) * 1e-12
+        alternatives = [
+            packet
+            for packet in packets[1:]
+            if float(packet["first_stage_score"]) + score_tolerance >= default_score
+        ]
+
+        def alternative_sort_key(packet):
+            return (
+                float(packet["first_stage_score"]),
+                sum(float(info["scores"]) for info in packet["recipe_info"].values()),
+                -float(packet["cost"]),
+                selection_signature(packet),
+            )
+
+        alternatives.sort(key=alternative_sort_key)
+
+        group_names = list(self.candidate_stats)
+        group_indices = self._resolve_diversity_group_indices()
+        min_hamming_distance = config.get("candidate_min_hamming_distance", 1)
+        max_objective_regret = config.get("candidate_max_objective_regret")
+        regret_denominator = max(abs(default_score), 1e-12)
+
+        def within_regret(packet):
+            if max_objective_regret is None:
+                return True
+            return (
+                float(packet["first_stage_score"]) - default_score
+            ) / regret_denominator <= max_objective_regret + 1e-12
+
+        strict_packets = [default_packet]
+        rejected_for_distance = []
+        for packet in alternatives:
+            if not within_regret(packet):
+                continue
+            signature = self._selection_signature(packet, group_names)
+            if all(
+                self._hamming_distance(
+                    signature,
+                    self._selection_signature(accepted, group_names),
+                    group_indices,
+                )
+                >= min_hamming_distance
+                for accepted in strict_packets
+            ):
+                strict_packets.append(packet)
+                if len(strict_packets) == pool_size:
+                    break
+            else:
+                rejected_for_distance.append(packet)
+
+        # Encode the accepted recipes as LP cuts so rejected threshold recipes
+        # cannot crowd out feasible, sufficiently different additive alternatives.
+        solve_times = []
+        excluded = []
+
+        def fill_pool(distance):
+            while len(strict_packets) < pool_size:
+                for lower_bound in self._get_search_lower_bounds():
+                    solver = self._build_candidate_lps(max_weight_size, lower_bound, verbose)
+                    cuts = [
+                        (selection_signature(packet), distance, group_indices)
+                        for packet in strict_packets
+                    ]
+                    cuts.extend(
+                        (tuple(selection), 1, list(range(len(group_names))))
+                        for selection in excluded
+                    )
+                    for cut_id, (cut_selection, cut_distance, indices) in enumerate(cuts):
+                        index_set = set(indices)
+                        constraint = f"candidate_distance_{cut_id}"
+                        solver.constraints[constraint] = len(indices) - cut_distance
+                        solver.constraints_to_candidate_costs[constraint] = [
+                            [
+                                int(i == selected and row in index_set)
+                                for i in range(len(stats["formats"]))
+                            ]
+                            for row, (selected, stats) in enumerate(
+                                zip(cut_selection, self.candidate_stats.values())
+                            )
+                        ]
+                    if max_objective_regret is not None:
+                        limit = default_score + regret_denominator * (max_objective_regret + 1e-12)
+                        solver.constraints["candidate_regret"] = 0
+                        solver.constraints_to_candidate_costs["candidate_regret"] = [
+                            [int(float(score) > limit) for score in stats["scores"]]
+                            for stats in self.candidate_stats.values()
+                        ]
+                    selection, status = solver()
+                    solve_times.append(solver.last_solve_metadata["solver_time_seconds"])
+                    if status == "Optimal":
+                        break
+                if status != "Optimal":
+                    break
+                packet = self._candidate_packet_from_selection(
+                    len(strict_packets), selection, total_weight_size
+                )
+                packet["first_stage_score"] = minimax_score(packet)
+                if float(packet["first_stage_score"]) + score_tolerance < default_score:
+                    excluded.append(selection)
+                    continue
+                strict_packets.append(packet)
+
+        fill_pool(min_hamming_distance)
+
+        strict_pool_size = len(strict_packets)
+        fallback_used = False
+        packets = strict_packets
+        if (
+            len(packets) < pool_size
+            and min_hamming_distance > 1
+            and config.get("candidate_distance_fallback", "none") == "relax"
+        ):
+            for packet in rejected_for_distance:
+                signature = self._selection_signature(packet, group_names)
+                if any(
+                    self._hamming_distance(
+                        signature,
+                        self._selection_signature(accepted, group_names),
+                        group_indices,
+                    )
+                    < 1
+                    for accepted in packets
+                ):
+                    continue
+                packets.append(packet)
+                fallback_used = True
+                if len(packets) == pool_size:
+                    break
+            fill_pool(1)
+            fallback_used = len(packets) > strict_pool_size
+
+        packets[1:] = sorted(packets[1:], key=alternative_sort_key)
+        self._annotate_candidate_pool(packets, group_indices)
+        enumerated_packets = list(packets)
+        packets = self._select_candidate_pool(packets, num_candidates, group_indices)
+        self._candidate_pool_provenance = {
+            "requested_pool_size": pool_size,
+            "enumerated_pool_size": len(enumerated_packets),
+            "requested_candidates": num_candidates,
+            "selected_candidates": len(packets),
+            "pool_selection": config.get("candidate_pool_selection", "objective"),
+            "min_hamming_distance": min_hamming_distance,
+            "diversity_group_patterns": config.get("candidate_diversity_group_patterns"),
+            "diversity_group_count": len(group_indices),
+            "max_objective_regret": max_objective_regret,
+            "distance_fallback": config.get("candidate_distance_fallback", "none"),
+            "fallback_used": fallback_used,
+            "strict_pool_size": strict_pool_size,
+            "strict_solver": ({"solver_time_seconds": sum(solve_times)} if solve_times else None),
+            "fallback_solver": None,
+            "threshold_candidate_count": threshold_candidate_count,
+            "pool_pairwise_hamming_distance": self._pairwise_distance_stats(
+                enumerated_packets, group_names, group_indices
+            ),
+            "selected_pairwise_hamming_distance": self._pairwise_distance_stats(
+                packets, group_names, group_indices
+            ),
+        }
+        if len(packets) < num_candidates:
+            warnings.warn(
+                f"KL-Divergence AutoQuantize requested {num_candidates} distinct candidates "
+                f"but selected only {len(packets)} feasible minimax recipes."
+            )
+        self.status = "Optimal"
+        return packets, True
 
     def run_search_with_stats(self, max_weight_size, verbose=False):
         """Run threshold-based binary search for KLDivergence loss based auto_quantize.
@@ -2332,11 +3458,14 @@ def _resolve_best_recipe(search_state, constraints, verbose=False):
 
     if method == "gradient":
         searcher = AutoQuantizeGradientSearcher()
+    elif method == "hidden_recon":
+        searcher = AutoQuantizeHiddenReconSearcher()
     elif method == "kl_div":
         searcher = AutoQuantizeKLDivSearcher()
     else:
         raise ValueError(
-            f"Unknown autoquant search method: {method!r}. Expected 'gradient' or 'kl_div'."
+            f"Unknown autoquant search method: {method!r}. Expected 'gradient', "
+            "'hidden_recon', or 'kl_div'."
         )
 
     searcher.candidate_stats = candidate_stats

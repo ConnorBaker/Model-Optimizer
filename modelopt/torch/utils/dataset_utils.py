@@ -456,6 +456,7 @@ def get_dataset_samples(
     apply_chat_template: bool = False,
     tokenizer: "PreTrainedTokenizerBase | None" = None,
     split: str | list[str] | None = None,
+    interleave_splits: bool = False,
 ) -> list[str]:
     """Load a portion of a dataset with the dataset name and a given size.
 
@@ -487,6 +488,8 @@ def get_dataset_samples(
         split: Override the split(s) to load.  Accepts a single split name or a list.
             If ``None``, uses the splits defined in ``SUPPORTED_DATASET_CONFIG`` for
             registered datasets, or ``["train"]`` for unregistered datasets.
+        interleave_splits: If True, round-robin samples from multiple splits instead of
+            concatenating them. Order within each split remains deterministic.
 
     Returns:
         Samples: The list of samples.
@@ -633,16 +636,22 @@ def get_dataset_samples(
         num_per_split = [num_samples // len(dataset_splits)] * len(dataset_splits)
         num_per_split[-1] += num_samples - sum(num_per_split)
 
-        samples: list[str] = []
+        split_samples: list[list[str]] = []
         for dataset, n in zip(dataset_splits, num_per_split):
+            samples = []
             for i, sample in enumerate(dataset):
                 if i >= n:
                     break
                 text = _preprocess(sample)
                 if text:
                     samples.append(text)
+            split_samples.append(samples)
 
-        return samples
+        return (
+            _interleave_sample_sources(split_samples)
+            if interleave_splits
+            else [sample for samples in split_samples for sample in samples]
+        )
     except fallback_types as e:
         # Backward-compat fallback: legacy callers passed JSONL files whose only usable
         # field is ``text``.  If the HF ``json`` builder fails on schema inference or
@@ -739,6 +748,16 @@ def get_dataloader_from_dataset(
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
+def _interleave_sample_sources(sample_sources: list[list[str]]) -> list[str]:
+    """Round-robin source samples while preserving order within each source."""
+    return [
+        samples[index]
+        for index in range(max(map(len, sample_sources), default=0))
+        for samples in sample_sources
+        if index < len(samples)
+    ]
+
+
 def get_dataset_dataloader(
     dataset_name: str | list[str] = "cnn_dailymail",
     tokenizer: "PreTrainedTokenizerBase | None" = None,
@@ -751,6 +770,7 @@ def get_dataset_dataloader(
     pack: bool = False,
     distributed: bool = False,
     sampler_kwargs: dict | None = None,
+    interleave_sources: bool = False,
 ) -> DataLoader:
     """Get a dataloader with the dataset name and tokenizer of the target model.
 
@@ -784,6 +804,9 @@ def get_dataset_dataloader(
             (e.g. for data-parallel calibration). ``sampler_kwargs`` supplies ``num_replicas``
             and ``rank``.
         sampler_kwargs: Keyword args for the ``DistributedSampler`` when ``distributed=True``.
+        interleave_sources: If True, round-robin samples from multiple sources before
+            tokenization. This keeps contiguous dataset splits source-balanced while preserving
+            deterministic order within each source.
 
     Returns:
         An instance of dataloader.
@@ -840,15 +863,21 @@ def get_dataset_dataloader(
     # - pack=True:  oversample 16x per source to ensure enough raw docs to fill all rows,
     #               since each row greedily packs multiple docs.
     sample_multiplier = 16 if pack else 1
-    all_samples = []
+    sample_sources = []
     for ds_name, num_sample in zip(dataset_name, num_samples):
         samples = get_dataset_samples(
             ds_name,
             num_sample * sample_multiplier,
             apply_chat_template=apply_chat_template,
             tokenizer=tokenizer,
+            interleave_splits=interleave_sources,
         )
-        all_samples.extend(samples)
+        sample_sources.append(samples)
+    all_samples = (
+        _interleave_sample_sources(sample_sources)
+        if interleave_sources
+        else [sample for samples in sample_sources for sample in samples]
+    )
 
     # Multi-source pack=True without shuffling would consume all of oversampled source 1's docs
     # before any of oversampled source 2 are reached

@@ -15,16 +15,19 @@
 
 import copy
 import io
+import json
+import math
 from types import SimpleNamespace
 
 import pytest
 import torch
-from _test_utils.torch.distributed.utils import spawn_multiprocess_job
+from _test_utils.torch.distributed.utils import DistributedWorkerPool, spawn_multiprocess_job
 from _test_utils.torch.quantization.models import SimpleConv, SimpleConvLinear, SimpleLinear
 
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
 import modelopt.torch.quantization.model_quant as model_quant
+from modelopt.torch.opt.searcher import LPS
 from modelopt.torch.quantization._auto_quantize_cost import (
     EXCLUDED_MODULE_NAME_PATTERNS_KEY,
     _get_module_weight_numel,
@@ -33,15 +36,22 @@ from modelopt.torch.quantization._auto_quantize_cost import (
 )
 from modelopt.torch.quantization.algorithms import (
     AutoQuantizeGradientSearcher,
+    AutoQuantizeHiddenReconSearcher,
+    AutoQuantizeKLDivSearcher,
     QuantRecipe,
     QuantRecipeHparam,
     _AutoQuantizeBaseSearcher,
+    _get_expected_acceptance_rate_from_log_probs,
+    _get_hidden_recon_score,
+    _get_kl_div_from_log_probs,
+    _get_kl_div_loss,
+    _get_kl_div_per_token,
     _module_search_space_signature,
     estimate_quant_compression,
 )
 from modelopt.torch.quantization.config import _base_disable_all, _default_disabled_quantizer_cfg
 from modelopt.torch.utils import safe_load, safe_save
-from modelopt.torch.utils.distributed import DistributedProcessGroup
+from modelopt.torch.utils.distributed import DistributedProcessGroup, ParallelState
 
 
 class _AttentionLayer(torch.nn.Module):
@@ -360,6 +370,373 @@ def test_quant_recipe_hparam_cost_weight_and_effective_bits_compose():
     # A recipe-level effective_bits override (8.0) wins over the library default and still stacks.
     override = QuantRecipe({**mtq.NVFP4_DEFAULT_CFG, "effective_bits": 8.0}, name="NVFP4_8B")
     assert hparam.get_cost(override) == pytest.approx(numel * 0.03125 * 0.5)
+
+
+def test_lps_solve_top_k_returns_objective_ranked_distinct_solutions():
+    solver = LPS(
+        name="top_k",
+        constraints={"cost": 2.0},
+        constraints_to_candidate_costs={
+            "cost": [
+                [1.0, 1.0],
+                [1.0, 1.0],
+            ]
+        },
+        candidate_scores=[
+            [0.0, 1.0],
+            [0.0, 2.0],
+        ],
+    )
+
+    assert solver.solve_top_k(3) == [
+        ([0, 0], "Optimal"),
+        ([1, 0], "Optimal"),
+        ([0, 1], "Optimal"),
+    ]
+
+
+def test_lps_solve_top_k_enforces_pairwise_minimum_hamming_distance():
+    solver = LPS(
+        name="hamming",
+        constraints={"cost": 3.0},
+        constraints_to_candidate_costs={"cost": [[1.0, 1.0]] * 3},
+        candidate_scores=[[0.0, 1.0]] * 3,
+    )
+
+    solutions = solver.solve_top_k(4, min_hamming_distance=2)
+    selections = [selection for selection, _ in solutions]
+
+    assert len(selections) == 4
+    assert all(
+        sum(lhs_idx != rhs_idx for lhs_idx, rhs_idx in zip(lhs, rhs)) >= 2
+        for lhs_pos, lhs in enumerate(selections)
+        for rhs in selections[lhs_pos + 1 :]
+    )
+    assert solver.last_solve_metadata["min_hamming_distance"] == 2
+
+
+def test_lps_infeasible_hamming_distance_returns_rank_zero_and_reports_partial_pool():
+    solver = LPS(
+        name="infeasible_hamming",
+        constraints={"cost": 3.0},
+        constraints_to_candidate_costs={"cost": [[1.0, 1.0]] * 3},
+        candidate_scores=[[0.0, 1.0]] * 3,
+    )
+
+    assert solver.solve_top_k(3, min_hamming_distance=4) == [([0, 0, 0], "Optimal")]
+    assert solver.last_solve_metadata["returned_solutions"] == 1
+    assert solver.last_solve_metadata["terminal_status"] == "Infeasible"
+
+
+def test_lps_objective_regret_and_cost_bounds_are_preserved():
+    solver = LPS(
+        name="regret",
+        constraints={"cost": 3.0},
+        constraints_to_candidate_costs={"cost": [[1.0, 2.0], [1.0, 2.0]]},
+        candidate_scores=[[1.0, 2.0], [1.0, 2.0]],
+    )
+
+    solutions = solver.solve_top_k(4, max_objective_regret=0.5)
+
+    objectives = [
+        sum(solver.candidate_scores[i][choice] for i, choice in enumerate(selection))
+        for selection, _ in solutions
+    ]
+    assert objectives == sorted(objectives)
+    assert objectives == [2.0, 3.0, 3.0]
+    assert all(
+        sum(
+            solver.constraints_to_candidate_costs["cost"][i][choice]
+            for i, choice in enumerate(selection)
+        )
+        <= 3.0
+        for selection, _ in solutions
+    )
+
+
+def _make_candidate_pool_searcher(**config_overrides):
+    searcher = AutoQuantizeGradientSearcher()
+    searcher.candidate_stats = {
+        f"layer_{layer_id}.quant_recipe": {
+            "formats": ["low", "high"],
+            "scores": [1.0, 2.0 + layer_id / 10],
+            "costs": [1.0, 1.0],
+            "module_names": [f"layer_{layer_id}"],
+        }
+        for layer_id in range(4)
+    }
+    searcher.cost_model = "weight"
+    searcher.config = {
+        **searcher.default_search_config,
+        "candidate_pool_size": 4,
+        "candidate_min_hamming_distance": 1,
+        "candidate_pool_selection": "farthest",
+        **config_overrides,
+    }
+    return searcher
+
+
+def test_autoquant_candidate_pool_farthest_selection_is_deterministic_and_serializable():
+    first = _make_candidate_pool_searcher()
+    second = _make_candidate_pool_searcher()
+
+    first_packets, first_satisfied = first._enumerate_candidate_packets(4.0, 4.0, 3, False)
+    second_packets, second_satisfied = second._enumerate_candidate_packets(4.0, 4.0, 3, False)
+
+    assert first_satisfied and second_satisfied
+    assert [packet["selection"] for packet in first_packets] == [
+        packet["selection"] for packet in second_packets
+    ]
+    assert first_packets[0]["pool_rank"] == 0
+    assert [packet["pool_selection_rank"] for packet in first_packets] == [0, 1, 2]
+    json.dumps(first_packets)
+    json.dumps(first._candidate_pool_provenance)
+
+
+def test_autoquant_candidate_pool_relaxes_infeasible_distance_with_provenance():
+    searcher = _make_candidate_pool_searcher(
+        candidate_min_hamming_distance=5,
+        candidate_distance_fallback="relax",
+    )
+
+    with pytest.warns(UserWarning, match="relaxed the distance"):
+        packets, is_satisfied = searcher._enumerate_candidate_packets(4.0, 4.0, 3, False)
+
+    assert is_satisfied
+    assert len(packets) == 3
+    assert searcher._candidate_pool_provenance["strict_pool_size"] == 1
+    assert searcher._candidate_pool_provenance["fallback_used"] is True
+    assert searcher._candidate_pool_provenance["selected_pairwise_hamming_distance"]["minimum"] < 5
+    assert all(packet["effective_bits"] <= 16.0 for packet in packets)
+
+
+def test_autoquant_candidate_diversity_patterns_scope_hamming_decisions():
+    searcher = _make_candidate_pool_searcher(
+        candidate_pool_size=2,
+        candidate_min_hamming_distance=2,
+        candidate_diversity_group_patterns=["layer_[01]"],
+        candidate_pool_selection="objective",
+    )
+
+    packets, is_satisfied = searcher._enumerate_candidate_packets(4.0, 4.0, 2, False)
+
+    assert is_satisfied
+    assert len(packets) == 2
+    assert searcher._candidate_pool_provenance["diversity_group_count"] == 2
+    assert (
+        sum(
+            packets[0]["selection"][f"layer_{layer_id}.quant_recipe"]
+            != packets[1]["selection"][f"layer_{layer_id}.quant_recipe"]
+            for layer_id in range(2)
+        )
+        == 2
+    )
+
+
+def test_kl_top_k_preserves_established_threshold_recipe_at_rank_zero():
+    searcher = AutoQuantizeKLDivSearcher()
+    searcher.candidate_stats = {
+        "layer_0": {
+            "formats": ["low", "mid", "high"],
+            "scores": [10.0, 4.0, 0.0],
+            "costs": [2.0, 5.0, 8.0],
+        },
+        "layer_1": {
+            "formats": ["low", "mid", "high"],
+            "scores": [10.0, 4.0, 0.0],
+            "costs": [2.0, 5.0, 8.0],
+        },
+    }
+    default_recipe, is_satisfied = searcher.run_search_with_stats(10.0)
+
+    packets, candidates_satisfied = searcher._enumerate_candidate_packets(
+        max_weight_size=10.0,
+        total_weight_size=16.0,
+        num_candidates=2,
+        verbose=False,
+    )
+
+    assert is_satisfied and candidates_satisfied
+    assert packets[0]["recipe"] == {name: info["format"] for name, info in default_recipe.items()}
+    assert [packet["first_stage_score"] for packet in packets] == [4.0, 10.0]
+    assert [packet["first_stage_rank"] for packet in packets] == [0, 1]
+
+
+@pytest.mark.parametrize(
+    ("distance", "fallback", "regret", "patterns", "expected"),
+    [
+        (3, "none", None, None, [(1, 1, 0), (0, 0, 1)]),
+        (3, "none", 0.0, None, [(1, 1, 0)]),
+        (4, "relax", None, None, [(1, 1, 0), (1, 0, 0)]),
+        (2, "relax", None, ["layer_0"], [(1, 1, 0), (0, 0, 0)]),
+    ],
+)
+def test_kl_top_k_fills_pool_after_diversity_filtering(
+    distance, fallback, regret, patterns, expected
+):
+    searcher = AutoQuantizeKLDivSearcher()
+    searcher.config = {
+        **searcher.default_search_config,
+        "candidate_pool_size": 2,
+        "candidate_min_hamming_distance": distance,
+        "candidate_distance_fallback": fallback,
+        "candidate_max_objective_regret": regret,
+        "candidate_diversity_group_patterns": patterns,
+    }
+    searcher.candidate_stats = {
+        f"layer_{i}": {"formats": ["low", "high"], "scores": [score, 0], "costs": [1, 2]}
+        for i, score in enumerate((10, 9, 8))
+    }
+
+    packets, satisfied = searcher._enumerate_candidate_packets(5, 6, 2, False)
+
+    assert satisfied
+    assert [tuple(packet["selection"].values()) for packet in packets] == expected
+    assert all(packet["cost"] <= 5 for packet in packets)
+
+
+def test_hidden_recon_score_is_normalized_output_error():
+    reference = torch.tensor([1.0, 2.0])
+    quantized = torch.tensor([2.0, 2.0])
+
+    assert _get_hidden_recon_score(reference, quantized).item() == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize("flatten", [False, True])
+def test_hidden_recon_score_excludes_padding(flatten):
+    reference = torch.tensor([[[1.0, 1.0], [10.0, 10.0]]])
+    quantized = torch.tensor([[[2.0, 1.0], [100.0, 100.0]]])
+    attention_mask = torch.tensor([[1, 0]])
+    if flatten:
+        reference = reference.flatten(0, 1)
+        quantized = quantized.flatten(0, 1)
+
+    assert _get_hidden_recon_score(
+        reference,
+        quantized,
+        attention_mask,
+    ).item() == pytest.approx(0.5)
+
+
+def test_hidden_recon_parent_replays_do_not_rescore_children(monkeypatch):
+    model = torch.nn.Sequential()
+    model.add_module("block", torch.nn.Sequential())
+    for name in ("leaf", "first", "last"):
+        model.block.add_module(name, torch.nn.Linear(32, 32))
+    inputs = torch.randn(1, 4, 32)
+
+    def score(rules):
+        monkeypatch.setattr(AutoQuantizeHiddenReconSearcher, "score_module_rules", rules)
+        return mtq.auto_quantize(
+            copy.deepcopy(model),
+            constraints={"effective_bits": 8.0},
+            quantization_formats=[mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG, mtq.INT8_DEFAULT_CFG],
+            data_loader=[inputs],
+            forward_step=lambda model, batch: model(batch),
+            num_calib_steps=1,
+            num_score_steps=1,
+            method="hidden_recon",
+            score_boundary="local",
+        )[1]["candidate_stats"]["block.leaf.quant_recipe"]["scores"]
+
+    local_scores = score([])
+    assert any(value > 0 for value in local_scores)
+    assert score([r"^(block)\.(?:first|last)$"]) == pytest.approx(local_scores)
+
+
+def test_kl_div_ignores_zero_probability_reference_terms():
+    """Exact zero target probabilities contribute zero instead of producing NaN."""
+    log_prob_unquant = torch.tensor([[[-torch.inf, 0.0]]])
+    logits_quant = torch.tensor([[[0.0, 0.0]]])
+
+    token_kl = _get_kl_div_per_token(log_prob_unquant, logits_quant)
+
+    assert torch.isfinite(token_kl).all()
+    assert token_kl.item() == pytest.approx(torch.log(torch.tensor(2.0)).item())
+    assert _get_kl_div_loss(log_prob_unquant, logits_quant).item() == pytest.approx(token_kl.item())
+
+
+def test_expected_acceptance_rate_is_exact_probability_overlap():
+    log_prob_unquant = torch.log(torch.tensor([[[0.6, 0.4], [1.0, 0.0]]]))
+    log_prob_quant = torch.log(torch.tensor([[[0.5, 0.5], [0.0, 1.0]]]))
+
+    ear = _get_expected_acceptance_rate_from_log_probs(log_prob_unquant, log_prob_quant)
+
+    torch.testing.assert_close(ear, torch.tensor([[0.9, 0.0]]))
+
+
+def test_expected_acceptance_rate_rejects_shape_mismatch():
+    with pytest.raises(ValueError, match="must have the same shape"):
+        _get_expected_acceptance_rate_from_log_probs(
+            torch.zeros(1, 2, 3),
+            torch.zeros(1, 2, 4),
+        )
+
+
+def test_kl_div_retains_infinite_penalty_for_missing_candidate_support():
+    """A candidate zero probability remains infinite when the reference is positive."""
+    log_prob_unquant = torch.tensor([[[0.0, -torch.inf]]])
+    logits_quant = torch.tensor([[[-torch.inf, 0.0]]])
+
+    token_kl = _get_kl_div_per_token(log_prob_unquant, logits_quant)
+
+    assert torch.isposinf(token_kl).all()
+
+
+def test_kl_div_nonfinite_candidate_fallback_is_opt_in_and_finite():
+    """The recovery fallback replaces only non-finite candidate log-probabilities."""
+    log_prob_unquant = torch.tensor([[[0.0, -torch.inf]]])
+    log_prob_quant = torch.tensor([[[-torch.inf, torch.nan]]])
+
+    exact = _get_kl_div_from_log_probs(log_prob_unquant, log_prob_quant)
+    recovered = _get_kl_div_from_log_probs(
+        log_prob_unquant,
+        log_prob_quant,
+        log_prob_fallback=-100.0,
+    )
+
+    assert torch.isposinf(exact).all()
+    assert torch.isfinite(recovered).all()
+    assert recovered.item() == pytest.approx(100.0)
+
+
+def test_kl_div_nonfinite_candidate_fallback_preserves_finite_terms():
+    """Enabling the fallback does not clip or otherwise change finite scores."""
+    log_prob_unquant = torch.log_softmax(torch.tensor([[[1.0, 2.0, 3.0]]]), dim=-1)
+    log_prob_quant = torch.log_softmax(torch.tensor([[[3.0, -200.0, 1.0]]]), dim=-1)
+
+    exact = _get_kl_div_from_log_probs(log_prob_unquant, log_prob_quant)
+    recovered = _get_kl_div_from_log_probs(
+        log_prob_unquant,
+        log_prob_quant,
+        log_prob_fallback=-100.0,
+    )
+
+    torch.testing.assert_close(recovered, exact)
+
+
+def test_kl_div_nonfinite_candidate_fallback_recovers_overflowed_logits():
+    """The opt-in path converts an overflowed candidate forward into a finite penalty."""
+    log_prob_unquant = torch.log_softmax(torch.tensor([[[1.0, 2.0]]]), dim=-1)
+    logits_quant = torch.tensor([[[torch.inf, 0.0]]])
+
+    exact = _get_kl_div_loss(log_prob_unquant, logits_quant)
+    recovered = _get_kl_div_loss(
+        log_prob_unquant,
+        logits_quant,
+        log_prob_fallback=-100.0,
+    )
+
+    assert torch.isnan(exact)
+    assert torch.isfinite(recovered)
+
+
+@pytest.mark.parametrize("fallback", [0.0, 1.0, math.inf, math.nan, True])
+def test_kl_div_rejects_invalid_nonfinite_candidate_fallback(fallback):
+    log_prob = torch.tensor([[[0.0]]])
+
+    with pytest.raises(ValueError, match="finite negative"):
+        _get_kl_div_from_log_probs(log_prob, log_prob, log_prob_fallback=fallback)
 
 
 def test_auto_quantize_cost_model_excludes_module_name_patterns():
@@ -1021,7 +1398,8 @@ def test_auto_quantize_group_score_boundary_does_not_group_recipe_decisions():
     assert (False, False) in model.use_cache_seen
 
 
-def test_auto_quantize_group_boundary_rejects_explicit_mutable_cache_before_replay():
+@pytest.mark.parametrize("method", ["gradient", "hidden_recon"])
+def test_auto_quantize_group_boundary_rejects_explicit_mutable_cache_before_replay(method):
     model = _ExplicitCacheGroupBoundaryModel()
 
     with pytest.raises(ValueError, match=r"mutable state/cache inputs \(cache_params\)"):
@@ -1037,7 +1415,7 @@ def test_auto_quantize_group_boundary_rejects_explicit_mutable_cache_before_repl
             loss_func=lambda output, data: output.sum(),
             num_calib_steps=1,
             num_score_steps=1,
-            method="gradient",
+            method=method,
         )
 
     # Each format runs one calibration forward. The parent replay must fail before a third,
@@ -1047,8 +1425,9 @@ def test_auto_quantize_group_boundary_rejects_explicit_mutable_cache_before_repl
 
 @pytest.mark.parametrize("input_name", ["state", "cache"])
 @pytest.mark.parametrize("as_keyword", [False, True])
+@pytest.mark.parametrize("method", ["gradient", "hidden_recon"])
 def test_auto_quantize_group_boundary_rejects_generic_mutable_state_before_replay(
-    input_name, as_keyword
+    input_name, as_keyword, method
 ):
     model = _ExplicitMutableStateGroupBoundaryModel(input_name, as_keyword)
 
@@ -1065,14 +1444,15 @@ def test_auto_quantize_group_boundary_rejects_generic_mutable_state_before_repla
             loss_func=lambda output, data: output.sum(),
             num_calib_steps=1,
             num_score_steps=1,
-            method="gradient",
+            method=method,
         )
 
     assert model.mutable["positions"] == [1, 2]
 
 
 @pytest.mark.parametrize("use_cache", [False, True])
-def test_auto_quantize_group_boundary_handles_explicit_use_cache_flag(use_cache):
+@pytest.mark.parametrize("method", ["gradient", "hidden_recon"])
+def test_auto_quantize_group_boundary_handles_explicit_use_cache_flag(use_cache, method):
     model = _ExplicitUseCacheGroupBoundaryModel(use_cache)
     kwargs = {
         "constraints": {"effective_bits": 8.0},
@@ -1085,7 +1465,7 @@ def test_auto_quantize_group_boundary_handles_explicit_use_cache_flag(use_cache)
         "loss_func": lambda output, data: output.sum(),
         "num_calib_steps": 1,
         "num_score_steps": 1,
-        "method": "gradient",
+        "method": method,
     }
 
     if use_cache:
@@ -1100,7 +1480,8 @@ def test_auto_quantize_group_boundary_handles_explicit_use_cache_flag(use_cache)
         )
 
 
-def test_auto_quantize_group_boundary_restores_cleanup_when_cache_disabling_fails():
+@pytest.mark.parametrize("method", ["gradient", "hidden_recon"])
+def test_auto_quantize_group_boundary_restores_cleanup_when_cache_disabling_fails(method):
     model = _PartiallyFailingCacheConfigModel()
 
     with pytest.raises(RuntimeError, match="cannot disable use_cache"):
@@ -1116,7 +1497,7 @@ def test_auto_quantize_group_boundary_restores_cleanup_when_cache_disabling_fail
             loss_func=lambda output, data: output.sum(),
             num_calib_steps=1,
             num_score_steps=1,
-            method="gradient",
+            method=method,
         )
 
     assert model.config.use_cache is True
@@ -1242,7 +1623,7 @@ INT8_CUSTOM_QUANT_TEST_CFG = {
 )
 @pytest.mark.parametrize(
     "method",
-    ["gradient", "kl_div"],
+    ["gradient", "hidden_recon", "kl_div"],
 )
 def test_auto_quantize(model_cls, search_formats, min_bits, search_bits, method):
     model = model_cls()
@@ -1268,6 +1649,14 @@ def test_auto_quantize(model_cls, search_formats, min_bits, search_bits, method)
     assert effective_bits_from_search <= search_bits and effective_bits_from_search >= min_bits, (
         "Search failed!"
     )
+    for candidate_stat in search_history["candidate_stats"].values():
+        assert len(candidate_stat["raw_scores"]) == len(candidate_stat["scores"])
+        expected_scores = []
+        previous_score = float("inf")
+        for raw_score in candidate_stat["raw_scores"]:
+            previous_score = min(raw_score, previous_score)
+            expected_scores.append(previous_score)
+        assert candidate_stat["scores"] == expected_scores
 
     if model_cls == TransformerBlock:
         hparam = model.attn.q_proj.get_hparam("quant_recipe")
@@ -1288,6 +1677,318 @@ def test_auto_quantize(model_cls, search_formats, min_bits, search_bits, method)
     output_ref = best_model(input)
     output_test = new_model(input)
     assert torch.allclose(output_ref, output_test)
+
+
+@pytest.mark.parametrize("method", ["gradient", "hidden_recon", "kl_div"])
+def test_auto_quantize_two_stage_selects_and_records_held_out_kl(method):
+    model = TransformerBlock()
+    first_stage_data = [model.get_input()]
+    held_out_data = [
+        {
+            "inputs": model.get_input(),
+            "attention_mask": torch.tensor([[1, 1, 0, 0]]),
+        }
+    ]
+
+    _, search_history = mtq.auto_quantize(
+        model,
+        constraints={"effective_bits": 8.0},
+        quantization_formats=[
+            mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
+            mtq.INT8_DEFAULT_CFG,
+        ],
+        data_loader=first_stage_data,
+        forward_step=lambda model, batch: model(batch),
+        loss_func=lambda output, data: output.sum(),
+        num_calib_steps=1,
+        num_score_steps=1,
+        num_candidates=3,
+        candidate_selection_data_loader=held_out_data,
+        candidate_selection_forward_step=lambda model, batch: model(batch["inputs"]),
+        num_candidate_selection_steps=1,
+        method=method,
+    )
+
+    candidates = search_history["best"]["candidates"]
+    selection = search_history["best"]["candidate_selection"]
+    assert len(candidates) == 3
+    assert {
+        key: selection[key]
+        for key in (
+            "metric",
+            "requested_candidates",
+            "evaluated_candidates",
+            "requested_steps",
+            "evaluated_steps",
+            "requires_disjoint_samples",
+        )
+    } == {
+        "metric": "kl_div",
+        "requested_candidates": 3,
+        "evaluated_candidates": 3,
+        "requested_steps": 1,
+        "evaluated_steps": 1,
+        "requires_disjoint_samples": True,
+    }
+    assert selection["requested_pool_size"] == 3
+    assert selection["enumerated_pool_size"] == 3
+    assert selection["min_hamming_distance"] == 1
+    assert selection["fallback_used"] is False
+    json.dumps(selection)
+    assert [candidate["selection_rank"] for candidate in candidates] == [0, 1, 2]
+    assert candidates[0]["selected"]
+    assert not any(candidate["selected"] for candidate in candidates[1:])
+    assert candidates[0]["validation_kl_div"] == min(
+        candidate["validation_kl_div"] for candidate in candidates
+    )
+    assert selection["reported_metrics"] == ["kl_div", "ear"]
+    assert selection["ear_definition"] == "full_vocabulary_probability_overlap"
+    assert all(0.0 <= candidate["validation_ear"] <= 1.0 for candidate in candidates)
+    assert all(
+        candidate["validation_ear_sum"]
+        == pytest.approx(candidate["validation_ear"] * candidate["validation_token_count"])
+        for candidate in candidates
+    )
+    assert candidates[0]["validation_token_count"] == 2
+    assert search_history["best"]["recipe"] == candidates[0]["recipe"]
+
+
+def test_auto_quantize_two_stage_can_select_maximum_ear():
+    model = TransformerBlock()
+    first_stage_data = [model.get_input()]
+    held_out_data = [{"inputs": model.get_input(), "attention_mask": torch.ones((1, 4))}]
+
+    _, search_history = mtq.auto_quantize(
+        model,
+        constraints={"effective_bits": 8.0},
+        quantization_formats=[
+            mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
+            mtq.INT8_DEFAULT_CFG,
+        ],
+        data_loader=first_stage_data,
+        forward_step=lambda model, batch: model(batch),
+        loss_func=lambda output, data: output.sum(),
+        num_calib_steps=1,
+        num_score_steps=1,
+        num_candidates=3,
+        candidate_selection_data_loader=held_out_data,
+        candidate_selection_forward_step=lambda model, batch: model(batch["inputs"]),
+        candidate_selection_metric="ear",
+        num_candidate_selection_steps=1,
+    )
+
+    candidates = search_history["best"]["candidates"]
+    assert search_history["best"]["candidate_selection"]["metric"] == "ear"
+    assert candidates[0]["validation_ear"] == max(
+        candidate["validation_ear"] for candidate in candidates
+    )
+    assert search_history["best"]["recipe"] == candidates[0]["recipe"]
+
+
+@pytest.mark.parametrize("selection_metric", ["kl_div", "ear"])
+def test_auto_quantize_two_stage_metric_ties_preserve_first_stage_order(selection_metric):
+    searcher = AutoQuantizeGradientSearcher()
+    searcher.model = torch.nn.Identity()
+    logits = torch.tensor([[[1.0, 2.0]]])
+    searcher.config = {
+        "candidate_selection_data_loader": [{"logits": logits}],
+        "candidate_selection_forward_step": lambda model, batch: model(batch["logits"]),
+        "candidate_selection_metric": selection_metric,
+        "num_candidate_selection_steps": 1,
+    }
+    packets = [
+        {"recipe_info": {}, "first_stage_rank": first_stage_rank} for first_stage_rank in (2, 0, 1)
+    ]
+
+    _, candidates, _ = searcher._select_candidate_with_kl_div(packets)
+
+    assert [candidate["first_stage_rank"] for candidate in candidates] == [0, 1, 2]
+
+
+@pytest.mark.parametrize("metric", ["kl_div", "ear"])
+@pytest.mark.parametrize("invalid", ["candidate", "reference", "all", "padding"])
+def test_auto_quantize_two_stage_nonfinite_metrics(metric, invalid):
+    searcher = AutoQuantizeGradientSearcher()
+    searcher.model = torch.nn.Identity()
+    logits = torch.tensor([[[1.0, 2.0]]])
+    bad_logits = torch.full_like(logits, torch.nan)
+    data = logits
+    if invalid == "padding":
+        logits = bad_logits = torch.cat([logits, bad_logits], dim=1)
+        data = {"attention_mask": torch.tensor([[1, 0]])}
+    outputs = iter(
+        [
+            bad_logits if invalid == "reference" else logits,
+            bad_logits,
+            bad_logits if invalid == "all" else logits,
+        ]
+    )
+    searcher.config = {
+        "candidate_selection_data_loader": [data],
+        "candidate_selection_forward_step": lambda model, batch: next(outputs),
+        "candidate_selection_metric": metric,
+        "num_candidate_selection_steps": 1,
+    }
+    packets = [{"recipe_info": {}, "first_stage_rank": rank} for rank in (0, 1)]
+
+    if invalid in ("candidate", "padding"):
+        _, candidates, _ = searcher._select_candidate_with_kl_div(packets)
+        assert candidates[0]["first_stage_rank"] == int(invalid == "candidate")
+        assert candidates[0]["validation_kl_div"] == pytest.approx(0)
+        assert candidates[0]["validation_ear"] == pytest.approx(1)
+    else:
+        with pytest.raises(ValueError, match=r"reference|No candidate"):
+            searcher._select_candidate_with_kl_div(packets)
+
+
+def _check_distributed_autoquant_scores_and_selection(rank, world_size):
+    torch.set_num_threads(1)
+    model = _GroupBoundaryModel()
+    torch.manual_seed(rank + 10)
+    _, state = mtq.auto_quantize(
+        model,
+        constraints={"effective_bits": 8.0},
+        quantization_formats=[mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG, mtq.INT8_DEFAULT_CFG],
+        data_loader=[model.get_input()],
+        forward_step=lambda model, batch: model(batch),
+        loss_func=lambda output, batch: output.sum(),
+        num_calib_steps=1,
+        num_score_steps=1,
+        num_candidates=2,
+        candidate_selection_data_loader=[model.get_input()[:, : 2 * rank + 1]],
+        candidate_selection_forward_step=lambda model, batch: model(batch),
+        num_candidate_selection_steps=1,
+    )
+    gathered = [None] * world_size
+    torch.distributed.all_gather_object(gathered, state["candidate_stats"])
+    grouped_scores_agree = all(stats == gathered[0] for stats in gathered)
+    assert all(
+        candidate["validation_token_count"] == 4 for candidate in state["best"]["candidates"]
+    )
+
+    reference = torch.tensor([[[2.0, 0.0]]]).repeat(1, 1 if rank == 0 else 3, 1)
+    flipped = reference.flip(-1)
+    bad_kl = _get_kl_div_per_token(reference.log_softmax(-1), flipped)[0, 0].item()
+    bad_ear = _get_expected_acceptance_rate_from_log_probs(
+        reference.log_softmax(-1), flipped.log_softmax(-1)
+    )[0, 0].item()
+    for metric in ("kl_div", "ear"):
+        for invalid in (None, "candidate", "reference", "all"):
+            searcher = AutoQuantizeGradientSearcher()
+            searcher.model = torch.nn.Identity()
+            searcher.model.output_layer = torch.nn.Identity()
+            searcher.model.output_layer.parallel_state = ParallelState()
+            bad = torch.full_like(reference, torch.nan)
+            outputs = iter(
+                [
+                    bad if invalid == "reference" and rank == 1 else reference,
+                    bad
+                    if invalid in ("candidate", "all") and rank == 1
+                    else (reference if rank == 0 else flipped),
+                    bad
+                    if invalid == "all" and rank == 0
+                    else (flipped if rank == 0 else reference),
+                ]
+            )
+            searcher.config = {
+                "candidate_selection_data_loader": [reference],
+                "candidate_selection_forward_step": lambda model, batch: next(outputs),
+                "candidate_selection_metric": metric,
+                "num_candidate_selection_steps": 1,
+            }
+            packets = [{"recipe_info": {}, "first_stage_rank": i} for i in (0, 1)]
+            if invalid in ("reference", "all"):
+                with pytest.raises(ValueError, match=r"reference|No candidate"):
+                    searcher._select_candidate_with_kl_div(packets)
+                continue
+            _, candidates, _ = searcher._select_candidate_with_kl_div(packets)
+            winner = candidates[0]
+            assert winner["first_stage_rank"] == 1
+            assert winner["validation_token_count"] == 4
+            assert winner["validation_kl_div"] == pytest.approx(bad_kl / 4)
+            assert winner["validation_ear"] == pytest.approx((3 + bad_ear) / 4)
+    assert grouped_scores_agree
+
+
+@pytest.mark.timeout(180)
+def test_auto_quantize_distributed_group_scores_and_candidate_selection():
+    pool = DistributedWorkerPool(world_size=2, backend="gloo")
+    try:
+        pool.run(_check_distributed_autoquant_scores_and_selection)
+    finally:
+        pool.shutdown()
+
+
+def test_auto_quantize_two_stage_rejects_unknown_selection_metric():
+    model = TransformerBlock()
+    first_stage_data = [model.get_input()]
+
+    with pytest.raises(ValueError, match="candidate_selection_metric"):
+        mtq.auto_quantize(
+            model,
+            constraints={"effective_bits": 8.0},
+            quantization_formats=[mtq.INT8_DEFAULT_CFG],
+            data_loader=first_stage_data,
+            forward_step=lambda model, batch: model(batch),
+            loss_func=lambda output, data: output.sum(),
+            num_calib_steps=1,
+            num_score_steps=1,
+            candidate_selection_metric="accuracy",
+        )
+
+
+def test_auto_quantize_two_stage_rejects_reused_first_stage_loader():
+    model = TransformerBlock()
+    data = [model.get_input()]
+
+    with pytest.raises(ValueError, match="must be a distinct loader"):
+        mtq.auto_quantize(
+            model,
+            constraints={"effective_bits": 8.0},
+            quantization_formats=[
+                mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
+                mtq.INT8_DEFAULT_CFG,
+            ],
+            data_loader=data,
+            forward_step=lambda model, batch: model(batch),
+            loss_func=lambda output, batch: output.sum(),
+            num_calib_steps=1,
+            num_score_steps=1,
+            num_candidates=2,
+            candidate_selection_data_loader=data,
+            candidate_selection_forward_step=lambda model, batch: model(batch),
+            num_candidate_selection_steps=1,
+        )
+
+
+def test_auto_quantize_two_stage_rejects_holdout_without_valid_tokens():
+    model = TransformerBlock()
+    first_stage_data = [model.get_input()]
+    held_out_data = [
+        {
+            "inputs": model.get_input(),
+            "attention_mask": torch.zeros((1, 4), dtype=torch.long),
+        }
+    ]
+
+    with pytest.raises(ValueError, match="no valid tokens"):
+        mtq.auto_quantize(
+            model,
+            constraints={"effective_bits": 8.0},
+            quantization_formats=[
+                mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
+                mtq.INT8_DEFAULT_CFG,
+            ],
+            data_loader=first_stage_data,
+            forward_step=lambda model, batch: model(batch),
+            loss_func=lambda output, data: output.sum(),
+            num_calib_steps=1,
+            num_score_steps=1,
+            num_candidates=2,
+            candidate_selection_data_loader=held_out_data,
+            candidate_selection_forward_step=lambda model, batch: model(batch["inputs"]),
+            num_candidate_selection_steps=1,
+        )
 
 
 def test_auto_quantize_disable_layers():
@@ -1591,7 +2292,7 @@ def test_estimate_quant_compression_per_entry_effective_bits():
         )
 
 
-@pytest.mark.parametrize("method", ["gradient", "kl_div"])
+@pytest.mark.parametrize("method", ["gradient", "hidden_recon", "kl_div"])
 def test_auto_quantize_checkpoint_resume(method, tmp_path, capsys):
     """Test that checkpoint can be used to resume an interrupted search."""
     model = SimpleLinear()
@@ -1679,6 +2380,43 @@ def test_auto_quantize_checkpoint_resume(method, tmp_path, capsys):
                 torch.testing.assert_close(
                     s1["state_dict"][qname][buf_name], s2["state_dict"][qname][buf_name]
                 )
+
+
+@pytest.mark.parametrize("method", ["gradient", "hidden_recon", "kl_div"])
+def test_auto_quantize_one_stage_resume_clears_candidate_selection(tmp_path, method):
+    checkpoint = str(tmp_path / "two_stage.pth")
+    template = TransformerBlock()
+    inputs = template.get_input()
+
+    def run(bits, candidates):
+        return mtq.auto_quantize(
+            copy.deepcopy(template),
+            constraints={"effective_bits": bits},
+            quantization_formats=[mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG, mtq.INT8_DEFAULT_CFG],
+            data_loader=[inputs],
+            forward_step=lambda model, batch: model(batch),
+            loss_func=(lambda output, batch: output.sum()) if method == "gradient" else None,
+            num_calib_steps=1,
+            num_score_steps=1,
+            method=method,
+            num_candidates=candidates,
+            candidate_selection_data_loader=[inputs + 0.25] if candidates > 1 else None,
+            candidate_selection_forward_step=(lambda model, batch: model(batch))
+            if candidates > 1
+            else None,
+            num_candidate_selection_steps=1,
+            checkpoint=checkpoint,
+        )[1]
+
+    original = run(16.0, 2)["best"]
+    assert original["candidates"][0]["selected"]
+    resumed = run(8.0, 1)["best"]
+    assert resumed["recipe"] != original["recipe"]
+    assert resumed["constraints"]["effective_bits"] <= 8.0
+    assert resumed["candidates"] == []
+    assert resumed["candidate_selection"] is None
+    assert safe_load(checkpoint)["best"]["candidates"] == []
+    assert safe_load(checkpoint)["best"]["candidate_selection"] is None
 
 
 def test_auto_quantize_checkpoint_rejects_changed_fixed_ptq_baseline(tmp_path):
@@ -1864,6 +2602,77 @@ def test_auto_quantize_calibration_checkpoint_validates_resolved_search_setup(
         )
 
 
+def test_auto_quantize_calibration_checkpoint_resumes_with_cost_excluded_groups(
+    tmp_path, monkeypatch
+):
+    checkpoint_path = str(tmp_path / "autoquant_cost_excluded_calibration.pth")
+    original_estimate_scores = AutoQuantizeGradientSearcher.estimate_sensitivity_scores
+
+    def interrupt_after_calibration(self):
+        raise RuntimeError("interrupt after calibration")
+
+    constraints = {
+        "effective_bits": 8.0,
+        "cost": {EXCLUDED_MODULE_NAME_PATTERNS_KEY: ["*attn*"]},
+    }
+    monkeypatch.setattr(
+        AutoQuantizeGradientSearcher,
+        "estimate_sensitivity_scores",
+        interrupt_after_calibration,
+    )
+    model = TransformerBlock()
+    with pytest.raises(RuntimeError, match="interrupt after calibration"):
+        mtq.auto_quantize(
+            model,
+            constraints=constraints,
+            quantization_formats=[
+                mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
+                mtq.INT8_DEFAULT_CFG,
+            ],
+            data_loader=[model.get_input()],
+            forward_step=lambda model, batch: model(batch),
+            loss_func=lambda output, data: output.sum(),
+            num_calib_steps=1,
+            num_score_steps=1,
+            checkpoint=checkpoint_path,
+        )
+
+    saved = safe_load(checkpoint_path)
+    assert type(saved["candidate_stats"]) is dict
+    assert not saved["candidate_stats"]
+
+    monkeypatch.setattr(
+        AutoQuantizeGradientSearcher,
+        "estimate_sensitivity_scores",
+        original_estimate_scores,
+    )
+    resumed_model = TransformerBlock()
+    _, resumed = mtq.auto_quantize(
+        resumed_model,
+        constraints=constraints,
+        quantization_formats=[
+            mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
+            mtq.INT8_DEFAULT_CFG,
+        ],
+        data_loader=[resumed_model.get_input()],
+        forward_step=lambda model, batch: model(batch),
+        loss_func=lambda output, data: output.sum(),
+        num_calib_steps=1,
+        num_score_steps=1,
+        checkpoint=checkpoint_path,
+    )
+
+    excluded_stats = [
+        stats
+        for stats in resumed["candidate_stats"].values()
+        if all("attn" in module_name for module_name in stats["module_names"])
+    ]
+    assert excluded_stats
+    assert all(stats["cost_weight"] == 0.0 for stats in excluded_stats)
+    assert all(stats["uncompressed_cost"] == 0.0 for stats in excluded_stats)
+    assert set(resumed["candidate_stats"]) == set(resumed["best"]["recipe"])
+
+
 def test_auto_quantize_calibration_only_checkpoint_validates_global_formats_and_legacy(
     tmp_path, monkeypatch
 ):
@@ -1972,7 +2781,51 @@ def test_auto_quantize_checkpoint_rejects_score_boundary_mismatch(tmp_path):
         )
 
 
-@pytest.mark.parametrize("method", ["gradient", "kl_div"])
+@pytest.mark.parametrize(
+    ("saved_fallback", "current_fallback", "legacy"),
+    [
+        (None, None, True),
+        (None, -30, True),
+        (-30, -60, False),
+        (-30, None, False),
+        (-30, -30, False),
+    ],
+)
+def test_auto_quantize_checkpoint_validates_kl_fallback(
+    tmp_path, saved_fallback, current_fallback, legacy
+):
+    checkpoint = str(tmp_path / "kl_fallback.pth")
+
+    def run(fallback):
+        model = SimpleLinear()
+        return mtq.auto_quantize(
+            model,
+            constraints={"effective_bits": 6.0},
+            quantization_formats=[mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG, mtq.INT8_DEFAULT_CFG],
+            data_loader=[model.get_input()],
+            forward_step=lambda model, batch: model(batch),
+            num_calib_steps=1,
+            num_score_steps=1,
+            method="kl_div",
+            kl_log_prob_fallback=fallback,
+            checkpoint=checkpoint,
+        )[1]
+
+    original = run(saved_fallback)
+    saved = safe_load(checkpoint)
+    assert saved["kl_log_prob_fallback"] == saved_fallback
+    if legacy:
+        del saved["kl_log_prob_fallback"]
+        safe_save(saved, checkpoint)
+    if saved_fallback == current_fallback:
+        resumed = run(current_fallback)
+        assert resumed["candidate_stats"] == original["candidate_stats"]
+    else:
+        with pytest.raises(ValueError, match="KL log-probability fallback"):
+            run(current_fallback)
+
+
+@pytest.mark.parametrize("method", ["gradient", "hidden_recon", "kl_div"])
 def test_get_auto_quantize_config(method):
     model = TransformerBlock()
 

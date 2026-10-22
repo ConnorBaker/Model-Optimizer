@@ -23,6 +23,7 @@ search space.
 
 import copy
 import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -394,15 +395,119 @@ class LPS:
             selections: A list of selected candidate indices per layer.
             status: Status of the solver.
         """
-        selection_vars = self._build_selection_vars()
+        solutions = self.solve_top_k(1)
+        if not solutions:
+            return [], "Infeasible"
+        return solutions[0]
 
-        problem = self._build_objective_problem(selection_vars)
-        for one_hot_constraint in self._build_one_hot_constraints(selection_vars):
-            problem += one_hot_constraint
-        for budget_constraint in self._build_budget_constraints(selection_vars):
-            problem += budget_constraint
+    def solve_top_k(
+        self,
+        k: int,
+        min_hamming_distance: int = 1,
+        hamming_group_indices: list[int] | None = None,
+        max_objective_regret: float | None = None,
+    ) -> list[tuple[list[int], str]]:
+        """Return up to ``k`` objective-ranked, distance-separated feasible selections.
 
-        problem.solve(self.solver)
+        Each successful solve adds a cut requiring later selections to differ in at
+        least ``min_hamming_distance`` of the selected decision groups. The default
+        distance of one is the historical exact no-good cut. When
+        ``max_objective_regret`` is provided, all alternatives must remain within that
+        relative regret of rank zero.
+        """
+        if k <= 0:
+            raise ValueError("k must be positive.")
+        if isinstance(min_hamming_distance, bool) or not isinstance(min_hamming_distance, int):
+            raise TypeError("min_hamming_distance must be an integer.")
+        if min_hamming_distance <= 0:
+            raise ValueError("min_hamming_distance must be positive.")
+        if max_objective_regret is not None:
+            if isinstance(max_objective_regret, bool) or not isinstance(
+                max_objective_regret, int | float
+            ):
+                raise TypeError("max_objective_regret must be a number or None.")
+            if max_objective_regret < 0:
+                raise ValueError("max_objective_regret cannot be negative.")
 
-        selections = [np.argmax([z.varValue for z in layer_vars]) for layer_vars in selection_vars]
-        return selections, pulp.LpStatus[problem.status]
+        if hamming_group_indices is None:
+            hamming_group_indices = list(range(self.num_layers))
+        if (
+            not hamming_group_indices
+            or len(set(hamming_group_indices)) != len(hamming_group_indices)
+            or any(
+                isinstance(layer_id, bool)
+                or not isinstance(layer_id, int)
+                or layer_id < 0
+                or layer_id >= self.num_layers
+                for layer_id in hamming_group_indices
+            )
+        ):
+            raise ValueError(
+                "hamming_group_indices must contain unique, valid decision-group indices."
+            )
+        hamming_group_index_set = set(hamming_group_indices)
+
+        solutions = []
+        excluded_selections = []
+        rank_zero_objective = None
+        solve_times = []
+        for _ in range(k):
+            selection_vars = self._build_selection_vars()
+            problem = self._build_objective_problem(selection_vars)
+            for one_hot_constraint in self._build_one_hot_constraints(selection_vars):
+                problem += one_hot_constraint
+            for budget_constraint in self._build_budget_constraints(selection_vars):
+                problem += budget_constraint
+            for cut_id, selection in enumerate(excluded_selections):
+                problem += (
+                    sum(
+                        selection_vars[layer_id][candidate_id]
+                        for layer_id, candidate_id in enumerate(selection)
+                        if layer_id in hamming_group_index_set
+                    )
+                    <= len(hamming_group_indices) - min_hamming_distance,
+                    f"hamming_distance_{cut_id}",
+                )
+            if rank_zero_objective is not None and max_objective_regret is not None:
+                objective_tolerance = max(abs(rank_zero_objective), 1e-12) * max_objective_regret
+                if self.objective_type == pulp.LpMinimize:
+                    problem += (
+                        problem.objective <= rank_zero_objective + objective_tolerance,
+                        "objective_regret",
+                    )
+                else:
+                    problem += (
+                        problem.objective >= rank_zero_objective - objective_tolerance,
+                        "objective_regret",
+                    )
+
+            solve_start = time.perf_counter()
+            problem.solve(self.solver)
+            solve_times.append(time.perf_counter() - solve_start)
+            status = pulp.LpStatus[problem.status]
+            if status != "Optimal":
+                break
+
+            selection = [
+                int(np.argmax([float(z.varValue or 0.0) for z in layer_vars]))
+                for layer_vars in selection_vars
+            ]
+            if rank_zero_objective is None:
+                rank_zero_objective = sum(
+                    self.candidate_scores[layer_id][candidate_id]
+                    for layer_id, candidate_id in enumerate(selection)
+                )
+            solutions.append((selection, status))
+            excluded_selections.append(selection)
+
+        self.last_solve_metadata = {
+            "requested_solutions": k,
+            "returned_solutions": len(solutions),
+            "min_hamming_distance": min_hamming_distance,
+            "hamming_group_count": len(hamming_group_indices),
+            "max_objective_regret": max_objective_regret,
+            "solve_times_seconds": solve_times,
+            "solver_time_seconds": sum(solve_times),
+            "terminal_status": status if solve_times else "Not Solved",
+        }
+        return solutions

@@ -26,6 +26,7 @@ Experimental
 
 **New Features**
 
+- Add optional hidden-reconstruction AutoQuantize scoring and two-stage recipe selection using held-out KL divergence or expected acceptance rate, with configurable candidate diversity.
 - Add the ``prepare_megatron_data_blend`` utility to prepare weighted Megatron data blends from YAML configs, including optional token-budgeted subsets for distillation workflows. See the `Megatron data preparation guide <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/dataset/MEGATRON_DATA_PREP.md#prepare-token-budgeted-data-blends>`_.
 - Add Learned Scale Quantization (LSQ) and Dual-LSQ support for quantization-aware distillation, including learnable ``amax`` parameters, tied-scale and pre-scale options, focused NVFP4 recipes, and scale-only training.
 - Add group-boundary AutoQuantize scoring and make it the default for gradient scoring. Quantizable descendants of common Hugging Face and Megatron attention parents are scored at their parent attention output without grouping recipe decisions; attention containers resolve to their invoked child, while fused, shared, and unfused MoE experts retain the established parent-MLP scoring boundary. Explicit mutable cache or recurrent-state inputs are rejected during parent replay, and configuration-level cache changes are transactional. Set ``score_boundary: local`` in an AutoQuantize recipe to restore leaf-output attention scoring. KL-divergence retains local scoring.

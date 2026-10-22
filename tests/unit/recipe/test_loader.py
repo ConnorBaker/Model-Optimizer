@@ -16,6 +16,7 @@
 """Unit tests for modelopt.recipe.loader and modelopt.recipe.loader.load_config."""
 
 import json
+import math
 import os
 import re
 import sys
@@ -1729,6 +1730,7 @@ def test_load_recipe_autoquantize_minimal(tmp_path):
     assert aq.auto_quantize_method == "gradient"
     assert aq.score_boundary is None
     assert aq.score_size == 128
+    assert aq.kl_log_prob_fallback is None
     assert aq.kv_cache is None
     assert aq.constraints.effective_bits == 4.8
     assert aq.constraints.cost_model == "weight"
@@ -1817,6 +1819,26 @@ def test_load_recipe_autoquantize_rejects_group_boundary_for_kl_div():
         )
 
 
+@pytest.mark.parametrize("fallback", [0.0, 1.0, math.inf, math.nan])
+def test_load_recipe_autoquantize_rejects_invalid_kl_log_prob_fallback(fallback):
+    with pytest.raises(ValueError, match="kl_log_prob_fallback must be a finite negative"):
+        AutoQuantizeConfig(
+            constraints=AutoQuantizeConstraints(effective_bits=5.4),
+            candidate_formats=[QuantizeConfig(quant_cfg=[])],
+            auto_quantize_method="kl_div",
+            kl_log_prob_fallback=fallback,
+        )
+
+
+def test_load_recipe_autoquantize_rejects_kl_log_prob_fallback_for_other_methods():
+    with pytest.raises(ValueError, match="requires auto_quantize_method='kl_div'"):
+        AutoQuantizeConfig(
+            constraints=AutoQuantizeConstraints(effective_bits=5.4),
+            candidate_formats=[QuantizeConfig(quant_cfg=[])],
+            kl_log_prob_fallback=-100.0,
+        )
+
+
 def test_load_recipe_autoquantize_builtin_active_moe():
     """The shipped active-MoE AutoQuantize recipe resolves to the expected values."""
     recipe = load_recipe("general/auto_quantize/w4a16_nvfp4_fp8_at_6p0bits-active_moe")
@@ -1896,4 +1918,8 @@ def test_load_recipe_autoquantize_builtin_general(recipe_path):
     recipe = load_recipe(recipe_path)
     assert isinstance(recipe, ModelOptAutoQuantizeRecipe)
     assert len(recipe.auto_quantize.candidate_formats) >= 2
-    assert recipe.auto_quantize.auto_quantize_method in ("gradient", "kl_div")
+    assert recipe.auto_quantize.auto_quantize_method in (
+        "gradient",
+        "hidden_recon",
+        "kl_div",
+    )

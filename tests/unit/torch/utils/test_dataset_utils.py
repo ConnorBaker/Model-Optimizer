@@ -695,6 +695,20 @@ class TestGetDatasetDataloaderBlending:
             )
 
 
+def test_interleave_sample_sources_balances_contiguous_splits():
+    samples = dataset_utils._interleave_sample_sources(
+        [
+            ["a0", "a1", "a2", "a3"],
+            ["b0", "b1", "b2"],
+            ["c0", "c1"],
+        ]
+    )
+
+    assert samples == ["a0", "b0", "c0", "a1", "b1", "c1", "a2", "b2", "a3"]
+    assert {sample[0] for sample in samples[:6]} == {"a", "b", "c"}
+    assert {sample[0] for sample in samples[6:]} == {"a", "b"}
+
+
 def test_multi_source_pack_shuffles_to_avoid_dominance(monkeypatch, tiny_tokenizer):
     """With ``pack=True`` and 2+ sources, samples are shuffled so a long-doc source
     can't silently exhaust the row budget and drop the other sources.
@@ -862,6 +876,20 @@ class TestLocalDatasetDirRoundTrips:
         test_only = set(get_dataset_samples(dataset, num_samples=10, split="test"))
         assert any(s in train_only for s in samples)
         assert any(s in test_only for s in samples)
+
+    def test_load_multiple_splits_interleaved(self, make_toy_hf_dataset):
+        dataset = make_toy_hf_dataset()
+        train = get_dataset_samples(dataset, num_samples=3, split="train")
+        test = get_dataset_samples(dataset, num_samples=3, split="test")
+
+        samples = get_dataset_samples(
+            dataset,
+            num_samples=6,
+            split=["train", "test"],
+            interleave_splits=True,
+        )
+
+        assert samples == [item for pair in zip(train, test) for item in pair]
 
     def test_default_split_is_train(self, make_toy_hf_dataset):
         dataset = make_toy_hf_dataset()

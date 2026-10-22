@@ -41,7 +41,7 @@ from example_utils import (
     resolve_checkpoint_dir,
     run_nemotron_vl_preview,
 )
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -170,6 +170,36 @@ def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return {k: _to_device(v) for k, v in batch.items()}
 
 
+def _split_dataloader_for_candidate_selection(
+    dataloader: DataLoader,
+    first_stage_size: int,
+    candidate_selection_size: int,
+) -> tuple[DataLoader, DataLoader]:
+    """Split a deterministic loader into non-overlapping first- and second-stage rows."""
+    total_size = first_stage_size + candidate_selection_size
+    if len(dataloader.dataset) < total_size:
+        raise ValueError(
+            "Dataset produced fewer rows than required for disjoint AutoQuantize "
+            f"splits: required {total_size}, got {len(dataloader.dataset)}."
+        )
+
+    full_dataset = dataloader.dataset
+    common_kwargs = {
+        "batch_size": dataloader.batch_size,
+        "shuffle": False,
+        "collate_fn": dataloader.collate_fn,
+    }
+    first_stage_loader = DataLoader(
+        Subset(full_dataset, range(first_stage_size)),
+        **common_kwargs,
+    )
+    selection_loader = DataLoader(
+        Subset(full_dataset, range(first_stage_size, total_size)),
+        **common_kwargs,
+    )
+    return first_stage_loader, selection_loader
+
+
 def make_calib_dataloader(
     args: argparse.Namespace,
     language_model: torch.nn.Module,
@@ -177,10 +207,24 @@ def make_calib_dataloader(
     tokenizer: PreTrainedTokenizerBase | None,
     device: torch.device,
     model_type: str | None,
-    autoquant_gradient_recipe: bool = False,
-) -> tuple[DataLoader | _DeviceDataLoader, str | None]:
+    autoquant_config=None,
+) -> tuple[DataLoader | _DeviceDataLoader, DataLoader | None, str | None]:
     calib_dataloader = None
+    candidate_selection_dataloader = None
     first_text_speech_dataset = None
+    candidate_selection_size = (
+        autoquant_config.candidate_selection_size
+        if autoquant_config is not None and autoquant_config.num_candidates > 1
+        else 0
+    )
+    if candidate_selection_size and (
+        args.specdec_offline_dataset is not None
+        or args.calib_with_images
+        or model_type == "whisper"
+    ):
+        raise NotImplementedError(
+            "Two-stage AutoQuantize held-out splitting currently supports text datasets only."
+        )
     if args.specdec_offline_dataset is not None:
         offline_data_path = Path(args.specdec_offline_dataset)
         dumped_files = sorted(str(p) for p in offline_data_path.glob("*.pt"))
@@ -238,21 +282,41 @@ def make_calib_dataloader(
         )
     else:
         assert tokenizer is not None and isinstance(
-            tokenizer, (PreTrainedTokenizer, PreTrainedTokenizerFast)
+            tokenizer, PreTrainedTokenizer | PreTrainedTokenizerFast
         ), "The PreTrainedTokenizer must be set"
-        # Labels are only needed for gradient-based auto_quantize
-        include_labels = autoquant_gradient_recipe
+        # Labels are only needed for gradient-based auto_quantize.
+        include_labels = (
+            autoquant_config is not None and autoquant_config.auto_quantize_method == "gradient"
+        )
+        dataset_sizes = args.calib_size
+        if candidate_selection_size:
+            if len(args.dataset) != 1 or len(args.calib_size) != 1:
+                raise ValueError(
+                    "Two-stage AutoQuantize currently requires one text dataset and one "
+                    "--calib_size value so the held-out split is unambiguous."
+                )
+            dataset_sizes = [args.calib_size[0] + candidate_selection_size]
 
         calib_dataloader = get_dataset_dataloader(
             dataset_name=args.dataset,
             tokenizer=tokenizer,
             batch_size=args.batch_size,
-            num_samples=args.calib_size,
+            num_samples=dataset_sizes,
             max_sample_length=args.calib_seq,
             device=device,
             include_labels=include_labels,
+            interleave_sources=bool(candidate_selection_size),
         )
-    return calib_dataloader, first_text_speech_dataset
+        if candidate_selection_size:
+            first_stage_size = args.calib_size[0]
+            calib_dataloader, candidate_selection_dataloader = (
+                _split_dataloader_for_candidate_selection(
+                    calib_dataloader,
+                    first_stage_size,
+                    candidate_selection_size,
+                )
+            )
+    return calib_dataloader, candidate_selection_dataloader, first_text_speech_dataset
 
 
 # Presets safe to mix into an AutoQuantize search *and* write via the unified HF checkpoint
@@ -373,6 +437,16 @@ def _mtq_inputs_from_auto_quantize_config(
         "method": aq_config.auto_quantize_method,
         "score_boundary": aq_config.score_boundary,
         "score_size": aq_config.score_size,
+        "kl_log_prob_fallback": aq_config.kl_log_prob_fallback,
+        "num_candidates": aq_config.num_candidates,
+        "candidate_pool_size": aq_config.candidate_pool_size,
+        "candidate_min_hamming_distance": aq_config.candidate_min_hamming_distance,
+        "candidate_diversity_group_patterns": aq_config.candidate_diversity_group_patterns,
+        "candidate_max_objective_regret": aq_config.candidate_max_objective_regret,
+        "candidate_pool_selection": aq_config.candidate_pool_selection,
+        "candidate_distance_fallback": aq_config.candidate_distance_fallback,
+        "candidate_selection_size": aq_config.candidate_selection_size,
+        "candidate_selection_metric": aq_config.candidate_selection_metric,
     }
 
 
@@ -421,6 +495,7 @@ def auto_quantize(
     args: argparse.Namespace,
     language_model: torch.nn.Module,
     calib_dataloader: DataLoader,
+    candidate_selection_dataloader: DataLoader | None,
     aq_config,
     full_model: torch.nn.Module | None = None,
     fixed_quantize_config=None,
@@ -467,7 +542,7 @@ def auto_quantize(
         def loss_func(output, data):
             return output.loss
 
-    if inputs["method"] == "gradient":
+    if inputs["method"] in {"gradient", "hidden_recon"}:
 
         def forward_step(model, batch):
             inputs_ = {k: v for k, v in batch.items() if k != "labels"} if is_base_model else batch
@@ -485,15 +560,24 @@ def auto_quantize(
 
     else:
         raise ValueError(
-            f"Invalid auto_quantize method: {inputs['method']}. Must be 'gradient' or 'kl_div'"
+            f"Invalid auto_quantize method: {inputs['method']}. Must be 'gradient', "
+            "'hidden_recon', or 'kl_div'"
         )
+
+    def candidate_selection_forward_step(model, batch):
+        inputs_ = {k: v for k, v in batch.items() if k != "labels"}
+        output = model(**inputs_)
+        if is_base_model:
+            assert full_model is not None
+            return full_model.lm_head(output.last_hidden_state)
+        return output.logits
 
     language_model, _ = mtq.auto_quantize(
         language_model,
         constraints=inputs["constraints"],
         data_loader=calib_dataloader,
         forward_step=forward_step,
-        loss_func=loss_func,
+        loss_func=loss_func if inputs["method"] == "gradient" else None,
         quantization_formats=inputs["quantization_formats"],
         fixed_quantization_config=inputs["fixed_quantization_config"],
         module_search_spaces=inputs["module_search_spaces"],
@@ -503,6 +587,22 @@ def auto_quantize(
         disabled_layers=inputs["disabled_layers"],
         method=inputs["method"],
         score_boundary=inputs["score_boundary"],
+        kl_log_prob_fallback=inputs["kl_log_prob_fallback"],
+        num_candidates=inputs["num_candidates"],
+        candidate_pool_size=inputs["candidate_pool_size"],
+        candidate_min_hamming_distance=inputs["candidate_min_hamming_distance"],
+        candidate_diversity_group_patterns=inputs["candidate_diversity_group_patterns"],
+        candidate_max_objective_regret=inputs["candidate_max_objective_regret"],
+        candidate_pool_selection=inputs["candidate_pool_selection"],
+        candidate_distance_fallback=inputs["candidate_distance_fallback"],
+        candidate_selection_data_loader=candidate_selection_dataloader,
+        candidate_selection_forward_step=(
+            candidate_selection_forward_step if inputs["num_candidates"] > 1 else None
+        ),
+        candidate_selection_metric=inputs["candidate_selection_metric"],
+        num_candidate_selection_steps=(
+            len(candidate_selection_dataloader) if candidate_selection_dataloader is not None else 1
+        ),
         checkpoint=args.auto_quantize_checkpoint,
     )
 
@@ -690,7 +790,7 @@ def sparsity_main(
     # Different calibration datasets are also available, e.g., "pile" and "wikipedia"
     # Please also check the docstring for the datasets available
     assert tokenizer is not None and isinstance(
-        tokenizer, (PreTrainedTokenizer, PreTrainedTokenizerFast)
+        tokenizer, PreTrainedTokenizer | PreTrainedTokenizerFast
     ), "The PreTrainedTokenizer must be set"
     calib_dataloader = get_dataset_dataloader(
         dataset_name=args.dataset,
@@ -980,6 +1080,10 @@ def post_quantize(
     quantized model for a sample prompt and compare it with pre-quantize generation.
 
     """
+    if args.skip_export:
+        print("Skipping quantized-checkpoint export as requested.")
+        return
+
     # Early exit for offline speculative decoding: skip generation comparison and export directly.
     # The model's get_dummy_inputs() provides the right input format for the export forward pass.
     if args.specdec_offline_dataset is not None:
@@ -1103,7 +1207,7 @@ def quantize_main(
     if args.recipe is not None:
         print(f"Use recipe {args.recipe} for quantization")
         recipe = load_recipe(args.recipe)
-        if not isinstance(recipe, (ModelOptPTQRecipe, ModelOptAutoQuantizeRecipe)):
+        if not isinstance(recipe, ModelOptPTQRecipe | ModelOptAutoQuantizeRecipe):
             raise TypeError(
                 f"Expected PTQ or AutoQuantize recipe, but got {type(recipe).__name__} "
                 f"from {args.recipe}"
@@ -1190,16 +1294,18 @@ def quantize_main(
 
     print(f"Use calib batch_size {args.batch_size}")
 
-    calib_dataloader, first_text_speech_dataset = make_calib_dataloader(
+    (
+        calib_dataloader,
+        candidate_selection_dataloader,
+        first_text_speech_dataset,
+    ) = make_calib_dataloader(
         args,
         language_model,
         processor,
         tokenizer,
         device,
         model_type,
-        autoquant_gradient_recipe=(
-            aq_config is not None and aq_config.auto_quantize_method == "gradient"
-        ),
+        autoquant_config=aq_config,
     )
 
     # Detect if this is a Nemotron VL model using architecture-based detection
@@ -1217,6 +1323,7 @@ def quantize_main(
             args,
             full_model,
             calib_dataloader,
+            candidate_selection_dataloader,
             aq_config,
             full_model=full_model,
             fixed_quantize_config=fixed_quantize_config,
@@ -1472,6 +1579,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
     )
     parser.add_argument(
+        "--skip_export",
+        help=(
+            "Skip writing a quantized checkpoint after calibration/search. "
+            "Useful for sensitivity and candidate-selection experiments that retain "
+            "--auto_quantize_checkpoint as their result artifact."
+        ),
+        default=False,
+        action="store_true",
+    )
+    parser.add_argument(
         "--low_memory_mode",
         help=(
             "Use low memory mode for quantization."
@@ -1513,7 +1630,7 @@ def parse_args() -> argparse.Namespace:
         "--auto_quantize_method",
         type=str,
         default="gradient",
-        choices=["gradient", "kl_div"],
+        choices=["gradient", "hidden_recon", "kl_div"],
         help="[Deprecated: use an AutoQuantize --recipe] Sensitivity scoring method.",
     )
     parser.add_argument(

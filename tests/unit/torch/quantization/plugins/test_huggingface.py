@@ -213,7 +213,7 @@ def test_nemotron_h_experts_only_recipes_target_routed_experts(recipe_path):
     assert not any(module.is_enabled for module in shared_expert_quantizers.values())
 
 
-@pytest.mark.parametrize("method", ["gradient", "kl_div"])
+@pytest.mark.parametrize("method", ["gradient", "hidden_recon", "kl_div"])
 @pytest.mark.parametrize("model_provider", [get_tiny_llama, get_tiny_qwen3_moe])
 def test_autoquantize_huggingface(model_provider, method):
     if model_provider == get_tiny_qwen3_moe and Version(torch.__version__) < Version("2.9"):
@@ -223,7 +223,8 @@ def test_autoquantize_huggingface(model_provider, method):
     input_ids = model.dummy_inputs["input_ids"]
 
     def forward_step(model, batch):
-        return model(**batch) if method == "gradient" else model(**batch).logits
+        output = model(**batch)
+        return output.logits if method == "kl_div" else output
 
     warnings.filterwarnings(
         "error", message="AutoQuantize: Error enabling gradient checkpointing for huggingface model"
@@ -246,7 +247,7 @@ def test_autoquantize_huggingface(model_provider, method):
             quantization_formats=[mtq.INT8_DEFAULT_CFG],
             data_loader=[{"input_ids": input_ids, "labels": input_ids} for _ in range(2)],
             forward_step=forward_step,
-            loss_func=lambda output, data: output.loss,
+            loss_func=(lambda output, data: output.loss) if method == "gradient" else None,
             num_calib_steps=2,
             num_score_steps=2,
             verbose=True,

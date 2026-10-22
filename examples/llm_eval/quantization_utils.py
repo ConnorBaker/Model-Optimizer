@@ -102,6 +102,12 @@ def _quantize_model_with_dataset(
                 # For transformers AutoModelForCausalLM models, the outputs are wrapped in `CausalLMOutputWithPast`
                 # which contains the loss attribute.
                 return output.loss
+        elif auto_quantize_method == "hidden_recon":
+            # Hidden reconstruction compares intermediate unquantized and quantized outputs.
+            def forward_step(model, batch):
+                return model(**batch)
+
+            loss_func = None
         elif auto_quantize_method == "kl_div":
             # For KL divergence method, return only logits
             def forward_step(model, batch):
@@ -111,7 +117,7 @@ def _quantize_model_with_dataset(
         else:
             raise ValueError(
                 f"Invalid auto_quantize_method: {auto_quantize_method}. "
-                "Must be 'gradient' or 'kl_div'"
+                "Must be 'gradient', 'hidden_recon', or 'kl_div'"
             )
 
         net, _ = mtq.auto_quantize(
@@ -192,7 +198,8 @@ def quantize_model(
         test_generated:  If ``True``, test the generated text before and after quantization.
         compress: If ``True``, compress the model after quantization.
         auto_quantize_bits: The effective bits constraint for auto_quantize.
-        auto_quantize_method: The method for auto_quantize ('gradient' or 'kl_div').
+        auto_quantize_method: The method for auto_quantize
+            ('gradient', 'hidden_recon', or 'kl_div').
         auto_quantize_score_size: Number of samples used for auto_quantize scoring.
         auto_quantize_checkpoint: Path to checkpoint file for saving/restoring auto_quantize search state
             (sensitivity scores, costs, etc.). Only used when auto_quantize_bits is specified.

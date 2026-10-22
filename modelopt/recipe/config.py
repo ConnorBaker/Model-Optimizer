@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 from enum import Enum
 from typing import Literal
@@ -254,23 +255,88 @@ class AutoQuantizeConfig(ModeloptBaseConfig):
         description="Optional per-module overrides for candidate formats and BF16/no-quant "
         "selectability. Matching is performed after runtime-fusion grouping.",
     )
-    auto_quantize_method: Literal["gradient", "kl_div"] = ModeloptField(
+    auto_quantize_method: Literal["gradient", "hidden_recon", "kl_div"] = ModeloptField(
         default="gradient",
         title="Sensitivity scoring method",
-        description="'gradient' (Taylor + Fisher, needs labels) or 'kl_div' (no labels).",
+        description="'gradient' (Taylor + Fisher, needs labels), 'hidden_recon' (normalized "
+        "hidden-output reconstruction error), or 'kl_div' (no labels).",
     )
     score_boundary: Literal["local", "group"] | None = ModeloptField(
         default=None,
         title="Sensitivity score boundary",
         description="'local' scores attention projections at their leaf outputs; 'group' scores "
         "them at the parent attention output. Expert projections retain their established parent "
-        "MLP boundary in either mode. Defaults to 'group' for gradient and 'local' for kl_div.",
+        "MLP boundary in either mode. Defaults to 'group' for gradient/hidden_recon and 'local' "
+        "for kl_div.",
     )
     score_size: int = ModeloptField(
         default=128,
         title="Scoring sample count",
         description="Number of samples used for sensitivity scoring (divided by batch_size to get "
         "the number of mtq scoring steps). Matches the former --auto_quantize_score_size.",
+    )
+    kl_log_prob_fallback: float | None = ModeloptField(
+        default=None,
+        title="Non-finite KL log-probability fallback",
+        description="Optional finite negative penalty substituted only for non-finite candidate "
+        "log-probabilities during first-stage local-KL scoring. None preserves exact KL behavior; "
+        "finite candidate log-probabilities are never clipped.",
+    )
+    num_candidates: int = ModeloptField(
+        default=1,
+        title="Held-out candidate count",
+        description="Number of complete recipes evaluated with held-out KL divergence. Values "
+        "greater than 1 enable candidate enumeration and held-out selection.",
+    )
+    candidate_pool_size: int | None = ModeloptField(
+        default=None,
+        title="First-stage candidate pool size",
+        description="Number of feasible recipes to enumerate before optional diversity selection. "
+        "Defaults to num_candidates and must be at least num_candidates.",
+    )
+    candidate_min_hamming_distance: int = ModeloptField(
+        default=1,
+        title="Minimum candidate Hamming distance",
+        description="Required number of differing runtime-grouped AutoQuantize decisions between "
+        "enumerated recipes. The default of 1 preserves exact no-good enumeration.",
+    )
+    candidate_diversity_group_patterns: LayerPatternList | None = ModeloptField(
+        default=None,
+        title="Candidate diversity decision-group patterns",
+        description="Optional glob patterns selecting which runtime-grouped decisions count toward "
+        "Hamming distance. Defaults to all AutoQuantize decision groups.",
+    )
+    candidate_max_objective_regret: float | None = ModeloptField(
+        default=None,
+        title="Maximum first-stage objective regret",
+        description="Optional maximum relative first-stage-score regret versus rank 0. For example, "
+        "0.05 limits alternatives to 5% regret.",
+    )
+    candidate_pool_selection: Literal["objective", "farthest"] = ModeloptField(
+        default="objective",
+        title="Candidate pool selection strategy",
+        description="'objective' keeps the first num_candidates recipes; 'farthest' always retains "
+        "rank 0 and greedily maximizes minimum Hamming distance with deterministic ties.",
+    )
+    candidate_distance_fallback: Literal["none", "relax"] = ModeloptField(
+        default="none",
+        title="Candidate distance fallback",
+        description="'none' evaluates a partial pool when the requested distance is infeasible; "
+        "'relax' fills from exact no-good alternatives and records the fallback.",
+    )
+    candidate_selection_size: int = ModeloptField(
+        default=0,
+        title="Held-out candidate-selection sample count",
+        description="Number of additional, disjoint samples used to evaluate every generated "
+        "recipe by KL divergence and expected acceptance rate. Required when num_candidates is "
+        "greater than 1.",
+    )
+    candidate_selection_metric: Literal["kl_div", "ear"] = ModeloptField(
+        default="kl_div",
+        title="Held-out candidate-selection metric",
+        description="'kl_div' selects the minimum full-vocabulary forward KL (default); 'ear' "
+        "selects the maximum exact full-vocabulary expected acceptance rate. Both metrics are "
+        "recorded for every candidate.",
     )
     disabled_layers: LayerPatternList = ModeloptField(
         default=[],
@@ -307,6 +373,49 @@ class AutoQuantizeConfig(ModeloptBaseConfig):
         )
         if self.auto_quantize_method == "kl_div" and boundary != "local":
             raise ValueError("auto_quantize_method='kl_div' requires score_boundary='local'.")
+        if self.kl_log_prob_fallback is not None:
+            if self.auto_quantize_method != "kl_div":
+                raise ValueError(
+                    "auto_quantize.kl_log_prob_fallback requires auto_quantize_method='kl_div'."
+                )
+            if not math.isfinite(self.kl_log_prob_fallback) or self.kl_log_prob_fallback >= 0:
+                raise ValueError(
+                    "auto_quantize.kl_log_prob_fallback must be a finite negative number."
+                )
+        if self.num_candidates <= 0:
+            raise ValueError("auto_quantize.num_candidates must be positive.")
+        if self.candidate_pool_size is not None:
+            if self.candidate_pool_size < self.num_candidates:
+                raise ValueError(
+                    "auto_quantize.candidate_pool_size must be at least num_candidates."
+                )
+            if self.num_candidates == 1 and self.candidate_pool_size != 1:
+                raise ValueError(
+                    "auto_quantize.candidate_pool_size must be 1 when num_candidates is 1."
+                )
+        if self.candidate_min_hamming_distance <= 0:
+            raise ValueError("auto_quantize.candidate_min_hamming_distance must be positive.")
+        if (
+            self.candidate_diversity_group_patterns is not None
+            and not self.candidate_diversity_group_patterns
+        ):
+            raise ValueError("auto_quantize.candidate_diversity_group_patterns cannot be empty.")
+        if (
+            self.candidate_max_objective_regret is not None
+            and self.candidate_max_objective_regret < 0
+        ):
+            raise ValueError("auto_quantize.candidate_max_objective_regret cannot be negative.")
+        if self.candidate_selection_size < 0:
+            raise ValueError("auto_quantize.candidate_selection_size cannot be negative.")
+        if self.num_candidates > 1 and self.candidate_selection_size <= 0:
+            raise ValueError(
+                "auto_quantize.candidate_selection_size must be positive when "
+                "num_candidates is greater than 1."
+            )
+        if self.num_candidates == 1 and self.candidate_selection_size:
+            raise ValueError(
+                "auto_quantize.candidate_selection_size requires num_candidates greater than 1."
+            )
         return self
 
 

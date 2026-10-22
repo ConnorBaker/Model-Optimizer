@@ -204,11 +204,12 @@ def _add_modelopt_args(parser):
         "--auto_quantize_method",
         type=str,
         default="gradient",
-        choices=["gradient", "kl_div"],
+        choices=["gradient", "hidden_recon", "kl_div"],
         help=(
             "Method for auto_quantize sensitivity analysis. 'gradient' uses gradient-based method "
-            "(requires labels in dataset). 'kl_div' uses KL divergence between original and "
-            "quantized model outputs (no labels required). Default: 'gradient'"
+            "(requires labels in dataset). 'hidden_recon' uses normalized hidden-output "
+            "reconstruction error. 'kl_div' uses KL divergence between original and quantized "
+            "model outputs (no labels required). Default: 'gradient'"
         ),
     )
     parser.add_argument(
