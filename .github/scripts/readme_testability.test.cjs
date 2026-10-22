@@ -42,9 +42,8 @@ test('asks for explicit implementation and posts only an advisory comment', asyn
   assert.equal(run.writes[0].method, 'create');
   assert.equal(run.writes[0].issue_number, 1);
   assert.match(run.writes[0].body, /tiny-model fixture/);
-  assert.match(run.writes[0].body, /Would you like/);
+  assert.match(run.writes[0].body, /To implement, an authorized maintainer can comment/);
   assert.match(run.writes[0].body, new RegExp(`@claude implement.*${SHA}`));
-  assert.match(run.writes[0].body, /has not changed files or run the snippets/);
 });
 
 test('skips proposals for stale commits and closed PRs', async () => {

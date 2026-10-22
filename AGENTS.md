@@ -79,6 +79,8 @@ below, tell the user and offer to address it before pushing; do not push as-is.
 
 ## Responding to README testability advice
 
+- Keep advice concise, including manual assessments: README snippet diffs, then
+  one-line descriptions of test/fixture files to add or modify, and an approval request.
 - CI advice is a proposal, not authorization to edit files or submit jobs.
   Implement it only after an authorized maintainer explicitly requests the changes.
 - Compare the proposal's reviewed commit with the current PR head. If it moved,

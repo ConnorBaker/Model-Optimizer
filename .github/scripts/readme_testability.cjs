@@ -27,14 +27,12 @@ async function publishProposal({github, context, proposal, headSha}) {
   const advice =
       proposal.needs_changes
           ? `${proposal.proposal.trim()}\n\n` +
-                `Would you like these README, test, and fixture changes implemented? ` +
-                `An authorized maintainer can request them by posting a new comment:\n\n` +
-                `\`@claude implement the README testability proposal for commit ${headSha}\`\n\n` +
-                `If the PR changes first, reassess the proposal against the new head before implementing it.`
+                `To implement, an authorized maintainer can comment:\n\n` +
+                `\`@claude implement the README testability proposal for commit ${headSha}\``
           : 'No additional README testability changes are suggested at this commit. The earlier proposal is superseded.';
   const body =
       `${MARKER}\n### README testability proposal\n\nReviewed commit: \`${headSha}\`\n\n` +
-      `${advice}\n\nAdvisory only. This assessment has not changed files or run the snippets.`;
+      `${advice}`;
   if (existing) {
     if (existing.body !== body) {
       await github.rest.issues.updateComment({owner, repo, comment_id : existing.id, body});
