@@ -16,6 +16,7 @@
 import pytest
 import yaml
 from _test_utils.torch.transformers_models import (
+    create_tiny_gpt_oss_dir,
     create_tiny_nemotron_h_dir,
     create_tiny_qwen3_5_moe_vl_dir,
     create_tiny_qwen3_moe_dir,
@@ -136,7 +137,8 @@ def _projs(prefix, names):
             },
             id="nemotron_h",
         ),
-        # The rows tests/unit/torch/quantization/test_hf_to_megatron.py hand-writes for Qwen3.5-MoE.
+        # The rows tests/unit/torch/quantization/test_hf_to_megatron.py hand-writes for Qwen3.5-MoE,
+        # except the routed experts: Bridge maps those from how the checkpoint stores them.
         pytest.param(
             create_tiny_qwen3_5_moe_vl_dir,
             {
@@ -145,14 +147,27 @@ def _projs(prefix, names):
                     f"model.language_model.layers.*.linear_attn.in_proj_{p}"
                     for p in ("qkv", "z", "b", "a")
                 ),
-                "language_model.decoder.layers.*.mlp.experts.linear_fc1": (
-                    "model.language_model.layers.*.mlp.experts.gate_up_proj",
-                ),
                 "language_model.decoder.layers.*.mlp.shared_experts.linear_fc1": _projs(
                     "model.language_model.layers.*.mlp.shared_expert", ("gate", "up")
                 ),
             },
             id="qwen3_5_moe",
+        ),
+        # Packed experts: both Megatron layouts, grouped and sequential, map from the same parameters.
+        pytest.param(
+            create_tiny_gpt_oss_dir,
+            {
+                "decoder.layers.*.mlp.experts.linear_fc1": (
+                    "model.layers.*.mlp.experts.gate_up_proj",
+                ),
+                "decoder.layers.*.mlp.experts.local_experts.*.linear_fc1": (
+                    "model.layers.*.mlp.experts.gate_up_proj",
+                ),
+                "decoder.layers.*.mlp.experts.local_experts.*.linear_fc2": (
+                    "model.layers.*.mlp.experts.down_proj",
+                ),
+            },
+            id="gpt_oss",
         ),
     ],
 )

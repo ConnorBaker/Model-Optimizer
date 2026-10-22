@@ -37,11 +37,17 @@ __all__ = ["ModuleMapping", "module_mappings_from_registry", "translate_quant_cf
 
 _LINEAR_SUFFIXES = ("weight_quantizer", "input_quantizer", "output_quantizer")
 _KV_SUFFIXES = ("q_bmm_quantizer", "k_bmm_quantizer", "v_bmm_quantizer")
-# Wildcards other than the layer index (experts) are enumerated over these representative values.
-_EXPERT_INDICES = (0, 1)
+# Wildcards other than the layer index stand for experts. They are enumerated over a spread of one,
+# two and three digit indices, so a glob that picks experts by position selects some of them but
+# not all; ``_expert_indices`` adds the numbers a glob names experts with.
+_EXPERT_INDICES = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 99, 100, 255, 1000)
 # Only the language-model decoder's layer index is enumerated; modules indexed by another layer
 # container (vision towers, MTP layers) are left to the original entries.
 _DECODER_LAYERS = re.compile(r"^(?:language_model\.)?decoder\.layers\.\*")
+# The Megatron export splits GatedDeltaNet's fused ``in_proj`` and writes ``in_proj_a`` and
+# ``in_proj_b`` unquantized whatever the fused quantizer does (``_gated_delta_net_slicing``). Recipes
+# exclude them while quantizing the other pieces, so the fused quantizer follows the other pieces.
+_UNQUANTIZED_ON_EXPORT = re.compile(r"\.in_proj_[ab]$")
 
 
 @dataclass(frozen=True)
@@ -86,8 +92,6 @@ def module_mappings_from_registry(registry: Any) -> list[ModuleMapping]:
             continue
         if megatron.count("*") and not _DECODER_LAYERS.match(megatron):
             continue
-        if megatron.count("*") > min(name.count("*") for name in hf):
-            continue  # flattened layouts, e.g. nested MTP layers
         mappings[ModuleMapping(megatron, hf, hf_params=None in modules)] = None
         if megatron.endswith(".self_attention.linear_qkv"):
             attention = ModuleMapping(
@@ -117,8 +121,19 @@ def _fill(template: str, indices: Sequence[int]) -> str:
     return template
 
 
+def _expert_indices(entries: Sequence[QuantizerCfgEntry]) -> list[int]:
+    """The expert indices to enumerate: the usual spread plus the numbers globs name experts with."""
+    named = {
+        int(number)
+        for entry in entries
+        if entry.get("parent_class") is None and "expert" in entry["quantizer_name"]
+        for number in re.findall(r"\d+", entry["quantizer_name"])
+    }
+    return sorted({*_EXPERT_INDICES, *named})
+
+
 def _instances(
-    mapping: ModuleMapping, layer_indices: Sequence[int]
+    mapping: ModuleMapping, layer_indices: Sequence[int], experts: Sequence[int]
 ) -> Iterator[tuple[int | None, tuple[int, ...], tuple[int, ...]]]:
     """Yield the (local layer, expert indices, transformers indices) of a mapping's modules."""
     wildcards = mapping.megatron.count("*")
@@ -126,36 +141,41 @@ def _instances(
         yield None, (), ()
         return
     for local in range(len(layer_indices)):
-        for experts in itertools.product(_EXPERT_INDICES, repeat=wildcards - 1):
-            yield local, experts, (layer_indices[local], *experts)
+        for expert in itertools.product(experts, repeat=wildcards - 1):
+            yield local, expert, (layer_indices[local], *expert)
 
 
-def _hf_quantizer_names(mapping: ModuleMapping, indices: Sequence[int], suffix: str) -> list[str]:
+def _hf_quantizer_names(
+    mapping: ModuleMapping, indices: Sequence[int], suffix: str, experts: Sequence[int]
+) -> list[str]:
     names = []
     for hf in mapping.hf:
-        spare = hf.count("*") - len(indices)
-        for extra in itertools.product(_EXPERT_INDICES, repeat=spare):
-            module = _fill(hf, (*indices, *extra))
+        if len(mapping.hf) > 1 and _UNQUANTIZED_ON_EXPORT.search(hf):
+            continue
+        wildcards = hf.count("*")
+        used = indices[:wildcards]  # a packed experts parameter has no expert index of its own
+        for extra in itertools.product(experts, repeat=wildcards - len(used)):
+            module = _fill(hf, (*used, *extra))
             if not mapping.hf_params:
                 names.append(f"{module}.{suffix}")
             elif suffix != "output_quantizer":  # a fused parameter has weight/input quantizers only
                 base, _, param = module.rpartition(".")
                 names.append(f"{base}.{param}_{suffix}")
-    return names
+    return list(dict.fromkeys(names))
 
 
 def _megatron_quantizers(
-    mappings: Sequence[ModuleMapping], layer_indices: Sequence[int]
+    mappings: Sequence[ModuleMapping], layer_indices: Sequence[int], experts: Sequence[int]
 ) -> list[_Quantizer]:
     quantizers = []
     for mapping in mappings:
-        for layer, experts, hf_indices in _instances(mapping, layer_indices):
-            module = _fill(mapping.megatron, () if layer is None else (layer, *experts))
+        for layer, expert, hf_indices in _instances(mapping, layer_indices, experts):
+            module = _fill(mapping.megatron, () if layer is None else (layer, *expert))
             for suffix in mapping.suffixes:
-                hf = _hf_quantizer_names(mapping, hf_indices, suffix)
+                hf = _hf_quantizer_names(mapping, hf_indices, suffix, experts)
                 if hf:
                     quantizers.append(
-                        _Quantizer(f"{module}.{suffix}", mapping, suffix, layer, experts, tuple(hf))
+                        _Quantizer(f"{module}.{suffix}", mapping, suffix, layer, expert, tuple(hf))
                     )
     return quantizers
 
@@ -168,15 +188,23 @@ def _matcher(entry: QuantizerCfgEntry) -> Callable[[str], Any] | None:
 
 
 def _resolve(
-    entries: Sequence[QuantizerCfgEntry], matchers: Sequence[Callable | None], name: str
+    entries: Sequence[QuantizerCfgEntry], matchers: Sequence[Callable | None], names: Sequence[str]
 ) -> tuple[bool, Any] | None:
-    """The (enable, cfg) the entries leave ``name`` in, applied in order like ``set_quantizer_by_cfg``."""
+    """The (enable, cfg) the entries leave a quantizer in, applied in order like ``set_quantizer_by_cfg``.
+
+    An entry applies when it matches any of the quantizer's ``names``.
+    """
     state = None
     for entry, match in zip(entries, matchers):
-        if match is not None and match(name):
+        if match is not None and any(match(name) for name in names):
             cfg = entry["cfg"] if entry["cfg"] is not None else (state[1] if state else None)
             state = (entry["enable"], cfg)
     return state
+
+
+def _alike(a: tuple[bool, Any] | None, b: tuple[bool, Any] | None) -> bool:
+    """Whether two states leave a quantizer alike; the attributes of a disabled one do not matter."""
+    return a == b or (a is not None and b is not None and not a[0] and not b[0])
 
 
 def _describe(state: tuple[bool, Any] | None) -> str:
@@ -194,12 +222,15 @@ def _check_fused_consistency(
     matchers: Sequence[Callable | None],
     quantizers: Sequence[_Quantizer],
 ) -> None:
-    """Raise if the entries configure the transformers pieces of a fused module differently."""
+    """Raise if the entries leave the transformers pieces of a fused quantizer in different states.
+
+    An entry that matches the Megatron name applies to every piece, so it can realign them.
+    """
     conflicts: dict[tuple[str, str], list[tuple[_Quantizer, list]]] = defaultdict(list)
     for quantizer in quantizers:
         if len(quantizer.hf) > 1:
-            states = [_resolve(entries, matchers, name) for name in quantizer.hf]
-            if any(state != states[0] for state in states[1:]):
+            states = [_resolve(entries, matchers, (name, quantizer.name)) for name in quantizer.hf]
+            if not all(_alike(state, states[0]) for state in states[1:]):
                 conflicts[(quantizer.mapping.megatron, quantizer.suffix)].append(
                     (quantizer, states)
                 )
@@ -208,8 +239,13 @@ def _check_fused_consistency(
     lines = []
     for (template, suffix), found in conflicts.items():
         quantizer, states = found[0]
+        by_state: dict[str, list[str]] = defaultdict(list)
+        for name, state in zip(quantizer.hf, states):
+            by_state[_describe(state)].append(name)
         pieces = "".join(
-            f"\n      {name}: {_describe(state)}" for name, state in zip(quantizer.hf, states)
+            f"\n      {state}: {', '.join(names[:3])}"
+            + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+            for state, names in by_state.items()
         )
         lines.append(
             f"  {template}.{suffix} ({len(found)} instance(s)), e.g. {quantizer.name}:{pieces}"
@@ -221,7 +257,7 @@ def _check_fused_consistency(
     )
 
 
-def _globs(missing: Sequence[_Quantizer], num_layers: int) -> list[str]:
+def _globs(missing: Sequence[_Quantizer], num_layers: int, experts: Sequence[int]) -> list[str]:
     """Megatron globs selecting exactly ``missing``: a ``*`` for the layer when all layers are in."""
     groups: dict[tuple[str, str], dict[int | None, set]] = defaultdict(lambda: defaultdict(set))
     for quantizer in missing:
@@ -230,13 +266,11 @@ def _globs(missing: Sequence[_Quantizer], num_layers: int) -> list[str]:
         )
     globs = []
     for (template, suffix), by_layer in groups.items():
-        every_expert = set(
-            itertools.product(_EXPERT_INDICES, repeat=max(template.count("*") - 1, 0))
-        )
-        if any(experts != every_expert for experts in by_layer.values()):
+        every_expert = set(itertools.product(experts, repeat=max(template.count("*") - 1, 0)))
+        if any(selected != every_expert for selected in by_layer.values()):
             raise ValueError(
-                f"A quant_cfg entry selects only some experts of {template}; Megatron-Core "
-                "has them in one module, so select all or none."
+                f"A quant_cfg entry picks experts of {template} by index. Megatron-Core numbers "
+                "experts per rank, so select all experts or none."
             )
         layers = sorted(layer for layer in by_layer if layer is not None)
         every_layer = None in by_layer or len(layers) == num_layers
@@ -259,10 +293,14 @@ def translate_quant_cfg_to_megatron(
     by the original glob only.
 
     A fused Megatron quantizer, e.g. ``linear_qkv`` for ``q/k/v_proj``, has a single state, so the
-    entries must leave all its transformers pieces alike. A layer index in a glob (``*layers.7.*``)
-    is a transformers (global) one and the copies follow ``layer_indices`` accordingly, but the
-    original entry still matches this rank's local indices, so such globs are unreliable under
-    pipeline parallelism.
+    entries must leave all its transformers pieces in the same state once all are applied (an entry
+    that matches the Megatron name applies to every piece, and disabled pieces are alike). The
+    exception is GatedDeltaNet's ``in_proj_a`` and ``in_proj_b``: the export writes them unquantized
+    anyway, so they are not pieces and entries that name only them have no effect.
+
+    A layer index in a glob (``*layers.7.*``) is a transformers (global) one and the copies follow
+    ``layer_indices`` accordingly, but the original entry still matches this rank's local indices,
+    so such globs are unreliable under pipeline parallelism. Experts cannot be picked by index.
 
     Args:
         quant_cfg: The ``quant_cfg`` in any form :func:`normalize_quant_cfg_list` accepts.
@@ -270,12 +308,13 @@ def translate_quant_cfg_to_megatron(
         layer_indices: The global decoder layer index of each of this rank's local layers, in order.
 
     Raises:
-        ValueError: If the entries configure the pieces of a fused module differently, or select
-            only some experts of a grouped-experts module.
+        ValueError: If the entries leave the pieces of a fused module in different states, or pick
+            experts of an experts module by index.
     """
     entries = normalize_quant_cfg_list(quant_cfg)
     matchers = [_matcher(entry) for entry in entries]
-    quantizers = _megatron_quantizers(mappings, layer_indices)
+    experts = _expert_indices(entries)
+    quantizers = _megatron_quantizers(mappings, layer_indices, experts)
     _check_fused_consistency(entries, matchers, quantizers)
 
     translated = []
@@ -286,6 +325,6 @@ def translate_quant_cfg_to_megatron(
         missing = [q for q in quantizers if not match(q.name) and any(match(name) for name in q.hf)]
         translated.extend(
             entry.model_copy(update={"quantizer_name": glob})
-            for glob in _globs(missing, len(layer_indices))
+            for glob in _globs(missing, len(layer_indices), experts)
         )
     return translated

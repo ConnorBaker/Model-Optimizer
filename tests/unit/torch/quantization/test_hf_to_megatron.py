@@ -90,6 +90,22 @@ FUSED_EXPERTS_REGISTRY = SimpleNamespace(
     ]
 )
 
+# Experts whose transformers parameters are packed, in both Megatron layouts: the grouped module
+# and the sequential ``local_experts.*`` ones map from the same parameters (as GPT-OSS's do).
+PACKED_EXPERTS_REGISTRY = SimpleNamespace(
+    mappings=[
+        *FUSED_EXPERTS_REGISTRY.mappings,
+        _mapping(
+            "language_model.decoder.layers.*.mlp.experts.local_experts.*.linear_fc1.weight",
+            "model.language_model.layers.*.mlp.experts.gate_up_proj",
+        ),
+        _mapping(
+            "language_model.decoder.layers.*.mlp.experts.local_experts.*.linear_fc2.weight",
+            "model.language_model.layers.*.mlp.experts.down_proj",
+        ),
+    ]
+)
+
 # The language-model rows of Megatron-Bridge's Qwen3.5-MoE registry: GatedDeltaNet and gated
 # attention layers with MoE MLPs, where Megatron fuses four transformers modules into ``in_proj``.
 _HF_LAYER = "model.language_model.layers.*"
@@ -238,6 +254,18 @@ def _entry(glob, **kwargs):
             _names(FC1, LINEAR[:1]) | _names(FC2, LINEAR[:1]) | _names(PROJ, LINEAR[:1]),
             id="already_matching_or_megatron_spelled",
         ),
+        # A piece configured alone is fine when a later entry settles the fused module as a whole.
+        pytest.param([_entry("*q_proj*"), DISABLE_ALL], set(), id="piece_then_disable_all"),
+        pytest.param(
+            [_entry("*q_proj*"), {"quantizer_name": "*linear_qkv*", "enable": False}],
+            set(),
+            id="piece_then_disable_the_megatron_module",
+        ),
+        pytest.param(
+            [_entry("*q_proj*"), _entry("*linear_qkv*")],
+            _names(QKV, LINEAR),
+            id="piece_then_configure_the_megatron_module",
+        ),
     ],
 )
 def test_translated_entries_select_the_megatron_quantizers(entries, expected):
@@ -276,9 +304,16 @@ def test_translation_follows_the_pipeline_stage_layer_offset():
     )
 
 
-def test_fused_experts_parameter_maps_onto_grouped_experts():
-    mappings = module_mappings_from_registry(FUSED_EXPERTS_REGISTRY)
-    fc1 = "language_model.decoder.layers.{l}.mlp.experts.linear_fc1"
+@pytest.mark.parametrize(
+    "fc1",
+    [
+        "language_model.decoder.layers.{l}.mlp.experts.linear_fc1",
+        "language_model.decoder.layers.{l}.mlp.experts.local_experts.{e}.linear_fc1",
+    ],
+    ids=["grouped", "sequential"],
+)
+def test_packed_experts_parameter_maps_onto_either_experts_layout(fc1):
+    mappings = module_mappings_from_registry(PACKED_EXPERTS_REGISTRY)
     names = _names(fc1, LINEAR) | _names(fc1.replace("fc1", "fc2"), LINEAR)
     assert _apply([_entry("*gate_up_proj_weight_quantizer")], mappings, names) == _names(
         fc1, LINEAR[:1]
@@ -292,12 +327,38 @@ def test_fused_experts_parameter_maps_onto_grouped_experts():
         ([_entry("*q_proj*"), _entry("*k_proj*")], "linear_qkv"),
         ([_entry("*"), {"quantizer_name": "*v_proj*", "enable": False}], "linear_qkv"),
         ([_entry("*experts.0.down_proj*")], "linear_fc2"),
+        ([_entry("*experts.2.down_proj*")], "linear_fc2"),
+        ([_entry("*experts.[01].down_proj*")], "linear_fc2"),
+        ([_entry("*experts.37.down_proj*")], "linear_fc2"),
     ],
-    ids=["gate_without_up", "q_k_without_v", "v_disabled", "one_expert_of_a_module"],
+    ids=[
+        "gate_without_up",
+        "q_k_without_v",
+        "v_disabled",
+        "first_expert",
+        "third_expert",
+        "first_two_experts",
+        "expert_beyond_the_enumerated_ones",
+    ],
 )
 def test_entries_a_megatron_module_cannot_express_raise(entries, megatron_module):
     with pytest.raises(ValueError, match=megatron_module):
         translate_quant_cfg_to_megatron([DISABLE_ALL, *entries], MAPPINGS, LAYERS)
+
+
+def test_gated_delta_net_gates_do_not_decide_the_fused_in_proj():
+    mappings = module_mappings_from_registry(QWEN3_5_MOE_REGISTRY)
+    in_proj = _names(
+        "language_model.decoder.layers.{l}.self_attention.in_proj", LINEAR[:1], range(3)
+    )
+
+    def quantized(*entries):
+        return _apply(entries, mappings, QWEN3_5_MOE_NAMES, range(4))
+
+    # The usual recipe: quantize everything, exclude the gates (Megatron fuses them into ``in_proj``).
+    exclude_gates = {"quantizer_name": "*linear_attn.in_proj_[ab]*", "enable": False}
+    assert in_proj <= quantized(_entry("*weight_quantizer"), exclude_gates)
+    assert quantized(_entry("*linear_attn.in_proj_[ab]*")) == set()
 
 
 def test_module_mappings_skip_what_is_not_a_decoder_module_weight():
@@ -358,14 +419,16 @@ def test_transformers_form_of_the_mcore_recipe_quantizes_the_same_modules(tmp_pa
     native = load_recipe("model_type/qwen3_6_moe/ptq/w4a4_nvfp4-fp8_attn-kv_fp8_cast_mcore")
     recipe_path = tmp_path / "w4a4_nvfp4-fp8_attn-kv_fp8_cast.yaml"
     recipe_path.write_text(QWEN3_6_MOE_TRANSFORMERS_RECIPE)
-    translated = translate_quant_cfg_to_megatron(
-        load_recipe(recipe_path).quantize.quant_cfg,
-        module_mappings_from_registry(QWEN3_5_MOE_REGISTRY),
-        layer_indices=range(4),
-    )
+    mappings = module_mappings_from_registry(QWEN3_5_MOE_REGISTRY)
+
+    def translate(recipe):
+        return translate_quant_cfg_to_megatron(recipe.quantize.quant_cfg, mappings, range(4))
 
     expected = _formats(native.quantize.quant_cfg, QWEN3_5_MOE_NAMES)
-    assert _formats(translated, QWEN3_5_MOE_NAMES) == expected
+    assert _formats(translate(load_recipe(recipe_path)), QWEN3_5_MOE_NAMES) == expected
+    # Translating the Megatron-spelled recipe must not change it: the transformers-named
+    # exclusions it imports (``in_proj_a``/``in_proj_b``) must not reach its fused ``in_proj``.
+    assert _formats(translate(native), QWEN3_5_MOE_NAMES) == expected
 
     # The comparison is not vacuous: NVFP4 on experts and the output layer, FP8 on both attentions.
     nvfp4, fp8, layer = (2, 1), (4, 3), "language_model.decoder.layers"
