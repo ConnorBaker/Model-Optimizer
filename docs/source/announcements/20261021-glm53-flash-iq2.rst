@@ -346,10 +346,10 @@ GLM-5.3-Flash support in Megatron-Bridge and the recipes are still landing in
        --hf_model_name_or_path <glm-5.3-flash-fp8> --megatron_path <ptq_ckpt> \
        --export_unified_hf_path <hf_fakequant>
 
-**Evaluation:** serve with vLLM ≥ 0.30 (``glm47`` reasoning and tool parsers, TP4), and use the
-model card's sampling (temperature 1.0, top_p 0.95; top_p 1.0 for tau2-bench) with
-``reasoning_effort: max`` and a 131K generation budget. GLM reasons long: a 32K budget leaves
-about half of GPQA answers unfinished.
+**Evaluation:** serve with vLLM ≥ 0.31, or 0.30 with ``--no-enable-prefix-caching`` (``glm47`` reasoning
+and tool parsers, TP4), and use the model card's sampling (temperature 1.0, top_p 0.95; top_p 1.0
+for tau2-bench) with ``reasoning_effort: max`` and a 131K generation budget. GLM reasons long: a
+32K budget leaves about half of GPQA answers unfinished.
 
 **QAD, if you try it** (differences from the Qwen3.6 command):
 
