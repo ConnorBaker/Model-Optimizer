@@ -3,7 +3,7 @@
 Experiments behind the [main tutorial](README.md) that did not become the recommended recipe. All builds use the same W4A4 NVFP4 PTQ student, the same evaluation setup and the same `mean ± sem` pooling as the [main results](README.md#results); deltas are against BF16.
 
 - [Data format: pre-tokenized blend vs chat SFT data](#data-format-pre-tokenized-blend-vs-chat-sft-data)
-  - [Controlled rerun: document isolation and assistant-only loss](#controlled-rerun-document-isolation-and-assistant-only-loss)
+  - [Controlled rerun on the corrected kernel](#controlled-rerun-on-the-corrected-kernel)
 - [SciCode non-termination: diagnosis and decode-time fix](#scicode-non-termination-diagnosis-and-decode-time-fix)
 
 ## Data format: pre-tokenized blend vs chat SFT data
@@ -45,7 +45,7 @@ Everything else matches the main run: 32 nodes, EP=8, ~16.8M tokens per iteratio
 
 Both chat-SFT variants pack two conversations into one THD micro-batch (`cu_seqlens`). On that path the Gated DeltaNet `chunk_gated_delta_rule` in FLA 0.4.2, the version in `nemo:26.08`, is **wrong, not just noisy**: on a real packed pair, compared with each conversation run alone, 11% of tokens are off by more than 1% of the layer output's maximum and the worst by ~20%, for the teacher and the student alike. FLA 0.5.2 is bit-exact and reproducible on the same input. The pre-tokenized run feeds unpacked 32K windows, which are exact on both versions, so only the packed runs on this page are affected: both chat-SFT variants and the on-policy test under [For the next QAD run](#for-the-next-qad-run). The controlled rerun below repeats the iteration-50 comparison on FLA 0.5.2.
 
-### Controlled rerun: document isolation and assistant-only loss
+### Controlled rerun on the corrected kernel
 
 The comparison above changed three things at once: cross-document attention (the pre-tokenized windows let each conversation attend to the ones packed before it), the loss mask, and the packed kernel. Three 50-iteration runs were meant to separate them, all on the same student and schedule as above:
 
@@ -68,7 +68,7 @@ The comparison above changed three things at once: cross-document attention (the
 | SciCode capped sub-steps | 0.7% | 4.3% | 3.5% | 2.0% | 3.0% |
 | SciCode median tokens | 1,817 | 2,684 | 2,932 | 2,388 | 2,244 |
 
-><sup>3</sup> B was meant to add per-document attention (`--document_boundaries`, a boundary at every end-of-document token), but no window was split: the blend renders conversations with the chat template and puts no end-of-document token between them, and the flag looked for an ID the data never contains. B is therefore A's recipe again, run on FLA 0.5.2 in THD layout with one segment per window. `distill.py` now uses the tokenizer's EOS and rejects data without it.
+><sup>3</sup> B was meant to add per-document attention (`--document_boundaries` from the then-unmerged [#2912](https://github.com/NVIDIA/Model-Optimizer/pull/2912), a boundary at every end-of-document token), but no window was split: the blend renders conversations with the chat template and puts no end-of-document token between them, and the flag looked for an ID the data never contains. B is therefore A's recipe again, run on FLA 0.5.2 in THD layout with one segment per window. The flag in #2912 now uses the tokenizer's EOS and rejects data without it.
 
 - **The three runs are within noise of each other at iteration 50.** A and B train the same recipe and differ by 0.45 on the mean, mostly on tau2-bench (3 runs): that is the run-to-run noise at iteration 50. C, chat data with per-conversation attention and assistant-only loss, lands between them.
 - **The correct kernel did not reproduce chat SFT's lead.** C is the iteration-50 chat-SFT run repeated on FLA 0.5.2 and scores 0.68 below it, mostly on SciCode (−2.6, 8 runs, sd 0.8) and IFBench, without more runaways (C has the lowest capped rate of the QAD runs). So the wrong kernel did not measurably hurt the original run. Its −0.34 was a favourable draw, consistent with its lead disappearing by iteration 300 and with the 0.45 between A and B.
