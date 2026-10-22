@@ -94,6 +94,12 @@ support; cross-entropy's log penalty has no such ceiling.
 
 ### Teacher policy data
 
+`$CONVERSATIONS` should carry responses the **target generated itself**, not the responses
+that shipped with the prompts. The objective trains the draft to match the target at the
+positions it will meet when serving, and those lie along the target's own samples; scoring
+it against another model's text trains it on positions the target would rarely produce.
+[Data Synthesis](../README.md#data-synthesis) covers generating them.
+
 ```bash
 python collect_hidden_states/compute_sparse_policy_hf.py \
   --model $TARGET --input-data $CONVERSATIONS --output-dir $POLICY_DIR \
