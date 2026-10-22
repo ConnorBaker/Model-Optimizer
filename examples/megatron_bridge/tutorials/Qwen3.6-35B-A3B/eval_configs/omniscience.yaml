@@ -72,7 +72,7 @@ evaluation:
     config:
       params:
         parallelism: 32
-        request_timeout: 14400
+        request_timeout: 3600
         max_retries: 10
         max_new_tokens: 131072
         temperature: 1.0

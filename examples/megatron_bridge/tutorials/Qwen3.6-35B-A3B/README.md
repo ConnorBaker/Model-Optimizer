@@ -61,7 +61,7 @@ See [Potential further improvements](#potential-further-improvements) for what w
 
 ### Knowledge recall and calibration
 
-The six benchmarks above barely test recalling facts, which is what weight quantization tends to cost first. [AA-Omniscience](eval_configs/omniscience.yaml) does: 600 questions across domains, each answered 10 times, and a judge grades every answer as correct, incorrect or abstained ("I don't know"). Its index is the share correct minus the share incorrect, so a wrong guess costs as much as a right answer earns.
+The six benchmarks above barely test recalling facts, which is what weight quantization tends to cost first. [AA-Omniscience](eval_configs/omniscience.yaml) does: 600 questions across domains, each answered 10 times, and a judge grades every answer as correct, partially correct, incorrect or abstained ("I don't know"). Its index is the share correct minus the share incorrect, so a wrong guess costs as much as a right answer earns.
 
 | Model | Correct | Incorrect | Abstained | Omniscience index | Hallucination rate |
 | --- | --- | --- | --- | --- | --- |
@@ -70,7 +70,7 @@ The six benchmarks above barely test recalling facts, which is what weight quant
 | **W4A4 NVFP4 PTQ** | 20.2 | 39.3 | 39.8 | −19.1 | 49.2% |
 | **↳ + QAD 500 iters** | 21.0 ± 0.3 | 48.5 ± 2.3 | 29.8 ± 2.4 | −27.5 | 61.4% |
 
->`pass@1[avg-of-10]`, judged by Gemini 3 Flash. Hallucination rate = incorrect / (100 − correct). The judge grades the remaining ~0.7% partially correct, so the three columns sum to ~99.3. `±` is the sem across the 10 repeats of one run (≤0.6 on the rows without one); the repeats share seeds across models, so it is not the run-to-run sem used elsewhere on this page.
+>`pass@1[avg-of-10]`, judged by Gemini 3 Flash. Hallucination rate = incorrect / (100 − correct). The ~0.7% graded partially correct is not shown, so the three columns sum to ~99.3. `±` is the sem across the 10 repeats of one run (≤0.6 on the rows without one); the repeats share seeds across models, so it is not the run-to-run sem used elsewhere on this page.
 
 - **Knowledge is kept.** Every model answers the same ~21% correctly; 4-bit weights, 4-bit activations and QAD all leave recall intact.
 - **Calibration is not.** Each step abstains less and guesses wrong more: the published W4A16 checkpoint already loses 4 index points, W4A4 PTQ 8, and **QAD 500 loses 16**, at an unchanged correct rate. None of the six benchmarks above can see this.

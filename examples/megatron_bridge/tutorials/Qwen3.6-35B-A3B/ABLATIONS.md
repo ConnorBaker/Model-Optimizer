@@ -47,7 +47,7 @@ Both chat-SFT variants pack two conversations into one THD micro-batch (`cu_seql
 
 ### Controlled rerun on the corrected kernel
 
-The comparison above changed three things at once: cross-document attention (the pre-tokenized windows let each conversation attend to the ones packed before it), the loss mask, and the packed kernel. Three 50-iteration runs were meant to separate them, all on the same student and schedule as above:
+The comparison above changed three things at once: cross-document attention (the pre-tokenized windows let each conversation attend to the ones packed before it), the loss mask, and the packed kernel. Three 50-iteration runs were meant to separate them, all on the same student and schedule as above, but the attention arm turned out to be a no-op (footnote 3), so only the kernel and the data/loss-mask change are separated here:
 
 | | A: pre-tokenized (main run) | B: A repeated<sup>3</sup> | C: chat SFT |
 | --- | --- | --- | --- |
