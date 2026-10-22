@@ -89,7 +89,7 @@ meaningless.
 Accuracy
 ********
 
-.. image:: assets/glm53-flash-iq2-accuracy-delta.svg
+.. image:: assets/glm53-flash-iq2-accuracy-delta.png
    :alt: Score difference from FP8 on six benchmarks and their mean for IQ2_S, IQ2_S + NVFP4 and IQ2_S + QAD 300
    :width: 100%
 
@@ -168,7 +168,7 @@ answers until it reaches the token budget and returns nothing. A ``presence_pena
 decode time cuts IQ2_S's capped SciCode sub-steps from 19.8% to 2.9% and recovers 4.4 points. Compare
 penalized runs only with a penalized FP8, since the penalty also helps FP8 (+0.6).
 
-.. image:: assets/glm53-flash-iq2-scicode-runaway.svg
+.. image:: assets/glm53-flash-iq2-scicode-runaway.png
    :alt: SciCode score and share of sub-steps hitting the token budget, with and without presence_penalty 1.5
    :width: 100%
 
@@ -184,7 +184,7 @@ stored facts. We added HLE (text-only, 2,158 questions, GPT-4o judge), AA-Omnisc
 questions x 10 repeats, Gemini 3 Flash judge) and RULER at 1M tokens (13 subtasks, 25 samples
 each).
 
-.. image:: assets/glm53-flash-iq2-recall.svg
+.. image:: assets/glm53-flash-iq2-recall.png
    :alt: Points below FP8 on HLE, AA-Omniscience accuracy and hallucination rate, and RULER-1M
    :width: 100%
 
@@ -252,7 +252,7 @@ tokens only, 3,840 conversations (~16.8M tokens) per step, top-4096 logit KL, an
 **Where QAD helps.** It fixes the runaway generations that cost IQ2_S most of its long-context
 accuracy, and shortens answers elsewhere:
 
-.. image:: assets/glm53-flash-iq2-qad-effects.svg
+.. image:: assets/glm53-flash-iq2-qad-effects.png
    :alt: Runaway rates on AA-LCR and SciCode, and AA-Omniscience answer length, for IQ2_S, IQ2_S + QAD 300 and FP8
    :width: 100%
 
@@ -263,7 +263,7 @@ and shortens AA-Omniscience answers. With that, AA-LCR rises from 70.0 ± 1.9 to
 **What the current blend does not fix.** On the six-benchmark mean, QAD 300 gains 0.8 ± 0.4 over
 IQ2_S, just under two standard errors, and most of that comes in the first 100 iterations:
 
-.. image:: assets/glm53-flash-iq2-qad-trend.svg
+.. image:: assets/glm53-flash-iq2-qad-trend.png
    :alt: Mean score difference from FP8 and SciCode with presence_penalty across QAD iterations
    :width: 100%
 
@@ -298,7 +298,7 @@ On GB300 NVL72:
 * **QAD:** 32 nodes (128 GPUs; EP32, CP4) at ~400 s per iteration once warm, so the 300 iterations
   took about 35 hours of training, or ~4,500 GPU-hours, not counting restarts.
 
-.. image:: assets/glm53-flash-iq2-cost.svg
+.. image:: assets/glm53-flash-iq2-cost.png
    :alt: GPU-hours for fake-quant export, the two PTQ recipes, and 300 QAD iterations, on a log scale
    :width: 100%
 
