@@ -47,12 +47,12 @@ torchrun --nproc_per_node 8 main.py \
   model.model_name_or_path=$TARGET \
   draft_model_name_or_path=$DRAFT \
   data.sparse_data_path=$POLICY_DIR \
+  data.sparse_cache_dir=$CACHE_DIR \
+  training.training_seq_len=4096 \
   training.output_dir=$OUTPUT_DIR
 ```
 
 ### Recipe
-
-See [`modelopt_recipes/general/speculative_decoding/external_draft.yaml`](../../../modelopt_recipes/general/speculative_decoding/external_draft.yaml)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -108,9 +108,9 @@ python collect_hidden_states/compute_sparse_policy_hf.py \
 ```
 
 Set `--max-seq-len` to the `training.training_seq_len` you will train at. The producer skips
-conversations longer than it, and the collator pads every sample to `training_seq_len`, so
-over-sizing spends the difference on padding and under-sizing silently drops records that
-carry no scored position.
+whole conversations longer than it, scored turns included, and prints how many it skipped. The
+collator pads every sample to `training_seq_len`, so over-sizing spends the difference on
+padding and under-sizing drops the long conversations from the dump.
 
 On a large corpus the first run spends a long time building the memmapped cache beside the
 shards. Under `torchrun` only rank 0 builds it and the others wait, so build it once in a
@@ -147,7 +147,7 @@ never reads the aux planes and they dominate the dump size.
 ```bash
 python collect_hidden_states/compute_hidden_states_hf.py \
   --model $TARGET --input-data $CONVERSATIONS --output-dir $HIDDEN_DIR \
-  --no-aux-hidden-states --answer-only-loss --chat-template ./template.jinja
+  --max-seq-len 4096 --no-aux-hidden-states --answer-only-loss --chat-template ./template.jinja
 ```
 
 ### Cross-tokenizer vocabulary swap (`external_vocab_swap`)
@@ -190,12 +190,8 @@ A cross-tokenizer draft: Llama-3.2-1B-Instruct re-indexed onto Qwen3.8-27B's
 
 ### Teacher policy
 
-```bash
-python collect_hidden_states/compute_sparse_policy_hf.py \
-  --model $TARGET --input-data $CONVERSATIONS --output-dir $POLICY_DIR \
-  --top-k 20 --top-p 0.95 --max-seq-len 12288 \
-  --answer-only-loss --chat-template ./template.jinja
-```
+The [teacher policy data](#teacher-policy-data) dump, with `--max-seq-len 12288` to match
+`training.training_seq_len` below.
 
 ### Training
 
@@ -233,11 +229,10 @@ torchrun --nproc_per_node 8 main.py \
 | Epochs | 1 |
 | Serving policy | top-k 20, top-p 0.95, temperature 1.0 |
 
-> **Note on the learning rate:** a swapped draft begins with a large untrained fraction and
-> wants a higher rate than a matched draft of comparable size. The vocabulary-matched drafts
-> trained against the same dump used 1.0e-5 (4B) and 2.0e-6 (0.8B). These were each selected
-> by sweeping against held-out acceptance; the ordering does not transfer to another target
-> or dump, so re-sweep for your own pair.
+> **Note on the learning rate:** the vocabulary-matched drafts trained against the same dump
+> used 1.0e-5 (4B) and 2.0e-6 (0.8B). Each rate was selected by sweeping against held-out
+> acceptance; the ordering does not transfer to another target or dump, so re-sweep for your
+> own pair.
 
 ## Open Items
 
