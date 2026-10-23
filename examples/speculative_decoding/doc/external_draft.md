@@ -92,6 +92,9 @@ that is all the dump holds; `tvd` and `tvd_deploy` then differ only in whether t
 is put through the filter too. Only `tvd_deploy` applies the same nucleus to both sides.
 Pairing `soft_ce` with `data.sparse_data_path` is a hard error, not a quiet degradation.
 
+Report which truncation you trained under. `top_k` and `top_p` settings are not
+interchangeable, so a number quoted without them is not comparable to anything.
+
 `tvd_ce` exists because TVD is bounded and so ranks weakly among tokens inside the target's
 support; cross-entropy's log penalty has no such ceiling.
 
@@ -131,6 +134,11 @@ SparsePolicyDataset(
 )
 PY
 ```
+
+Use `discover_shards` and the same `cache_dir` the training run will use: a cache keyed on a
+different shard list is ignored, and `torchrun` rebuilds it from scratch. A ragged
+third-party dump also needs `top_k=<its top-k>` here, since the cache width is otherwise
+inferred from the first record and the recipe has no field to set it.
 
 > **Note on `answer_only_loss` and chat templates:** when `--answer-only-loss` is set, the
 > chat template must wrap assistant content in `{% generation %}` / `{% endgeneration %}`
@@ -253,5 +261,8 @@ torchrun --nproc_per_node 8 main.py \
 
 ### Not yet validated
 
+- Streaming the teacher data from a live `vllm serve`. It is accepted for this mode but has
+  not been exercised. Online training is rejected outright, since it produces no cached
+  target outputs for the draft to be scored against.
 - VLM targets. `main.py` routes through `load_vlm_or_llm`, so the path exists, but no
   external draft has been trained against one.
