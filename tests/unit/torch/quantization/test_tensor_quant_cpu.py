@@ -566,10 +566,11 @@ def test_preserve_quantizer_attributes_context_restores_type_and_properties():
 
 @pytest.mark.parametrize("bits", [8, (4, 3)])
 @pytest.mark.parametrize("pass_through", [True, False])
-def test_stochastic_rounding_clipping_and_ste(bits, pass_through):
+@pytest.mark.parametrize("rounding", ["stochastic", "stochastic_toward_zero"])
+def test_stochastic_rounding_clipping_and_ste(bits, pass_through, rounding):
     quantizer = TensorQuantizer(
         QuantizerAttributeConfig(
-            num_bits=bits, rounding="stochastic", pass_through_bwd=pass_through, narrow_range=True
+            num_bits=bits, rounding=rounding, pass_through_bwd=pass_through, narrow_range=True
         ),
         amax=torch.tensor(1.0),
     )
@@ -589,9 +590,10 @@ def test_stochastic_rounding_clipping_and_ste(bits, pass_through):
         {"num_bits": (2, 1), "block_sizes": {-1: 32, "type": "dynamic", "scale_bits": (4, 3)}},
     ],
 )
-def test_stochastic_rounding_rejects_unsupported_backends(options):
+@pytest.mark.parametrize("rounding", ["stochastic", "stochastic_toward_zero"])
+def test_stochastic_rounding_rejects_unsupported_backends(options, rounding):
     with pytest.raises(ValueError):
-        QuantizerAttributeConfig(rounding="stochastic", **options)
+        QuantizerAttributeConfig(rounding=rounding, **options)
 
 
 @pytest.mark.parametrize(
@@ -601,14 +603,15 @@ def test_stochastic_rounding_rejects_unsupported_backends(options):
         {"num_bits": (2, 1), "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)}},
     ],
 )
-def test_stochastic_rounding_checkpoint_and_export(tmp_path, format_cfg):
+@pytest.mark.parametrize("rounding", ["stochastic", "stochastic_toward_zero"])
+def test_stochastic_rounding_checkpoint_and_export(tmp_path, format_cfg, rounding):
     model = mtq.quantize(
         torch.nn.Linear(16, 16),
         {
             "quant_cfg": [
                 {
                     "quantizer_name": "*",
-                    "cfg": {**format_cfg, "type": "dynamic", "rounding": "stochastic"},
+                    "cfg": {**format_cfg, "type": "dynamic", "rounding": rounding},
                 }
             ],
             "algorithm": None,
@@ -617,7 +620,7 @@ def test_stochastic_rounding_checkpoint_and_export(tmp_path, format_cfg):
     path = tmp_path / "model.pth"
     mto.save(model, path)
     restored = mto.restore(torch.nn.Linear(16, 16), path)
-    assert restored.weight_quantizer.rounding == "stochastic"
+    assert restored.weight_quantizer.rounding == rounding
     with torch.random.fork_rng(devices=[]):
         inputs = torch.randn(2, 16)
         torch.manual_seed(41)

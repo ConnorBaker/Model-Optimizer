@@ -43,21 +43,23 @@ class TensorQuantizerTester:
         ]
         + [((2, 1), {"block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)}})],
     )
-    def test_stochastic_rounding(self, bits, grouping):
+    @pytest.mark.parametrize("rounding", ["stochastic", "stochastic_toward_zero"])
+    def test_stochastic_rounding(self, bits, grouping, rounding):
         maximum, gap = {8: (127.0, 1.0), (4, 3): (448.0, 0.125), (2, 1): (6.0, 0.5)}[bits]
         # Known adjacent codes test the rounding distribution independently of its implementation.
         tiny = {8: 1.0, (4, 3): 2.0**-9, (2, 1): 0.5}[bits]
-        lower = torch.tensor([1.0, -1 - gap, 0.0, -tiny], device=self.device)
-        spacing = torch.tensor([gap, gap, tiny, tiny], device=self.device)
-        values = lower + spacing * torch.tensor([0.25, 0.75, 0.25, 0.75], device=self.device)
-        row = torch.cat([values, torch.zeros(27, device=self.device), values.new_tensor([maximum])])
+        lower = torch.tensor([1.0, -1 - gap, 0.0, -tiny] * 3, device=self.device)
+        spacing = torch.tensor([gap, gap, tiny, tiny] * 3, device=self.device)
+        fractions = torch.tensor(
+            [0.25, 0.75] * 2 + [0.75, 0.25] * 2 + [0.5] * 4, device=self.device
+        )
+        values = lower + spacing * fractions
+        row = torch.cat([values, torch.zeros(19, device=self.device), values.new_tensor([maximum])])
         if bits == (2, 1):
             row[15] = maximum  # Both block scales are exactly 448; the effective scale is 1.
         x = row.repeat(4096, 1).requires_grad_()
         quantizer = TensorQuantizer(
-            QuantizerAttributeConfig(
-                num_bits=bits, type="dynamic", rounding="stochastic", **grouping
-            )
+            QuantizerAttributeConfig(num_bits=bits, type="dynamic", rounding=rounding, **grouping)
         ).to(self.device)
         devices = [torch.cuda.current_device()] if self.device == "cuda" else []
         with torch.random.fork_rng(devices=devices):
@@ -72,11 +74,25 @@ class TensorQuantizerTester:
             torch.testing.assert_close(
                 rng_state, torch.cuda.get_rng_state() if devices else torch.get_rng_state()
             )
-        assert ((actual[:, :4] == lower) | (actual[:, :4] == lower + spacing)).all()
+        assert ((actual[:, :12] == lower) | (actual[:, :12] == lower + spacing)).all()
+        expected_mean = values.clone()
+        if rounding == "stochastic_toward_zero":
+            expected_mean[:4] = values.new_tensor([1.0, -1.0, 0.0, 0.0])
+            torch.testing.assert_close(
+                actual[:, :4], expected_mean[:4].expand(4096, -1), rtol=0, atol=0
+            )
         # More than six standard errors of the Bernoulli mean, including FP8 subnormals.
-        assert ((actual[:, :4].mean(0) - values).abs() <= 0.05 * spacing).all()
-        torch.testing.assert_close(actual[:, 4:], x[:, 4:], rtol=0, atol=0)
+        assert ((actual[:, :12].mean(0) - expected_mean).abs() <= 0.05 * spacing).all()
+        torch.testing.assert_close(actual[:, 12:], x[:, 12:], rtol=0, atol=0)
         torch.testing.assert_close(x.grad, torch.ones_like(x))
+        if self.device == "cuda":
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = quantizer(x.detach())
+            graph.replay()
+            first = captured.clone()
+            graph.replay()
+            assert not torch.equal(first, captured)
         quantizer.disable()
         torch.testing.assert_close(quantizer(x), x, rtol=0, atol=0)
 

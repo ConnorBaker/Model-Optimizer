@@ -47,10 +47,15 @@ def _round_to_integer(x, rounding):
     """Round grid coordinates; the caller owns the format, scale and saturation."""
     if rounding == "nearest":
         return x.round_()
-    if rounding != "stochastic":
+    if rounding not in ("stochastic", "stochastic_toward_zero"):
         raise ValueError(f"Unsupported rounding policy: {rounding}")
-    lower = x.floor()
-    return lower.add_(torch.rand_like(x) < x.sub_(lower))
+    biased = rounding == "stochastic_toward_zero"
+    grid = x.abs() if biased else x
+    # Cap magnitude SR at nearest, with halfway ties selecting the larger magnitude.
+    nearest = (grid + 0.5).floor() if biased else None
+    lower = grid.floor()
+    rounded = lower.add_(torch.rand_like(grid) < grid.sub_(lower))
+    return rounded.minimum(nearest).copysign_(x) if biased else rounded
 
 
 def _fp8_eager(x, amax=None, rounding="nearest"):
@@ -522,7 +527,7 @@ def _dynamic_block_quantize_forward(
     return outputs
 
 
-def _nvfp4_stochastic(inputs, amax):
+def _nvfp4_stochastic(inputs, amax, rounding):
     """Round E2M1 values stochastically; keep the FP32 global/E4M3 block scales unchanged."""
     shape = inputs.shape
     padding = (-shape[-1]) % 16
@@ -536,7 +541,7 @@ def _nvfp4_stochastic(inputs, amax):
     # E2M1 has spacing 0.5 below 2, 1 below 4, and 2 up to its maximum of 6.
     exponent = torch.frexp(normalized.abs())[1].clamp(min=1) - 2
     spacing = torch.ldexp(torch.ones_like(normalized), exponent)
-    rounded = _round_to_integer(normalized / spacing, "stochastic") * spacing
+    rounded = _round_to_integer(normalized / spacing, rounding) * spacing
     return (rounded * scale).reshape(*shape[:-1], -1)[..., : shape[-1]].to(inputs.dtype)
 
 
@@ -601,12 +606,12 @@ class DynamicBlockQuantizationFunction(Function):
     ):
         """Forward method."""
         _save_for_backward_if_needed(ctx, pass_through_bwd, inputs, amax)
-        if rounding == "stochastic":
+        if rounding in ("stochastic", "stochastic_toward_zero"):
             if num_bits != (2, 1) or scale_bits != (4, 3) or block_size != 16 or bias is not None:
                 raise NotImplementedError(
-                    "Stochastic block quantization requires unbiased block16 NVFP4"
+                    "Stochastic block quantization requires block16 NVFP4 without bias correction"
                 )
-            return _nvfp4_stochastic(inputs, amax)
+            return _nvfp4_stochastic(inputs, amax, rounding)
         if rounding != "nearest":
             raise ValueError(f"Unsupported rounding policy: {rounding}")
         return _dynamic_block_quantize_forward(
@@ -665,7 +670,7 @@ class StaticBlockwiseFP4FakeQuantFunction(Function):
 
 def _tensor_quant(inputs, amax, num_bits=8, unsigned=False, narrow_range=True, rounding="nearest"):
     """Shared integer grid and scaling for nearest and stochastic fake QDQ."""
-    if rounding == "stochastic" and inputs.is_cuda:
+    if rounding != "nearest" and inputs.is_cuda:
         if unsigned:
             torch._assert_async((inputs >= 0).all(), "Negative values in unsigned quantization")
         torch._assert_async((amax >= 0).all(), "Negative values in amax")

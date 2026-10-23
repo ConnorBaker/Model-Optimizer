@@ -136,6 +136,13 @@ resume the random stream. Backward retains the selected STE and draws no new
 random numbers. Disable stochastic rounding explicitly before exporting to a
 runtime that implements only nearest rounding, and re-evaluate that policy.
 
+``"rounding": "stochastic_toward_zero"`` caps the stochastic magnitude at its
+nearest magnitude, resolving halfway ties toward the larger magnitude, then
+restores the sign. This biases the expected magnitude toward zero: a normalized
+E2M1 value of 2.4 always becomes 2, while 2.8 becomes 3 with probability 0.8 and
+2 otherwise. It supports the same formats, RNG and backward rules as
+``"stochastic"``; it does not change block sizes or scale precision.
+
 Ordering and Precedence
 =======================
 

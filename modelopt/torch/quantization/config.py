@@ -452,12 +452,15 @@ class QuantizerAttributeConfig(ModeloptBaseConfig):
         description="""If True, enable fake quantization.""",
     )
 
-    rounding: Literal["nearest", "stochastic"] = ModeloptField(
+    rounding: Literal["nearest", "stochastic", "stochastic_toward_zero"] = ModeloptField(
         default="nearest",
         description="""Rounding policy, independent of format and scale grouping. ``nearest``
         preserves the backend's existing nearest rounding. ``stochastic`` chooses adjacent
         representable values with probabilities proportional to distance, using PyTorch's
-        device RNG. Supported for built-in integer, E4M3 and dynamic block16 NVFP4
+        device RNG. ``stochastic_toward_zero`` caps a stochastic magnitude at its nearest
+        magnitude (halfway ties select the larger magnitude), then restores the sign.
+        This biases the expected magnitude toward zero. Supported for built-in integer,
+        E4M3 and dynamic block16 NVFP4
         fake quantization. NVFP4 E4M3 block scales retain nearest rounding.
         Other backends and inference export are unsupported.""",
     )
@@ -470,7 +473,7 @@ class QuantizerAttributeConfig(ModeloptBaseConfig):
             "type": "dynamic",
             "scale_bits": (4, 3),
         }
-        if self.rounding == "stochastic" and (
+        if self.rounding != "nearest" and (
             not self.fake_quant
             or self.backend is not None
             or (
