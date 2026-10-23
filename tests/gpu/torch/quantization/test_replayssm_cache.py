@@ -47,6 +47,7 @@ def _paged_buffers(slots, spec):
         ("tp4_hi32", "nearest"),
         ("s32_rs", "nearest"),
         ("tp4_hi32", "stochastic"),
+        ("tp4_hi32", "stochastic_toward_zero"),
     ],
 )
 @pytest.mark.parametrize("captured", [False, True])
@@ -66,7 +67,7 @@ def test_replay_cache_reordering_flush_and_reuse(read_mode, rounding, captured):
         references[slot] = _native_replay(
             state[0].transpose(-1, -2), read_mode, rounding, key_heads=1
         )
-        if rounding == "stochastic":
+        if rounding != "nearest":
             references[slot].read_seeds.copy_(cache.read_seeds[slot : slot + 1])
 
     if captured:
@@ -138,34 +139,60 @@ def test_replay_cache_reordering_flush_and_reuse(read_mode, rounding, captured):
     assert torch.all(cache.steps[[0, 4]] == -1)
 
 
-@pytest.mark.parametrize("stochastic", [False, True])
-def test_nvfp4_read_grid_and_head_isolation(stochastic):
+@pytest.mark.parametrize("rounding", ["nearest", "stochastic", "stochastic_toward_zero"])
+def test_nvfp4_read_grid_and_head_isolation(rounding):
     from modelopt.torch.kernels.quantization.linear_attention.replayssm_read import (
         refresh_nvfp4_read,
     )
 
-    anchor = torch.full((2, 2, 128, 128), 1.125, device="cuda")
-    anchor[..., 1::2] = -1.125
-    anchor[..., 15::16] = 6  # Exact global and E4M3 scales; adjacent codes are +/-1 and +/-1.5.
+    values = torch.tensor(
+        [
+            1.125,
+            -1.125,
+            1.375,
+            -1.375,
+            1.25,
+            -1.25,
+            0.25,
+            -0.25,
+            2.5,
+            -2.5,
+            5,
+            -5,
+            0.125,
+            -0.125,
+            6,
+            6,
+        ],
+        device="cuda",
+    )
+    anchor = values.repeat(2, 2, 128, 8)  # Every block's maximum is 6: the effective scale is 1.
     read = torch.empty_like(anchor)
-    seed = torch.tensor([17, 19], device="cuda", dtype=torch.int32) if stochastic else None
+    seed = (
+        torch.tensor([17, 19], device="cuda", dtype=torch.int32) if rounding != "nearest" else None
+    )
     indices = torch.arange(2, device="cuda", dtype=torch.int32)
-    zero = torch.zeros_like(indices)
+    positions, windows = torch.zeros_like(indices), torch.zeros_like(indices)
 
     def refresh():
         amax = anchor.reshape(2, 2, 2, 64, 128).abs().amax((-1, -2))
-        refresh_nvfp4_read(anchor, read, amax, zero, zero, indices, seeds=seed)
+        refresh_nvfp4_read(
+            anchor, read, amax, positions, windows, indices, seeds=seed, rounding=rounding
+        )
 
     refresh()
-    actual = read[..., :15].reshape(-1)
-    expected = anchor[..., :15].reshape(-1)
-    assert ((actual.abs() == 1) | (actual.abs() == 1.5)).all()
-    if stochastic:
-        assert (actual[expected > 0].mean() - 1.125).abs() < 0.02
-        assert (actual[expected < 0].mean() + 1.125).abs() < 0.02
+    actual = read.reshape(-1, 16)
+    grid = values.new_tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
+    assert torch.isin(actual.abs(), grid).all()
+    if rounding != "nearest":
+        expected = values.clone()
+        if rounding == "stochastic_toward_zero":
+            expected[[0, 1, 12, 13]] = values.new_tensor([1, -1, 0, 0])
+        spacing = values.new_tensor([0.5] * 8 + [1, 1, 2, 2, 0.5, 0.5, 0, 0])
+        assert ((actual.mean(0) - expected).abs() <= 0.05 * spacing).all()
     else:
-        torch.testing.assert_close(actual, expected.sign(), rtol=0, atol=0)
-    assert torch.all(read[..., 15::16] == 6)
+        expected = values.new_tensor([1, -1, 1.5, -1.5, 1, -1, 0, 0, 2, -2, 4, -4, 0, 0, 6, 6])
+        torch.testing.assert_close(actual, expected.expand_as(actual), rtol=0, atol=0)
     independent = read[0, 0].clone()
     # Other heads and requests must not change this head's outer scale or rounding.
     anchor[0, 1].mul_(2**20)
@@ -174,3 +201,13 @@ def test_nvfp4_read_grid_and_head_isolation(stochastic):
     refresh()
     torch.testing.assert_close(read[0, 0], independent, rtol=0, atol=0)
     torch.testing.assert_close(anchor, before, rtol=0, atol=0)
+    if seed is not None:
+        positions.fill_(15)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            refresh()
+            windows.add_(1)
+        graph.replay()
+        first = read.clone()
+        graph.replay()
+        assert not torch.equal(first, read)

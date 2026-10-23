@@ -94,6 +94,12 @@ and the recurrence anchor remains FP32. Reads refresh at initialization and each
 16-token replay flush. Backward uses saved read values with the identity STE and
 draws no new random numbers.
 
+Set `rounding: stochastic_toward_zero` for biased stochastic reads: cap each
+stochastic magnitude at its nearest magnitude (halfway ties select the larger
+magnitude), then restore the sign. Both training and serving use this policy at
+the same read refreshes. It retains NVFP4 block16 E4M3 scales and the FP32 anchor;
+it does not select an FP32-block-scale or block8 format.
+
 For example, create a resolved recipe usable by training and the ReplaySSM worker:
 
 ```python

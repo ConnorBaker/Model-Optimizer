@@ -91,8 +91,8 @@ class _GDNReplayCache:
                 raise ValueError("Invalid ReplaySSM cache shape, dtype, device or row layout")
         if self.anchor.stride(0) != self.read.stride(0):
             raise ValueError("Recurrence and read checkpoints must have the same slot stride")
-        if read_rounding not in ("nearest", "stochastic") or (
-            read_rounding == "stochastic" and read_mode != "tp4_hi32"
+        if read_rounding not in ("nearest", "stochastic", "stochastic_toward_zero") or (
+            read_rounding != "nearest" and read_mode != "tp4_hi32"
         ):
             raise ValueError("Stochastic ReplaySSM reads require NVFP4 with an FP32 anchor")
         if read_mode not in ("s32_rs", "tp8_hi32", "tp4_hi32"):
@@ -111,7 +111,7 @@ class _GDNReplayCache:
         writes the read checkpoint, so clearing the large buffers is unnecessary.
         """
         self.steps.index_fill_(0, indices.long(), 0)
-        if self.read_rounding == "stochastic":
+        if self.read_rounding != "nearest":
             seeds = torch.randint(
                 2**31 - 1, indices.shape, device=indices.device, dtype=torch.int32
             )
@@ -190,7 +190,8 @@ class _GDNReplayCache:
                 positions,
                 windows,
                 indices,
-                seeds=self.read_seeds if self.read_rounding == "stochastic" else None,
+                seeds=self.read_seeds if self.read_rounding != "nearest" else None,
+                rounding=self.read_rounding,
                 null=self.null,
             )
         self.steps.index_add_(0, indices, (indices != self.null).to(torch.int32))

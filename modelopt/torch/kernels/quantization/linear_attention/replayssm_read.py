@@ -45,7 +45,7 @@ def _refresh_read(
     K: tl.constexpr,
     TILE: tl.constexpr,
     TILES: tl.constexpr,
-    STOCHASTIC: tl.constexpr,
+    ROUNDING: tl.constexpr,
 ):
     tile, batch, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     slot = tl.load(Indices + batch)
@@ -62,7 +62,7 @@ def _refresh_read(
     blocks = tl.arange(0, TILES)
     amax = tl.max(tl.load(Amax + slot * AMAX_STRIDE + head * TILES + blocks))
     uniform = 0.0
-    if STOCHASTIC:
+    if ROUNDING != "nearest":
         seed = tl.load(Seeds + slot * SEED_STRIDE)
         # Initial read is refresh 0; the first completed window is refresh 1.
         refresh = window + (pos == 15).to(tl.int32)
@@ -74,18 +74,25 @@ def _refresh_read(
     block_scale = fp8_scalar_qdq(tl.div_rn(block_max, 6.0 * outer), 1.0, EMULATE=True)
     scale = tl.where(block_scale > 0, block_scale, 1.0) * outer
     magnitude = tl.abs(tl.div_rn(groups, scale))
-    if STOCHASTIC:
+    if ROUNDING != "nearest":
         # E2M1 spacing is 0.5 below 2, 1 below 4, and 2 thereafter.
         spacing = tl.where(magnitude < 2, 0.5, tl.where(magnitude < 4, 1.0, 2.0))
-        magnitude = tl.floor(magnitude / spacing + tl.reshape(uniform, groups.shape)) * spacing
+        coordinate = magnitude / spacing
+        sampled = tl.floor(coordinate + tl.reshape(uniform, groups.shape))
+        if ROUNDING == "stochastic_toward_zero":
+            # Match TensorQuantizer's magnitude cap, including halfway ties upward.
+            sampled = tl.minimum(sampled, tl.floor(coordinate + 0.5))
+        magnitude = sampled * spacing
     rounded = fp4_round_magnitude(magnitude) * scale
     rounded = tl.where(groups < 0, -rounded, rounded)
     rounded = tl.reshape(tl.where(block_scale > 0, rounded, 0.0), state.shape)
     tl.store(Read + offset, rounded, rows[:, None] < V)
 
 
-def refresh_nvfp4_read(anchor, read, amax, positions, windows, indices, *, seeds=None, null=-1):
-    """Refresh reads at seed/flush with per-head scales; seeds enable stochastic rounding."""
+def refresh_nvfp4_read(
+    anchor, read, amax, positions, windows, indices, *, seeds=None, rounding="nearest", null=-1
+):
+    """Refresh reads at seed/flush with per-head scales and the quantizer's rounding policy."""
     _, heads, values, keys = anchor.shape
     tiles = triton.next_power_of_2(triton.cdiv(values, 64))
     _refresh_read[(triton.cdiv(values, 64), len(indices), heads)](
@@ -104,5 +111,5 @@ def refresh_nvfp4_read(anchor, read, amax, positions, windows, indices, *, seeds
         keys,
         64,
         tiles,
-        seeds is not None,
+        rounding,
     )

@@ -32,14 +32,16 @@ from modelopt.torch.quantization.linear_attention.utils import forward_value
 from modelopt.torch.quantization.nn import TensorQuantizer
 
 
-@pytest.fixture(params=["fp8", "nvfp4", "nvfp4_stochastic"])
+@pytest.fixture(params=["fp8", "nvfp4", "nvfp4_stochastic", "nvfp4_stochastic_toward_zero"])
 def read_quantizer(request):
     nvfp4 = request.param.startswith("nvfp4")
     return TensorQuantizer(
         QuantizerAttributeConfig(
             num_bits=(2, 1) if nvfp4 else (4, 3),
             type="dynamic",
-            rounding="stochastic" if request.param.endswith("stochastic") else "nearest",
+            rounding=request.param.removeprefix("nvfp4_")
+            if "stochastic" in request.param
+            else "nearest",
             pass_through_bwd=True,
             block_sizes={-1: 16, "type": "dynamic", "scale_bits": (4, 3)} if nvfp4 else {-1: 128},
         )
@@ -146,10 +148,10 @@ def test_native_two_precision_forward_and_window_backward(read_quantizer, monkey
         if i in (0, 15, 31):
             torch.testing.assert_close(expected[-1], exact_output, rtol=0, atol=0)
     torch.testing.assert_close(actual, torch.stack(expected), rtol=0, atol=0)
-    stochastic = read_quantizer.rounding == "stochastic"
+    stochastic = read_quantizer.rounding != "nearest"
     if stochastic:
         torch.manual_seed(92)
-        other = two_precision_decode(*params, (a, b, rate, bias), mode, "stochastic")
+        other = two_precision_decode(*params, (a, b, rate, bias), mode, read_quantizer.rounding)
         assert not torch.equal(actual, other)
     reference = _oracle(*params, read_quantizer, reads=reads if stochastic else None)
     torch.testing.assert_close(actual, reference, rtol=2e-3, atol=2e-6)

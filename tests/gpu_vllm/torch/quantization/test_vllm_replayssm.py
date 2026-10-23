@@ -33,7 +33,7 @@ from modelopt.torch.quantization.linear_attention._two_precision import _native_
 ROOT = Path(__file__).parents[4]
 
 
-def _audit(worker, install=False, compiled=False):
+def _audit(worker, install=False, compiled=False, rounding=None):
     # This optional adapter is only imported inside the vLLM 0.30 worker.
     from modelopt.torch.quantization.plugins.vllm_replayssm import _ReplaySSMGDN
 
@@ -41,6 +41,8 @@ def _audit(worker, install=False, compiled=False):
     assert layers
     for layer in layers:
         cache = layer._replay_cache
+        if rounding is not None:
+            assert cache.read_rounding == layer.gdn_read_quantizer.rounding == rounding
         assert len(layer.kv_cache) == (10 if cache.read_mode == "tp4_hi32" else 9)
         if compiled:
             if install:
@@ -126,17 +128,30 @@ def _graph_replays(worker, start=False):
 
 
 @pytest.fixture(
-    params=[("fp8", True), ("fp8", False), ("nvfp4", False), ("nvfp4_stochastic", False)],
-    ids=["fp8_eager", "fp8_full_decode_graph", "nvfp4_full_decode_graph", "nvfp4_stochastic_graph"],
+    params=[
+        ("fp8", True),
+        ("fp8", False),
+        ("nvfp4", False),
+        ("nvfp4_stochastic", False),
+        ("nvfp4_stochastic_toward_zero", False),
+    ],
+    ids=[
+        "fp8_eager",
+        "fp8_full_decode_graph",
+        "nvfp4_full_decode_graph",
+        "nvfp4_stochastic_graph",
+        "nvfp4_stochastic_toward_zero_graph",
+    ],
 )
 def replay_engine(tmp_path, monkeypatch, request):
     if Version(vllm_version).release[:2] != (0, 30):
         pytest.skip("ReplaySSM engine adapter requires vLLM 0.30.x")
     read_format, eager = request.param
+    rounding = read_format.removeprefix("nvfp4_") if "stochastic" in read_format else "nearest"
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "triton")
-    recipe_path = f"general/ptq/gdn_replayssm_{read_format.removesuffix('_stochastic')}_read"
-    if read_format.endswith("_stochastic"):
+    recipe_path = f"general/ptq/gdn_replayssm_{read_format.split('_', 1)[0]}_read"
+    if "stochastic" in read_format:
         from modelopt.recipe import load_recipe
 
         recipe = {
@@ -145,7 +160,7 @@ def replay_engine(tmp_path, monkeypatch, request):
         }
         for rule in recipe["quantize"]["quant_cfg"]:
             if rule.get("quantizer_name") == "*gdn_read_quantizer":
-                rule["cfg"]["rounding"] = "stochastic"
+                rule["cfg"]["rounding"] = rounding
         recipe_path = str(tmp_path / "stochastic.yaml")
         Path(recipe_path).write_text(yaml.safe_dump(recipe))
     monkeypatch.setenv("RECIPE_PATH", recipe_path)
@@ -197,7 +212,9 @@ def replay_engine(tmp_path, monkeypatch, request):
         seed=17,
     )
     try:
-        llm.collective_rpc(_audit, kwargs={"install": True, "compiled": not eager})
+        llm.collective_rpc(
+            _audit, kwargs={"install": True, "compiled": not eager, "rounding": rounding}
+        )
         yield llm, not eager
     finally:
         llm.llm_engine.engine_core.shutdown()

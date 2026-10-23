@@ -35,7 +35,9 @@ def validate_two_precision(state_quantizer, read_quantizer):
             name="gdn_read_quantizer",
             num_bits=((4, 3), (2, 1)),
             block_sizes=(128,),
-            rounding=("nearest", "stochastic") if read_quantizer.is_nvfp4_dynamic else ("nearest",),
+            rounding=("nearest", "stochastic", "stochastic_toward_zero")
+            if read_quantizer.is_nvfp4_dynamic
+            else ("nearest",),
         )
         if not read_quantizer.is_nvfp4_dynamic and read_quantizer.block_sizes != {-1: 128}:
             raise ValueError("gdn_read_quantizer requires FP8 block128 or NVFP4 block16 along K")
