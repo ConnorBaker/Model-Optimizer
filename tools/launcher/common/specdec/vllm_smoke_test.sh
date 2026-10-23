@@ -28,6 +28,8 @@
 #   VLLM_PORT       — server port (default: 8000)
 #   REASONING_PARSER — reasoning parser (e.g., "qwen3" for Qwen3.5)
 #   DISABLE_PREFIX_CACHING — set to "1" to disable prefix caching
+#   SERVER_TIMEOUT  — seconds to wait for the server to become healthy (default: 180). Large or
+#                    hybrid targets need longer for compile, kernel JIT and CUDA graph capture
 #   MIN_ACCEPTANCE_LENGTH — fail unless the mean acceptance length (from vLLM's /metrics
 #                    counters) reaches this; also fails if no speculative drafts were recorded
 #   SMOKE_JSON      — also write the result to this file as JSON, on every exit; "stage"
@@ -43,6 +45,7 @@ MODEL=${HF_MODEL_CKPT}
 DRAFT=${DRAFT_MODEL:-}
 METHOD=${SPEC_METHOD:-eagle}
 NUM_SPEC=${NUM_SPEC_TOKENS:-15}
+SERVER_TIMEOUT=${SERVER_TIMEOUT:-180}
 STAGE=starting
 VERDICT=FAIL
 REASON=""
@@ -113,6 +116,8 @@ if [ -n "${MIN_ACCEPTANCE_LENGTH:-}" ] && ! python3 -c 'import math, sys; sys.ex
     REASON="MIN_ACCEPTANCE_LENGTH='${MIN_ACCEPTANCE_LENGTH}' is not a finite number"
 elif ! [[ "$NUM_SPEC" =~ ^[0-9]+$ ]] || [ "$NUM_SPEC" -eq 0 ]; then
     REASON="NUM_SPEC_TOKENS='${NUM_SPEC}' is not a positive integer"
+elif ! [[ "$SERVER_TIMEOUT" =~ ^[0-9]+$ ]] || [ "$SERVER_TIMEOUT" -eq 0 ]; then
+    REASON="SERVER_TIMEOUT='${SERVER_TIMEOUT}' is not a positive integer"
 fi
 if [ -n "$REASON" ]; then
     STAGE=invalid_config; echo "ERROR: $REASON"; exit 1
@@ -187,7 +192,7 @@ SERVER_PID=$!
 
 # Wait for server
 echo "Waiting for vLLM server..."
-for i in $(seq 1 180); do
+for i in $(seq 1 "$SERVER_TIMEOUT"); do
     if curl -s http://localhost:${PORT}/health > /dev/null 2>&1; then
         echo "Server ready after ${i}s"
         break
@@ -201,7 +206,7 @@ done
 
 if ! curl -s http://localhost:${PORT}/health > /dev/null 2>&1; then
     echo "ERROR: Server timeout"
-    STAGE=server_timeout; REASON="vLLM server not healthy after 180s"; exit 1
+    STAGE=server_timeout; REASON="vLLM server not healthy after ${SERVER_TIMEOUT}s"; exit 1
 fi
 STAGE=serving
 REASON="exited while sending test prompts"

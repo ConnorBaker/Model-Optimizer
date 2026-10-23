@@ -75,6 +75,7 @@ def test_sources_service_utils_outside_a_launcher_workdir(tmp_path):
         ({"MIN_ACCEPTANCE_LENGTH": "1,5"}, "MIN_ACCEPTANCE_LENGTH='1,5' is not a finite number"),
         ({"MIN_ACCEPTANCE_LENGTH": "nan"}, "MIN_ACCEPTANCE_LENGTH='nan' is not a finite number"),
         ({"NUM_SPEC_TOKENS": "x"}, "NUM_SPEC_TOKENS='x' is not a positive integer"),
+        ({"SERVER_TIMEOUT": "15m"}, "SERVER_TIMEOUT='15m' is not a positive integer"),
     ],
 )
 def test_invalid_config_fails_with_a_result(tmp_path, env, reason):
