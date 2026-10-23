@@ -71,7 +71,8 @@ def _get_modelopt_state_path(model_name_or_path: str, subfolder: str = "") -> st
         f"{subfolder}/{_MODELOPT_STATE_SAVE_NAME}" if subfolder else _MODELOPT_STATE_SAVE_NAME
     )
     try:
-        return try_to_load_from_cache(model_name_or_path, filename) or ""
+        cache_path = try_to_load_from_cache(model_name_or_path, filename)
+        return cache_path if isinstance(cache_path, str) else ""
     except HFValidationError:
         return ""
 
