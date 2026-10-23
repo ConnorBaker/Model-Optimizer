@@ -16,9 +16,10 @@
 """Shared quantization state for fusible sibling modules.
 
 Weight ``global_amax`` must be unified across modules that get **fused** at export
-(q/k/v -> qkv, gate/up -> gate_up) so they quantize with one per-tensor scale.
-:func:`find_shared_input_groups` discovers these groups by regex over module FQNs;
-``SHARED_PATTERNS`` covers the standard q/k/v, gate/up and per-expert w1/w3 names.
+(q/k/v -> qkv, gate/up -> gate_up, MLA q_down/kv_down -> fused_qkv_a_proj) so they quantize
+with one per-tensor scale. :func:`find_shared_input_groups` discovers these groups by regex over
+module FQNs; ``SHARED_PATTERNS`` covers the standard q/k/v, gate/up, per-expert w1/w3 and MCore
+MLA down-projection names.
 
 Discovery is name/pattern-based (not input-hook-based) on purpose: "shares an input
 tensor" is broader than "gets fused" — e.g. a ``shared_expert_gate`` reads the same
@@ -57,6 +58,7 @@ __all__ = [
 # immediate parent so MoE ``w1``/``w3`` groups are per-expert.
 SHARED_PATTERNS = (
     r"(?:(.*)\.)?(?:q_proj|k_proj|v_proj)",
+    r"(?:(.*)\.)?(?:linear_q_down_proj|linear_kv_down_proj)",
     r"(?:(.*)\.)?(?:gate_proj|up_proj)",
     r"(?:(.*)\.)?(?:w1|w3)",
 )
@@ -65,6 +67,7 @@ SHARED_PATTERNS = (
 # same ``experts``/``local_experts`` container. Kept unused until a state opts into it.
 SHARED_PATTERNS_ACROSS_EXPERTS = (
     r"(?:(.*)\.)?(?:q_proj|k_proj|v_proj)",
+    r"(?:(.*)\.)?(?:linear_q_down_proj|linear_kv_down_proj)",
     r"(?:(.*)\.)?(?:gate_proj|up_proj)",
     r"(?:(.*)\.)?(?:experts|local_experts)\.\d+\.(?:w1|w3)",
 )

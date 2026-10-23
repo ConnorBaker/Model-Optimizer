@@ -100,9 +100,10 @@ def _is_calibrated_nvfp4_static(q) -> bool:
 
 
 def _collect_grouped_linears(model: nn.Module) -> list[list[nn.Module]]:
-    """Collect name-based sibling groups (Q/K/V, gate/up, w1/w3) of calibrated NVFP4-static linears."""
+    """Collect name-based sibling groups (Q/K/V, MLA down, gate/up, w1/w3) of calibrated NVFP4-static linears."""
     patterns: tuple[tuple[str, ...], ...] = (
         ("q_proj", "k_proj", "v_proj"),
+        ("linear_q_down_proj", "linear_kv_down_proj"),
         *list_all_possible("gate_up_pairs"),
     )
     groups: list[list[nn.Module]] = []
@@ -155,6 +156,12 @@ def _finalize_with_shared_state(model: nn.Module, weight_patterns: list[str]) ->
     the default patterns, verifies the name groups were actually synced. Call once ``_amax``
     is final: single-process, or after the distributed amax sync.
     """
+    try:
+        from .plugins.megatron import _sync_mla_fused_down_proj_amax
+    except ImportError:
+        pass
+    else:
+        _sync_mla_fused_down_proj_amax(model)
     SharedWeightGlobalAmaxState.populate(model)
     promote_static_block_weight_quantizers(model)
     # Under the default patterns, verify the fusible name groups were actually synced.
