@@ -147,6 +147,41 @@ def _check_grouped_weight_global_amax_synced(model: nn.Module) -> None:
         )
 
 
+@torch.no_grad()
+def _sync_mla_fused_down_proj_amax(model: torch.nn.Module) -> None:
+    """Give Megatron-Core MLA's q_down / kv_down projections one per-tensor input and weight range each.
+
+    vLLM and TRT-LLM fuse them into one GEMM (``fused_qkv_a_proj``) with one scale per tensor.
+    Static NVFP4 weights share their global range through ``SHARED_PATTERNS`` instead.
+    """
+    for module in model.modules():
+        members = [
+            getattr(module, name, None) for name in ("linear_q_down_proj", "linear_kv_down_proj")
+        ]
+        if any(member is None for member in members):
+            continue
+        for quantizer_name in ("input_quantizer", "weight_quantizer"):
+            quantizers = []
+            for member in members:
+                quantizer = getattr(member, quantizer_name, None)
+                # W4A8 keeps its per-tensor FP8 range in the last quantizer.
+                if isinstance(quantizer, SequentialQuantizer):
+                    quantizer = quantizer[-1]
+                amax = getattr(quantizer, "_amax", None)
+                if (
+                    quantizer is None
+                    or not quantizer.is_enabled
+                    or amax is None
+                    or amax.numel() != 1
+                ):
+                    break
+                quantizers.append((quantizer, amax))
+            else:
+                shared = torch.stack([amax.float().reshape(()) for _, amax in quantizers]).max()
+                for quantizer, amax in quantizers:
+                    quantizer.amax = shared.to(amax).reshape(amax.shape)
+
+
 def _finalize_with_shared_state(model: nn.Module, weight_patterns: list[str]) -> None:
     """Finalize calibrated static quantizers and attached shared state.
 
@@ -156,12 +191,7 @@ def _finalize_with_shared_state(model: nn.Module, weight_patterns: list[str]) ->
     the default patterns, verifies the name groups were actually synced. Call once ``_amax``
     is final: single-process, or after the distributed amax sync.
     """
-    try:
-        from .plugins.megatron import _sync_mla_fused_down_proj_amax
-    except ImportError:
-        pass
-    else:
-        _sync_mla_fused_down_proj_amax(model)
+    _sync_mla_fused_down_proj_amax(model)
     SharedWeightGlobalAmaxState.populate(model)
     promote_static_block_weight_quantizers(model)
     # Under the default patterns, verify the fusible name groups were actually synced.
@@ -839,6 +869,8 @@ def _mse_calibrate_weights(
 
                 pbar.update(1)
     pbar.close()
+    # The search refines each weight's range on its own; share the fused MLA pair's again.
+    _sync_mla_fused_down_proj_amax(model)
 
 
 class _LocalHessianAccumulator:

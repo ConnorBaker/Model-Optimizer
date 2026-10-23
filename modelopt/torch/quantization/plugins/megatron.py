@@ -92,41 +92,6 @@ except ImportError:
 __all__ = []
 
 
-@torch.no_grad()
-def _sync_mla_fused_down_proj_amax(model: torch.nn.Module) -> None:
-    """Give MLA's q_down / kv_down projections one per-tensor input and weight range each.
-
-    vLLM and TRT-LLM fuse them into one GEMM (``fused_qkv_a_proj``) with one scale per tensor.
-    Static NVFP4 weights share their global range through ``SHARED_PATTERNS`` instead.
-    """
-    for module in model.modules():
-        members = [
-            getattr(module, name, None) for name in ("linear_q_down_proj", "linear_kv_down_proj")
-        ]
-        if any(member is None for member in members):
-            continue
-        for quantizer_name in ("input_quantizer", "weight_quantizer"):
-            quantizers = []
-            for member in members:
-                quantizer = getattr(member, quantizer_name, None)
-                # W4A8 keeps its per-tensor FP8 range in the last quantizer.
-                if isinstance(quantizer, SequentialQuantizer):
-                    quantizer = quantizer[-1]
-                amax = getattr(quantizer, "_amax", None)
-                if (
-                    quantizer is None
-                    or not quantizer.is_enabled
-                    or amax is None
-                    or amax.numel() != 1
-                ):
-                    break
-                quantizers.append((quantizer, amax))
-            else:
-                shared = torch.stack([amax.float().reshape(()) for _, amax in quantizers]).max()
-                for quantizer, amax in quantizers:
-                    quantizer.amax = shared.to(amax).reshape(amax.shape)
-
-
 def _check_nvfp4_static_tp_supported(model: torch.nn.Module) -> None:
     """Raise if using NVFP4-static weight quantization with TP>1.
 
