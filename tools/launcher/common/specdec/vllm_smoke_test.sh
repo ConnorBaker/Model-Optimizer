@@ -114,9 +114,10 @@ trap cleanup EXIT
 # Checked after the trap, so a bad value still writes this run's SMOKE_JSON.
 if [ -n "${MIN_ACCEPTANCE_LENGTH:-}" ] && ! python3 -c 'import math, sys; sys.exit(not math.isfinite(float(sys.argv[1])))' "$MIN_ACCEPTANCE_LENGTH" 2>/dev/null; then
     REASON="MIN_ACCEPTANCE_LENGTH='${MIN_ACCEPTANCE_LENGTH}' is not a finite number"
-elif ! [[ "$NUM_SPEC" =~ ^[0-9]+$ ]] || [ "$NUM_SPEC" -eq 0 ]; then
+# Canonical form only: NUM_SPEC goes into SPEC_CONFIG as a bare JSON number, so "08" breaks it.
+elif ! [[ "$NUM_SPEC" =~ ^[1-9][0-9]*$ ]]; then
     REASON="NUM_SPEC_TOKENS='${NUM_SPEC}' is not a positive integer"
-elif ! [[ "$SERVER_TIMEOUT" =~ ^[0-9]+$ ]] || [ "$SERVER_TIMEOUT" -eq 0 ]; then
+elif ! [[ "$SERVER_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
     REASON="SERVER_TIMEOUT='${SERVER_TIMEOUT}' is not a positive integer"
 fi
 if [ -n "$REASON" ]; then
@@ -269,8 +270,9 @@ fi
 # Mean acceptance length over all prompts, from vLLM's cumulative Prometheus counters:
 # 1 + accepted draft tokens / drafts (the bonus token counts, as in vLLM's own log). The
 # "SpecDecoding metrics: Mean acceptance length" log line covers only the last logging
-# interval (vLLM resets its stats after each log), so it is not used.
-AVG_ACCEPT=$(echo "$ALL_METRICS" | python3 -c '
+# interval (vLLM resets its stats after each log), so it is not used. Printed twice: full
+# precision for the floor check and SMOKE_JSON, rounded for the log.
+AL_OUT=$(echo "$ALL_METRICS" | python3 -c '
 import sys
 
 drafts = accepted = 0.0
@@ -281,8 +283,10 @@ for line in sys.stdin:
     elif name == "vllm:spec_decode_num_accepted_tokens_total":
         accepted += float(line.split()[-1])
 if drafts > 0:
-    print(f"{1 + accepted / drafts:.4f}")
+    al = 1 + accepted / drafts
+    print(repr(al), f"{al:.4f}")
 ' 2>/dev/null || true)
+read -r AVG_ACCEPT AL_SHOWN <<< "$AL_OUT"
 
 STAGE=completed
 VERDICT=PASS
@@ -293,17 +297,17 @@ if [ $PROMPTS_FAILED -gt 0 ]; then
 elif [ -n "${MIN_ACCEPTANCE_LENGTH:-}" ]; then
     echo ""
     echo "=== Acceptance Length Regression Check ==="
-    echo "  Mean acceptance length: ${AVG_ACCEPT:-not reported}"
+    echo "  Mean acceptance length: ${AL_SHOWN:-not reported}"
     echo "  Threshold: ${MIN_ACCEPTANCE_LENGTH}"
     if [ -z "$AVG_ACCEPT" ]; then
         # A threshold that was never evaluated must not pass.
         VERDICT=FAIL
         REASON="REGRESSION: MIN_ACCEPTANCE_LENGTH=${MIN_ACCEPTANCE_LENGTH} was set but vLLM /metrics reports no speculative drafts"
     elif python3 -c 'import sys; sys.exit(float(sys.argv[1]) < float(sys.argv[2]))' "$AVG_ACCEPT" "$MIN_ACCEPTANCE_LENGTH"; then
-        echo "  PASS: ${AVG_ACCEPT} >= ${MIN_ACCEPTANCE_LENGTH}"
+        echo "  PASS: ${AL_SHOWN} >= ${MIN_ACCEPTANCE_LENGTH}"
     else
         VERDICT=FAIL
-        REASON="REGRESSION: ${AVG_ACCEPT} < ${MIN_ACCEPTANCE_LENGTH}"
+        REASON="REGRESSION: ${AL_SHOWN} < ${MIN_ACCEPTANCE_LENGTH}"
     fi
 fi
 
