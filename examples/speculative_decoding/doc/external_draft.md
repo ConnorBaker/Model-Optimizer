@@ -42,13 +42,16 @@ Draft (a complete causal LM, trained)  ──► its own lm_head ──► draft
 ### Quick Start
 
 ```bash
+# Every command in this section reads $SEQ_LEN; change it here and they stay consistent.
+SEQ_LEN=4096
+
 torchrun --nproc_per_node 8 main.py \
   --config ../../modelopt_recipes/general/speculative_decoding/external_draft.yaml \
   model.model_name_or_path=$TARGET \
   draft_model_name_or_path=$DRAFT \
   data.sparse_data_path=$POLICY_DIR \
   data.sparse_cache_dir=$CACHE_DIR \
-  training.training_seq_len=4096 \
+  training.training_seq_len=$SEQ_LEN \
   training.output_dir=$OUTPUT_DIR
 ```
 
@@ -103,7 +106,7 @@ it against another model's text trains it on positions the target would rarely p
 ```bash
 python collect_hidden_states/compute_sparse_policy_hf.py \
   --model $TARGET --input-data $CONVERSATIONS --output-dir $POLICY_DIR \
-  --top-k 20 --top-p 0.95 --max-seq-len 4096 \
+  --top-k 20 --top-p 0.95 --max-seq-len $SEQ_LEN \
   --answer-only-loss --chat-template ./template.jinja
 ```
 
@@ -124,7 +127,7 @@ from modelopt.torch.speculative.external.sparse_data import (
 )
 
 SparsePolicyDataset(
-    discover_shards("$POLICY_DIR"), max_length=4096, cache_dir="$CACHE_DIR"
+    discover_shards("$POLICY_DIR"), max_length=$SEQ_LEN, cache_dir="$CACHE_DIR"
 )
 PY
 ```
@@ -147,7 +150,7 @@ never reads the aux planes and they dominate the dump size.
 ```bash
 python collect_hidden_states/compute_hidden_states_hf.py \
   --model $TARGET --input-data $CONVERSATIONS --output-dir $HIDDEN_DIR \
-  --max-seq-len 4096 --no-aux-hidden-states --answer-only-loss --chat-template ./template.jinja
+  --max-seq-len $SEQ_LEN --no-aux-hidden-states --answer-only-loss --chat-template ./template.jinja
 ```
 
 ### Cross-tokenizer vocabulary swap (`external_vocab_swap`)
