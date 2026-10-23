@@ -31,8 +31,6 @@ from modelopt.torch.quantization.linear_attention._two_precision import (
 from modelopt.torch.quantization.linear_attention.utils import forward_value
 from modelopt.torch.quantization.nn import TensorQuantizer
 
-native = pytest.importorskip("emulation", reason="Requires pinned upstream ReplaySSM emulation")
-
 
 @pytest.fixture(params=["fp8", "nvfp4", "nvfp4_stochastic"])
 def read_quantizer(request):
@@ -134,7 +132,7 @@ def test_native_two_precision_forward_and_window_backward(read_quantizer, monkey
     actual = two_precision_decode(*params, (a, b, rate, bias), mode, read_quantizer.rounding)
     torch.manual_seed(91)
     runner = _native_replay(state.detach(), mode, read_quantizer.rounding)
-    exact = native.GDNReplay(state.detach().transpose(-1, -2)[None].contiguous(), 2, "s32_rs")
+    exact = _native_replay(state.detach(), "s32_rs")
     expected, reads = [], []
     for i in range(33):
         packed = torch.cat([x[i].flatten() for x in (q, k, v)])[None].bfloat16()
@@ -216,6 +214,10 @@ def test_two_precision_public_api_padding_and_baseline(read_quantizer):
 
 
 def test_two_precision_packed_matches_separate_sequences(read_quantizer):
+    # Only the nonempty prefix needs the optional serving framework.
+    vllm = pytest.importorskip("vllm")
+    if vllm.__version__ != "0.30.0":
+        pytest.skip("The chunked prefix requires vLLM 0.30.0")
     torch.manual_seed(42)
     inputs = [
         torch.randn(1, 160, 1, 128, device="cuda", dtype=torch.bfloat16).requires_grad_()

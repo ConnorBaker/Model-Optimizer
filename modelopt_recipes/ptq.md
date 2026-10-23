@@ -68,8 +68,8 @@ supported combinations.
 | `linear_attention_state_int8_block32_dynamic` | GDN/KDA state INT8, 32 value channels per key row; weights unchanged | none | none (dynamic scales; requires vLLM and a prefix/decode phase context) |
 | `linear_attention_state_int8_block32_dynamic_kimi_k3` | Kimi-K3/Kimi-Linear KDA state INT8, 32 value channels per key row | none | none (dynamic scales; explicit Triton Kimi profile) |
 | `linear_attention_state_nvfp4_dynamic` | GDN/KDA state NVFP4, block16 and E4M3 scales; weights unchanged | none | none (dynamic global and block scales) |
-| `gdn_replayssm_fp8_read` | GDN ReplaySSM FP32 recurrence and FP8 block128 reads; floating storage | none | none (requires upstream ReplaySSM emulation) |
-| `gdn_replayssm_nvfp4_read` | GDN ReplaySSM FP32 recurrence and NVFP4 block16 reads; floating storage | none | none (requires upstream ReplaySSM emulation) |
+| `gdn_replayssm_fp8_read` | GDN ReplaySSM FP32 recurrence and FP8 block128 reads; floating storage | none | none (ModelOpt replay backend) |
+| `gdn_replayssm_nvfp4_read` | GDN ReplaySSM FP32 recurrence and NVFP4 block16 reads; floating storage | none | none (ModelOpt replay backend) |
 
 </details>
 

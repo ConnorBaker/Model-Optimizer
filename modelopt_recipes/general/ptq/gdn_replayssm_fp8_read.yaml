@@ -21,7 +21,7 @@ imports:
 metadata:
   description: >-
     GDN ReplaySSM with an FP32 recurrence anchor and an FP8 block128 read copy.
-    Requires upstream ReplaySSM emulation and a fixed 16-token decode window.
+    Uses the ModelOpt replay backend with a fixed 16-token decode window.
     This is floating-storage QAT emulation; the vLLM engine adapter is separate.
 quantize:
   algorithm:

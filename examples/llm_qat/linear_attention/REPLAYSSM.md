@@ -2,8 +2,8 @@
 
 This optional extension adds checkpoint-and-update replay to the
 [GDN/KDA QAT and QAD example](README.md). The existing INT8/Hadamard profile is
-implemented as a comparison baseline. The two-precision GDN profile imports
-upstream native forward kernels and adds a window-wise training adjoint.
+implemented as a comparison baseline. The two-precision GDN profile uses a ModelOpt Triton forward kernel shared by
+training and serving, with a window-wise training adjoint.
 The experimental serving worker below binds the two-precision cache to vLLM's
 request cache manager.
 
@@ -57,12 +57,12 @@ The goal is to reduce read precision without feeding the low-precision read
 copy back into the recurrence checkpoint. This changes the state machine, not
 just its quantizer setting.
 
-The reference is upstream ReplaySSM's
-[GDN emulation](https://github.com/Johnny-Liou/ReplaySSM/blob/73a9592e9d8a2268620e8883a82f5cec7442ed36/emulation/gdn_replay_unf_vf.py),
-pinned at `73a9592e9d8a2268620e8883a82f5cec7442ed36`. ModelOpt imports its
-`emulation.GDNReplay` wrapper with mode `tp8_hi32` (FP8) or `tp4_hi32` (NVFP4); no upstream kernels are
-copied into ModelOpt. This backend stores quantized values in FP32 tensors.
-It qualifies numerical emulation, not compressed cache storage or speed.
+ModelOpt implements the GDN replay equations internally in `replayssm.py` and
+uses its existing E4M3/E2M1 quantization helpers. The external
+[ReplaySSM reference](https://github.com/Johnny-Liou/ReplaySSM/tree/73a9592e9d8a2268620e8883a82f5cec7442ed36/emulation)
+was used for numerical comparison; its `emulation` package is not a runtime or
+regular-test dependency. Quantized values remain in FP32 tensors, so this is
+numerical emulation rather than compressed cache storage.
 
 Select `--recipe general/ptq/gdn_replayssm_fp8_read` or
 `--recipe general/ptq/gdn_replayssm_nvfp4_read` in the main QAT/QAD example.
@@ -74,7 +74,7 @@ The recipe sets `precision="replayssm_two_precision"`, `replay_window=16`, and:
 | `gdn_read_quantizer` (FP8 recipe) | Dynamic E4M3, `block_sizes={-1: 128}`, identity STE | One scale per 128 key channels of each value row |
 | `gdn_read_quantizer` (NVFP4 recipe) | Dynamic E2M1, block16 E4M3 scales, identity STE | Groups of 16 key channels; one FP32 global scale per request and head at each refresh |
 
-NVFP4 uses the existing TensorQuantizer configuration and upstream replay codec.
+NVFP4 uses the existing TensorQuantizer configuration and ModelOpt rounding helpers.
 A second kernel reduces each head's state amax independently and refreshes the read
 copy at initialization and each 16-token flush. Training and the vLLM cache
 adapter use the same mode. The FP32 recurrence anchor never uses the quantized read copy.
@@ -124,18 +124,9 @@ the explicit recipe above to install its supported read-rounding policy.
 
 ### Backend installation
 
-Install the main example's public vLLM 0.30 and FLA dependencies for the chunked
-prefix. Expose only the pinned upstream checkout's `emulation` package, so its
-`vllm/` source does not shadow the installed vLLM:
-
-```bash
-mkdir -p /path/to/standalone-packages
-ln -s /path/to/ReplaySSM/emulation /path/to/standalone-packages/emulation
-export PYTHONPATH="/path/to/standalone-packages:${PYTHONPATH:-}"
-```
-
-The upstream checkout must be at the pinned revision above. Decode-only calls
-need the standalone package without vLLM; a nonempty prefix requires vLLM 0.30.
+Install the main example's dependencies for QAT/QAD and public vLLM 0.30 for the
+chunked prefix and serving worker. Decode-only calls require PyTorch and Triton;
+they need no external ReplaySSM checkout or additional `PYTHONPATH` entry.
 The existing INT8/Hadamard fork uses a separate environment.
 
 Maintain two checkpoints formed from the same refreshed, unrounded state `S`:
@@ -180,7 +171,7 @@ not qualify KDA.
 
 The chunked prefix runs once through the existing native vLLM adapter; FLA
 supplies its backward. For the suffix, `_two_precision.py` creates one native
-replay cache and calls `GDNReplay.step` once per token. It saves immutable
+replay cache and calls the shared ModelOpt replay kernel once per token. It saves immutable
 anchor/read snapshots at window boundaries. Backward reconstructs one window
 at a time, differentiating both the read path and the raw-input triangular solve.
 It does not build a second Torch forward graph during the native forward.
@@ -208,10 +199,10 @@ after loading the model, before vLLM plans or allocates cache pages. The ordinar
 state-QDQ worker runs its setup later and cannot reserve the additional replay
 buffers. This opt-in worker supports GDN with K=128 on vLLM 0.30, one GPU and one
 active request. Checkpoint precision is fixed at startup; restart the worker to
-change it. Use the upstream standalone package described above.
+change it.
 
 ```bash
-export PYTHONPATH="$PWD/examples/vllm_serve:/path/to/standalone-packages:${PYTHONPATH:-}"
+export PYTHONPATH="$PWD/examples/vllm_serve:${PYTHONPATH:-}"
 export RECIPE_PATH=general/ptq/gdn_replayssm_fp8_read
 VLLM_GDN_DECODE_KERNEL=triton vllm serve /path/to/hf-checkpoint \
   --worker-cls replayssm_worker.ReplaySSMWorker \
@@ -240,7 +231,7 @@ and compatibility with weight-quantized exports are not qualified here.
 The cache specification adds a read checkpoint, raw key/value/gate/beta rings,
 a residual-update ring and a per-slot token counter to the existing convolution
 and recurrence state. vLLM allocates and releases all of these in its cache pages.
-`replayssm_cache.py` imports the pinned upstream kernel with request-slot indices;
+`replayssm_cache.py` calls the internal kernel with request-slot indices;
 no recurrent state is kept in a separate Python request cache. Prefill writes the
 FP32 anchor and resets the counter. Decode refreshes the read copy only at the
 native handoff and flush boundaries, without applying plain per-token state QDQ.
@@ -256,6 +247,28 @@ decoding, prefix caching, cache transfer and distributed serving remain outside
 this initial engine integration. Keep ordinary state-QDQ serving separate.
 
 ## Validation and remaining work
+
+### Internal backend
+
+The standalone GDN forward is implemented in ModelOpt and shares the serving
+cache adapter. Regular GPU tests run without `emulation`, checking the window
+math against an independent Torch recurrence, gradients, padding, request-slot
+reuse, per-head read scales and CUDA graph replay.
+
+On GB300 with vLLM 0.30.0 and Triton 3.7.1, all 19 kernel/training tests and four
+real-engine tests passed with `emulation` absent. Engine coverage includes eager
+FP8 and CUDA-graph FP8, NVFP4 and stochastic NVFP4 execution. The engine checks
+use a tiny offline Qwen3-Next model with dummy weights and one active request;
+they do not qualify the separate multi-request adapter changes.
+
+A local comparison over 65 tokens per case against the previous backend found
+bit-exact FP32 anchors and FP8/NVFP4 read copies, including stochastic reads.
+FP32 outputs differed by at most 1.6e-6 on these inputs; external-backend outputs
+are not claimed to be bit-exact. The Q/K/V, gate, beta and initial-state gradients
+matched the previous window adjoint bit-exactly in all three quantized profiles.
+These checks do not establish full-model accuracy or throughput equivalence.
+
+### Previous external-backend qualification
 
 Before the per-head outer-scale change, NVFP4 qualification on JHB GB300 passed all six indexed-cache cases
 (FP8/NVFP4/FP32 reads, eager/captured execution) and the NVFP4 full-decode-graph
@@ -282,10 +295,10 @@ confirmed CUDA graph launches, repeated generation, prompt-boundary handling and
 GPU counter advancement.
 
 This is functional coverage with dummy model weights, not a pretrained quality
-result or a full-model QAT/QAD export-to-serving qualification. The engine test
-requires the optional standalone backend; V2 is the runner tested here.
+result or a full-model QAT/QAD export-to-serving qualification. Those results
+used the external backend and the V2 runner.
 
-Focused CPU tests cover policy validation, both read recipes, read-only enablement,
+Focused CPU tests covered policy validation, both read recipes, read-only enablement,
 and ModelOpt checkpoint save/restore (41 tests passed). Four local GPU cases passed
 on RTX A6000. All six training GPU cases passed on JHB GB300, including packed
 sequences, with PyTorch 2.13.0+cu130, Triton 3.7.1, vLLM 0.30.0 and fla-core 0.5.1.
@@ -297,10 +310,11 @@ The GPU cases exercise both FP8 and NVFP4 reads and check:
 - Packed versus separate sequence outputs and gradients, including sequence isolation.
 
 These are numerical and workflow checks, not full-model NVFP4 QAT/QAD or accuracy
-results. The tests require the optional upstream `emulation` package and skip
-when it is absent. The existing fork-only tests remain separate qualification.
+results. Regular GPU tests now run without the upstream `emulation` package,
+using an independent Torch window reference for numerical and gradient checks.
+The existing fork-only tests remain separate qualification.
 
 K=256 failed the predefined numerical gate in the earlier FP8 qualification and
 remains unsupported. No tolerance was relaxed. KDA two-precision support,
-lower-precision anchors, stochastic rounding, full-model accuracy and broader scheduler
+lower-precision anchors, full-model accuracy and broader scheduler
 qualification remain follow-ups.

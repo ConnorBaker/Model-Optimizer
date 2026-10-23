@@ -26,8 +26,6 @@ from modelopt.torch.kernels.quantization.linear_attention.replayssm_cache import
 )
 from modelopt.torch.quantization.linear_attention._two_precision import _native_replay
 
-native = pytest.importorskip("emulation", reason="Requires pinned upstream ReplaySSM emulation")
-
 
 def _paged_buffers(slots, spec):
     sizes = [prod(shape) * dtype.itemsize for shape, dtype in spec]
@@ -65,14 +63,11 @@ def test_replay_cache_reordering_flush_and_reuse(read_mode, rounding, captured):
         state = torch.randn(1, 2, 144, 128, device="cuda") * 0.1
         buffers[0][slot].copy_(state[0])
         cache.reset(torch.tensor([slot], device="cuda", dtype=torch.int32))
-        if read_mode == "tp4_hi32":
-            references[slot] = _native_replay(
-                state[0].transpose(-1, -2), read_mode, rounding, key_heads=1
-            )
-            if rounding == "stochastic":
-                references[slot].read_seeds.copy_(cache.read_seeds[slot : slot + 1])
-        else:
-            references[slot] = native.GDNReplay(state, 1, read_mode)
+        references[slot] = _native_replay(
+            state[0].transpose(-1, -2), read_mode, rounding, key_heads=1
+        )
+        if rounding == "stochastic":
+            references[slot].read_seeds.copy_(cache.read_seeds[slot : slot + 1])
 
     if captured:
         # Fixed addresses, changing request slots and GPU counters on every replay.

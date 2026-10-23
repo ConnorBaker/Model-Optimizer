@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-request, per-head NVFP4 read refresh using upstream ReplaySSM's codec.
+"""Per-request, per-head NVFP4 read refresh with ModelOpt's E4M3/E2M1 rounding.
 
 Request seeds and logical element offsets keep the random stream independent
 of cache slot placement and CUDA graph replay.
@@ -21,7 +21,9 @@ of cache slot placement and CUDA graph replay.
 
 import triton
 import triton.language as tl
-from emulation.quant_tl import nvfp4_outer_scale, quantize_nvfp4
+
+from ..common.fp8_quant import fp8_scalar_qdq
+from ..common.nvfp4_quant import fp4_round_magnitude
 
 __all__ = []
 
@@ -65,7 +67,20 @@ def _refresh_read(
         # Initial read is refresh 0; the first completed window is refresh 1.
         refresh = window + (pos == 15).to(tl.int32)
         uniform = tl.rand(seed + refresh * 1103515245, logical)
-    rounded = quantize_nvfp4(state, uniform, nvfp4_outer_scale(amax), STOCHASTIC, K // 16, 16)
+    outer = amax / (6.0 * 448.0)
+    outer = tl.where(outer > 0, outer, 1.0)
+    groups = tl.reshape(state, (TILE, K // 16, 16))
+    block_max = tl.max(tl.abs(groups), 2, keep_dims=True)
+    block_scale = fp8_scalar_qdq(tl.div_rn(block_max, 6.0 * outer), 1.0, EMULATE=True)
+    scale = tl.where(block_scale > 0, block_scale, 1.0) * outer
+    magnitude = tl.abs(tl.div_rn(groups, scale))
+    if STOCHASTIC:
+        # E2M1 spacing is 0.5 below 2, 1 below 4, and 2 thereafter.
+        spacing = tl.where(magnitude < 2, 0.5, tl.where(magnitude < 4, 1.0, 2.0))
+        magnitude = tl.floor(magnitude / spacing + tl.reshape(uniform, groups.shape)) * spacing
+    rounded = fp4_round_magnitude(magnitude) * scale
+    rounded = tl.where(groups < 0, -rounded, rounded)
+    rounded = tl.reshape(tl.where(block_scale > 0, rounded, 0.0), state.shape)
     tl.store(Read + offset, rounded, rows[:, None] < V)
 
 

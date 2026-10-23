@@ -150,7 +150,7 @@ execution policy. They use dynamic quantization without a calibration pass.
 | Recipe | State quantization | Runtime |
 | --- | --- | --- |
 | `linear_attention_state_int8_block32_dynamic` (default) | INT8 QDQ at handoff and every suffix token; one scale per key row and 32 value channels | Public vLLM |
-| `gdn_replayssm_fp8_read` | GDN FP32 recurrence anchor and FP8 block128 reads; 16-token replay windows | [Optional ReplaySSM emulation](REPLAYSSM.md#two-precision-gdn-profile) |
+| `gdn_replayssm_fp8_read` | GDN FP32 recurrence anchor and FP8 block128 reads; 16-token replay windows | [ModelOpt ReplaySSM backend](REPLAYSSM.md#two-precision-gdn-profile) |
 
 ModelOpt separates quantization settings from execution and batch metadata:
 

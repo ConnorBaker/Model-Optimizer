@@ -46,7 +46,7 @@ class LinearAttentionConfig(ModeloptBaseConfig):
     One quantized checkpoint feeds both reads and recurrence updates; separate
     read and recurrence precisions require the GDN-only ``replayssm_two_precision``
     profile: an FP32 anchor, FP8 block128 read copy along K, and a fixed 16-token
-    window. It imports upstream ReplaySSM emulation; runtime caches use FP32 storage.
+    window. It uses ModelOpt's replay kernel; runtime caches use FP32 storage.
     For the shared-checkpoint fork, ``replay_window=1`` refreshes every token.
     Fresh prefill has no internal state QDQ. Two-precision replay reads the
     unrounded prefill checkpoint for its first output, then encodes the read copy.

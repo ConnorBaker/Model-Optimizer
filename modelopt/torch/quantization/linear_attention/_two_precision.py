@@ -45,42 +45,12 @@ def validate_two_precision(state_quantizer, read_quantizer):
 
 
 def _native_replay(state, read_mode, read_rounding="nearest", *, key_heads=None):
-    # Optional standalone backend; installing public vLLM does not install this package.
-    from emulation import GDNReplay
+    # Triton is optional until the CUDA replay path is selected.
+    from modelopt.torch.kernels.quantization.linear_attention.replayssm_cache import _GDNReplay
 
-    if read_rounding not in ("nearest", "stochastic"):
-        raise ValueError(f"Unsupported read rounding: {read_rounding}")
-    if read_rounding == "stochastic" and read_mode != "tp4_hi32":
-        raise ValueError("Stochastic ReplaySSM reads require NVFP4 with an FP32 anchor")
-    runner_type = GDNReplay
-    if read_mode == "tp4_hi32":
-        from modelopt.torch.kernels.quantization.linear_attention.replayssm_read import (
-            refresh_nvfp4_read,
-        )
-
-        class NVFP4ReadReplay(GDNReplay):
-            def _finish_step(self, grid):
-                refresh_nvfp4_read(
-                    self.state_hi,
-                    self.state_lo,
-                    self.amax,
-                    self.write_pos,
-                    self.window_idx,
-                    self.state_idx,
-                    seeds=self.read_seeds if read_rounding == "stochastic" else None,
-                )
-                self.steps.add_(1)
-                return self.output
-
-        runner_type = NVFP4ReadReplay
-    runner = runner_type(
-        state.transpose(-1, -2).unsqueeze(0).contiguous(),
-        state.shape[0] if key_heads is None else key_heads,
-        mode=read_mode,
+    return _GDNReplay(
+        state, state.shape[0] if key_heads is None else key_heads, read_mode, read_rounding
     )
-    if read_rounding == "stochastic":
-        runner.read_seeds = torch.randint(2**31 - 1, (1,), device=state.device, dtype=torch.int32)
-    return runner
 
 
 class _TwoPrecision(torch.autograd.Function):

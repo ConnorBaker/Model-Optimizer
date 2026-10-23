@@ -28,7 +28,8 @@ from transformers import Qwen3NextConfig
 from vllm import LLM, SamplingParams
 from vllm import __version__ as vllm_version
 
-native = pytest.importorskip("emulation", reason="Requires pinned upstream ReplaySSM emulation")
+from modelopt.torch.quantization.linear_attention._two_precision import _native_replay
+
 ROOT = Path(__file__).parents[4]
 
 
@@ -72,8 +73,8 @@ def _audit(worker, install=False, compiled=False):
                 expected = []
                 for row, slot in enumerate(indices.tolist()):
                     if _cache.steps[slot] == 0:
-                        _refs[slot] = native.GDNReplay(
-                            _cache.anchor[slot : slot + 1].contiguous(), 2, _cache.read_mode
+                        _refs[slot] = _native_replay(
+                            _cache.anchor[slot].transpose(-1, -2), _cache.read_mode, key_heads=2
                         )
                         _layer._replay_counts["resets"] += 1
                     _layer._replay_counts["flushes"] += int(_cache.steps[slot] % 16 == 15)

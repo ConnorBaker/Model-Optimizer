@@ -24,6 +24,9 @@ from math import prod
 import torch
 import triton
 
+from .replayssm import _replay_step
+from .replayssm_read import refresh_nvfp4_read
+
 __all__ = []
 
 
@@ -58,7 +61,9 @@ class _GDNReplayCache:
     are left untouched. A fresh prefill must write the anchor and call reset.
     """
 
-    def __init__(self, buffers, key_heads, *, read_mode="tp8_hi32", read_rounding="nearest"):
+    def __init__(
+        self, buffers, key_heads, *, read_mode="tp8_hi32", read_rounding="nearest", null=0
+    ):
         (
             self.anchor,
             self.read,
@@ -90,6 +95,9 @@ class _GDNReplayCache:
             read_rounding == "stochastic" and read_mode != "tp4_hi32"
         ):
             raise ValueError("Stochastic ReplaySSM reads require NVFP4 with an FP32 anchor")
+        if read_mode not in ("s32_rs", "tp8_hi32", "tp4_hi32"):
+            raise ValueError(f"Unsupported ReplaySSM read mode: {read_mode}")
+        self.null = null
         self.steps, self.read_seeds = steps[:, 0], steps[:, 1]
         self.read_rounding = read_rounding
         self.key_heads = key_heads
@@ -119,10 +127,6 @@ class _GDNReplayCache:
         QKV and raw gate projections must be BF16. Output is [batch,Hv,V], in
         FP32 or BF16. This inference-only entry point does not build an adjoint.
         """
-        # Optional standalone ReplaySSM dependency, pinned by the example.
-        from emulation.gdn_replay_unf_vf import _gdn_unf_vf_step_kernel
-        from emulation.modes import MODES
-
         rows, heads, values = output.shape
         if (
             qkv.shape != (rows, 2 * self.key_heads * 128 + heads * values)
@@ -145,59 +149,40 @@ class _GDNReplayCache:
         steps = self.steps.index_select(0, indices)
         positions = steps.remainder(16)
         windows = torch.div(steps, 16, rounding_mode="floor")
-        precision = MODES[self.read_mode]
-        tiles = triton.next_power_of_2(triton.cdiv(values, 64))
-        grid = (triton.cdiv(values, 64), rows, heads)
-        flush = positions == 15
-        _gdn_unf_vf_step_kernel[grid](
+        _replay_step[(triton.cdiv(values, 64), rows, heads)](
             self.anchor,
             self.read,
+            (self.keys, self.values, self.gates, self.betas, self.updates),
             self.amax,
             qkv,
             a,
             b,
             rate,
             bias,
-            output,
-            self.keys,
-            self.values,
-            self.gates,
-            self.betas,
-            self.updates,
-            positions,
-            flush,
-            windows,
             indices,
-            0,
-            1234,
+            positions,
+            windows,
+            output,
             128**-0.5,
-            qkv.stride(0),
-            a.stride(0),
-            b.stride(0),
-            output.stride(0),
-            self.anchor.stride(0),
-            self.keys.stride(0),
-            self.values.stride(0),
-            self.gates.stride(0),
-            self.betas.stride(0),
-            self.updates.stride(0),
-            self.amax.stride(0),
-            rows,
+            tuple(
+                x.stride(0)
+                for x in (
+                    self.anchor,
+                    self.keys,
+                    self.values,
+                    self.gates,
+                    self.betas,
+                    self.updates,
+                    self.amax,
+                )
+            ),
             self.key_heads,
             heads,
-            128,
             values,
-            64,
-            tiles,
-            precision.two_precision,
-            precision.state,
-            precision.stochastic,
-            precision.read if precision.two_precision else precision.state,
-            precision.nvfp4,
+            self.read_mode,
+            self.null,
         )
-        if precision.nvfp4:
-            from .replayssm_read import refresh_nvfp4_read
-
+        if self.read_mode == "tp4_hi32":
             refresh_nvfp4_read(
                 self.anchor,
                 self.read,
@@ -206,6 +191,30 @@ class _GDNReplayCache:
                 windows,
                 indices,
                 seeds=self.read_seeds if self.read_rounding == "stochastic" else None,
-                null=0,
+                null=self.null,
             )
-        self.steps.index_add_(0, indices, (indices != 0).to(torch.int32))
+        self.steps.index_add_(0, indices, (indices != self.null).to(torch.int32))
+
+
+class _GDNReplay:
+    """Allocate one sequence's training buffers and use the indexed serving backend."""
+
+    def __init__(self, state, key_heads, read_mode, read_rounding):
+        heads, keys, values = state.shape
+        spec = _gdn_replay_state_spec(key_heads, heads, values, read_mode=read_mode)
+        buffers = [
+            torch.zeros((1, *shape), dtype=dtype, device=state.device) for shape, dtype in spec
+        ]
+        buffers[0][0].copy_(state.transpose(-1, -2))
+        self.cache = _GDNReplayCache(
+            buffers, key_heads, read_mode=read_mode, read_rounding=read_rounding, null=-1
+        )
+        self.indices = torch.zeros(1, device=state.device, dtype=torch.int32)
+        self.cache.reset(self.indices)
+        self.state_hi, self.state_lo = self.cache.anchor, self.cache.read
+        self.steps, self.read_seeds = self.cache.steps, self.cache.read_seeds
+        self.output = state.new_empty((1, heads, values))
+
+    def step(self, qkv, a, b, rate, bias):
+        self.cache.step(qkv, a.bfloat16(), b.bfloat16(), rate, bias, self.indices, self.output)
+        return self.output
