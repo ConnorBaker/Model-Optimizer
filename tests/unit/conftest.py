@@ -55,3 +55,22 @@ def cpu_dist_workers(_cpu_pools):
     return get_live_pool(
         _cpu_pools, 2, lambda: DistributedWorkerPool(world_size=2, backend="gloo", teardown_fn=None)
     )
+
+
+@pytest.hookimpl(tryfirst=True)  # xdist reads the marker in a tryfirst hook of its own
+def pytest_collection_modifyitems(config, items):
+    """Group the tests for ``--dist loadgroup`` so that one xdist worker holds the ``cpu_dist_workers`` pool.
+
+    ``loadgroup`` treats an unmarked test as a group of its own, so every file becomes a group (what
+    ``loadfile`` does), except that all files with a ``cpu_dist_workers`` test share one group. The
+    pool (two gloo processes of about 0.7 GB) outlives its file, so with ``loadfile`` up to four
+    workers held one at once, which on a 16 GB runner leaves the memory-hungry tests too little.
+    Summed RSS of a CI-like unit run: 14-16 GB with ``loadfile``, about 11 GB with this group.
+    """
+    if not config.pluginmanager.hasplugin("xdist"):
+        return
+    pool_files = {item.path for item in items if "cpu_dist_workers" in item.fixturenames}
+    for item in items:
+        if item.get_closest_marker("xdist_group") is None:
+            group = "cpu_pool" if item.path in pool_files else item.nodeid.split("::")[0]
+            item.add_marker(pytest.mark.xdist_group(group))

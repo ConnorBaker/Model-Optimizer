@@ -73,7 +73,7 @@ jobs:
           COVERAGE_CORE: sysmon
           # One single-threaded xdist worker per vCPU (`-n auto` counts physical cores); torch's
           # default threads per worker oversubscribe the runner and run slower than serial.
-          PYTEST_ADDOPTS: -n 4 --dist loadfile
+          PYTEST_ADDOPTS: -n 4 --dist loadgroup
           OMP_NUM_THREADS: "1"
         run: pip install nox uv && nox -s "unit-3.12(torch_214, tf_latest)" -- $PYTEST_EXTRA
       - name: Upload coverage reports to Codecov
@@ -153,7 +153,7 @@ jobs:
           python-version: ${{ matrix.python_version }}
       - name: Run unit tests
         env:
-          PYTEST_ADDOPTS: -n 4 --dist loadfile
+          PYTEST_ADDOPTS: -n 4 --dist loadgroup
           OMP_NUM_THREADS: "1"
         run: pip install nox uv && nox -s "${{ matrix.nox_session }}"
   partial-install:
