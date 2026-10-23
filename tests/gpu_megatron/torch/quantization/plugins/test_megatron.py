@@ -2654,29 +2654,30 @@ class TestKeepGptOutputLayerExtraState:
 def test_mla_fused_down_projections_share_ranges(distributed_setup_size_1, quant_cfg):
     """vLLM and TRT-LLM fuse MLA's q_down and kv_down into one GEMM with one scale per tensor."""
     initialize_for_megatron(tensor_model_parallel_size=1, seed=SEED)
-    model = get_mcore_gpt_model(
-        hidden_size=128,
-        num_attention_heads=2,
-        vocab_size=128,
-        max_sequence_length=32,
-        transformer_impl="transformer_engine",
-        multi_latent_attention=True,
-    ).cuda()
-    attentions = [layer.self_attention for layer in model.decoder.layers]
-    with torch.no_grad():
+    try:
+        model = get_mcore_gpt_model(
+            hidden_size=128,
+            num_attention_heads=2,
+            vocab_size=128,
+            max_sequence_length=32,
+            transformer_impl="transformer_engine",
+            multi_latent_attention=True,
+        ).cuda()
+        attentions = [layer.self_attention for layer in model.decoder.layers]
+        with torch.no_grad():  # give the two weights different ranges
+            for attention in attentions:
+                attention.linear_kv_down_proj.weight.mul_(4)
+
+        model = mtq.quantize(model, copy.deepcopy(getattr(mtq, quant_cfg)), get_forward(model))
+
         for attention in attentions:
-            attention.linear_kv_down_proj.weight.mul_(4)  # give the two weights different ranges
-
-    model = mtq.quantize(model, copy.deepcopy(getattr(mtq, quant_cfg)), get_forward(model))
-
-    for attention in attentions:
-        q_down, kv_down = attention.linear_q_down_proj, attention.linear_kv_down_proj
-        assert torch.equal(q_down.input_quantizer.amax, kv_down.input_quantizer.amax)
-        if q_down.weight_quantizer.is_nvfp4_static:
-            assert torch.equal(
-                q_down.weight_quantizer.global_amax, kv_down.weight_quantizer.global_amax
-            )
-        else:
-            assert torch.equal(q_down.weight_quantizer.amax, kv_down.weight_quantizer.amax)
-    # Clean up since this is not a spawned process
-    destroy_model_parallel()
+            q_down, kv_down = attention.linear_q_down_proj, attention.linear_kv_down_proj
+            assert torch.equal(q_down.input_quantizer.amax, kv_down.input_quantizer.amax)
+            if q_down.weight_quantizer.is_nvfp4_static:
+                assert torch.equal(
+                    q_down.weight_quantizer.global_amax, kv_down.weight_quantizer.global_amax
+                )
+            else:
+                assert torch.equal(q_down.weight_quantizer.amax, kv_down.weight_quantizer.amax)
+    finally:
+        destroy_model_parallel()  # not a spawned process

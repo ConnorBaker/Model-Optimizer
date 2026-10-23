@@ -512,6 +512,7 @@ def _verify_functional_kv_cache_export(model, export_dir: Path):
     """The functional KV-cache export writes the same scales and config as this exporter."""
     attentions = [m for m in model.modules() if hasattr(m, "k_bmm_quantizer")]
     states = [capture_kv_cache_export_state(attention) for attention in attentions]
+    assert states and None not in states
     exported = load_safetensors_dir(export_dir)
     for kind in ("k_scale", "v_scale"):
         names = sorted(
