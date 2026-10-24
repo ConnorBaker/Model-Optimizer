@@ -127,6 +127,11 @@ def calibrate(
             forward_loop_ran = True
             return _requested_forward_loop(model)
 
+        # The fused-experts interception check below judges this calibration's forwards alone.
+        for module in model.modules():
+            if hasattr(module, "_intercept_count"):
+                module._intercept_count = module._forward_count = 0
+
     # move the model to eval mode
     is_training = model.training
     model.eval()
@@ -143,21 +148,22 @@ def calibrate(
             for attr_name in ["_amax", "_pre_quant_scale"]:
                 module.validate_attr(attr_name=attr_name, warn_error=True, name=name)
 
+    # TODO: Re-enable when the CUDA error: unspecified launch failure is fixed.
+    # clear_cuda_cache()
+
+    model.train(is_training)
+
     if forward_loop_ran:
         # A fused-experts module whose forward ran past both interception hooks collected
         # nothing. Surface it here rather than let the export emit weight-derived fallback scales
-        # under a warning that blames the size of the calibration set.
+        # under a warning that blames the size of the calibration set. Raised once the model is
+        # back in its mode, for a caller that catches it to calibrate again.
         try:
             from .plugins.huggingface import assert_fused_experts_intercepted
         except ImportError:
             pass  # no transformers -> no HF fused-experts modules to check
         else:
             assert_fused_experts_intercepted(model)
-
-    # TODO: Re-enable when the CUDA error: unspecified launch failure is fixed.
-    # clear_cuda_cache()
-
-    model.train(is_training)
 
     return model
 

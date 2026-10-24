@@ -17,6 +17,7 @@
 
 import copy
 import warnings
+import weakref
 from contextlib import nullcontext
 from unittest import mock
 
@@ -484,16 +485,25 @@ class TestQuantFusedExperts:
         assert QuantModuleRegistry.get(block_type) is None
         self._cleanup_registry(expert_type)
 
-    def test_transposed_fused_experts_are_left_unquantized(self):
+    @pytest.mark.parametrize("declared", [True, False], ids=["declared", "by-shape"])
+    def test_transposed_fused_experts_are_left_unquantized(self, declared):
         """Matched by shape, a transposed container would export with gate/up split along its input
         dim; registration leaves it unquantized, with a warning, rather than let export write wrong
-        weights or abort the rest of the model's quantization."""
+        weights or abort the rest of the model's quantization. A gated container's shapes give it
+        away when it does not say so."""
 
         class _TransposedExperts(_SyntheticFusedExperts):
-            is_transposed = True
+            pass
 
+        experts = _TransposedExperts()
+        if declared:
+            experts.is_transposed = True
+        else:
+            for name in ("gate_up_proj", "down_proj"):
+                weight = getattr(experts, name).detach().transpose(1, 2).contiguous()
+                setattr(experts, name, nn.Parameter(weight))
         model = nn.Module()
-        model.experts = _TransposedExperts()
+        model.experts = experts
 
         with pytest.warns(UserWarning, match="store their weights transposed"):
             register_fused_experts_on_the_fly(model)
@@ -1248,6 +1258,22 @@ class TestNormalizeExpertsImpl:
         normalize_experts_impl_on_the_fly(model)
         assert model.config._experts_implementation == "eager"
 
+    def test_refuses_experts_quantized_on_the_eager_forward_only_under_expert_parallelism(self):
+        """Expert parallelism runs the experts on the torch_a2a forward, which cannot fall back to
+        eager: such experts would calibrate on raw FP8 bytes, or not at all. Refused before any
+        config changes."""
+        text_config = _StubConfig(impl="torch_a2a")
+        model = _NonMoEModelWithConfig(_StubConfig(impl="grouped_mm", text_config=text_config))
+        model.experts = FP8Experts(
+            PretrainedConfig(
+                hidden_size=256, intermediate_size=256, num_experts=2, hidden_act="silu"
+            ),
+            block_size=(128, 128),
+        )
+        with pytest.raises(NotImplementedError, match="FP8Experts"):
+            normalize_experts_impl_on_the_fly(model)
+        assert model.config._experts_implementation == "grouped_mm"
+
     @pytest.mark.parametrize("impl", ["eager", "grouped_mm", None])
     def test_leaves_a_supported_value_unchanged(self, impl):
         """``eager``, ``grouped_mm`` and an explicit None (the model's eager ``F.linear`` forward) are
@@ -1814,6 +1840,35 @@ class TestGroupedMMExperts:
                 assert eq is not None and gq is not None, f"{q_list}[{idx}] not calibrated"
                 assert torch.allclose(eq, gq, atol=1e-5), f"{q_list}[{idx}] weight amax mismatch"
         self._cleanup_registry(_SyntheticGroupedExperts)
+
+    def test_fake_quantizing_a_projection_keeps_one_experts_slice_alive(self):
+        """Without autograd each expert's fake-quantized slice goes into the output as it is made:
+        a projection's slices all alive beside the output would double its memory."""
+        model = _GroupedMoEModel("grouped_mm")
+        try:
+            mtq.quantize(model, self._quant_cfg(), self._forward_loop_all_experts)
+        finally:
+            self._cleanup_registry(_SyntheticGroupedExperts)
+        experts = model.moe.experts
+        weight, quantizers = experts.gate_up_proj, experts.gate_up_proj_weight_quantizers
+        made = []
+
+        def one_alive(_quantizer, _args, output):
+            assert all(ref() is None for ref in made), "an earlier expert's slice is still alive"
+            made.append(weakref.ref(output))
+
+        handles = [q.register_forward_hook(one_alive) for q in quantizers]
+        try:
+            with torch.no_grad():
+                out = experts._quantize_grouped_weight(weight, quantizers)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert len(made) == NUM_EXPERTS
+        with torch.no_grad():
+            expected = torch.stack([q(weight[idx]) for idx, q in enumerate(quantizers)])
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     @pytest.mark.parametrize("gated", [True, False], ids=["gated", "ungated"])
     def test_gptq_hessians_match_eager(self, gated, monkeypatch):
@@ -2516,10 +2571,14 @@ class _TextAndVisionMoEModel(nn.Module):
 
 
 class _BypassingExperts(_SyntheticFusedExperts):
-    """A hand-written forward that reaches neither ``F.linear`` nor ``_grouped_linear``."""
+    """A forward that, while ``bypass``, reaches neither ``F.linear`` nor ``_grouped_linear``."""
+
+    bypass = True
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
-        return torch.zeros_like(hidden_states)
+        if self.bypass:
+            return torch.zeros_like(hidden_states)
+        return super().forward(hidden_states, top_k_index, top_k_weights)
 
 
 class TestFusedExpertsInterceptionCheck:
@@ -2534,12 +2593,28 @@ class TestFusedExpertsInterceptionCheck:
         assert model.text_moe.experts.gate_up_proj_input_quantizer.amax is not None
         assert model.vision_moe.experts.gate_up_proj_input_quantizer.amax is None
 
-    def test_experts_whose_forward_ran_past_both_hooks_still_fail_loudly(self):
+    @pytest.mark.parametrize("reached_before", [False, True], ids=["first-pass", "later-pass"])
+    def test_experts_whose_forward_ran_past_both_hooks_still_fail_loudly(self, reached_before):
+        """Also when an earlier calibration reached them: each judges its own forwards. The model
+        comes back in the mode it went in, for a caller that catches the error."""
         model = _TinyMoEModel()
         model.moe.experts = _BypassingExperts()
+
+        def forward_loop(m):
+            m(torch.randn(2, 4, HIDDEN_DIM))
+
         try:
+            if reached_before:
+                model.moe.experts.bypass = False
+                mtq.quantize(model, _INT8_EXPERTS_CFG, forward_loop)
+                model.moe.experts.bypass = True
+            model.train()
             with pytest.raises(RuntimeError, match="collected nothing"):
-                mtq.quantize(model, _INT8_EXPERTS_CFG, lambda m: m(torch.randn(2, 4, HIDDEN_DIM)))
+                if reached_before:
+                    mtq.calibrate(model, "max", forward_loop)
+                else:
+                    mtq.quantize(model, _INT8_EXPERTS_CFG, forward_loop)
+            assert model.training
         finally:
             TestFusedExpertsCalibration._cleanup_registry(_BypassingExperts)
 

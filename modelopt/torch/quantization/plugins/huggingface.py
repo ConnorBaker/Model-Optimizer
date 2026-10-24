@@ -910,13 +910,21 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
 
         Each expert slice passes through its own weight quantizer (collecting
         ``amax`` during calibration, fake-quantizing afterwards), matching the
-        eager per-expert ``F.linear`` semantics. Returns ``weight`` untouched when
+        eager per-expert ``F.linear`` semantics. Returns this rank's experts untouched when
         every quantizer is disabled so passthrough stays exact (and cheap).
         """
+        weight = self._local_experts(weight)
         if all(not q.is_enabled for q in quantizers):
             return weight
-        weight = self._local_experts(weight)
-        return torch.stack([quantizers[idx](weight[idx]) for idx in range(self.num_experts)], dim=0)
+        if torch.is_grad_enabled():
+            # Slices written into one buffer would chain a full-size gradient copy per expert into
+            # the backward (QAT), so stack them there.
+            return torch.stack([quantizers[idx](weight[idx]) for idx in range(self.num_experts)])
+        # Each slice goes into the output as it is made: a stack would hold all of them beside it.
+        out = torch.empty_like(weight)
+        for idx in range(self.num_experts):
+            out[idx] = quantizers[idx](weight[idx])
+        return out
 
     @property
     def functionals_to_replace(self):
@@ -1039,34 +1047,14 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
         """Bake each per-expert weight quantizer into its slice of the fused 3-D weight.
 
         The base ``fold_weight`` only handles singular ``*_weight_quantizer`` attributes and
-        would skip the ``nn.ModuleList`` of per-expert quantizers used here. It walks the per-expert
-        ``(weight_slice, quantizer)`` pairs :meth:`iter_weights_for_calibration` calibrates; each
-        fake-quant quantizer's quantization and rotation are folded in and disabled, and calibration
-        buffers are dropped unless ``keep_attrs``.
+        would skip the ``nn.ModuleList`` of per-expert quantizers used here. The per-expert
+        ``(weight_slice, quantizer)`` pairs are the same ones :meth:`iter_weights_for_calibration`
+        yields, so we reuse it; each fake-quant quantizer's quantization and rotation are folded
+        in and disabled, and calibration buffers are dropped unless ``keep_attrs``.
         """
-        for weight_name, quantizers_name in (
-            (self._first_proj_attr, self._first_proj_weight_quantizers_attr),
-            ("down_proj", "down_proj_weight_quantizers"),
-        ):
-            weight = getattr(self, weight_name, None)
-            quantizers = getattr(self, quantizers_name, None)
-            if weight is None or quantizers is None:
-                continue
-            for idx, q in enumerate(quantizers):
-                if not (isinstance(q, TensorQuantizer) and q.fake_quant):
-                    continue
-                slice_ = self._local_experts(weight.data)[idx]
-                slice_.copy_(q(slice_.float()).to(weight.dtype))
-                q.disable()
-                q.disable_rotate()
-                if keep_attrs and hasattr(q, "_pre_quant_scale"):
-                    # The scale is already baked into the folded weight; disable pre-quant
-                    # scaling so it is not applied a second time at inference.
-                    q._enable_pre_quant_scale = False
-                elif not keep_attrs:
-                    for attr_name in ("_pre_quant_scale", "_amax"):
-                        if hasattr(q, attr_name):
-                            delattr(q, attr_name)
+        for weight_slice, q in self.iter_weights_for_calibration():
+            if isinstance(q, TensorQuantizer) and q.fake_quant:
+                self._fold_weight_quantizer(q, (weight_slice,), keep_attrs)
 
 
 class _QuantNemotronHExperts(_QuantFusedExperts):
@@ -1539,7 +1527,12 @@ def register_fused_experts_on_the_fly(model):
         visited_types.add(mod_type)
 
         wrapper = _fused_experts_wrapper(module)
-        if wrapper is not None and getattr(module, "is_transposed", False):
+        if wrapper is not None and (
+            getattr(module, "is_transposed", False)
+            # Stored `(num_experts, out_dim, in_dim)`, the first projection takes the dim down_proj
+            # puts out; a gated container stored transposed never does, whether it says so or not.
+            or getattr(module, wrapper._first_proj_attr).shape[-1] != module.down_proj.shape[1]
+        ):
             # `_fused_experts_wrapper` matches on parameter SHAPE only, so it also claims a
             # transposed `(num_experts, in_dim, out_dim)` container. The fused-experts export
             # (export/moe_utils.py) then splits gate/up by slicing dim 1 at `intermediate_dim`, the
@@ -1581,6 +1574,9 @@ def normalize_experts_impl_on_the_fly(model):
     the grouped path unless ``eager`` was asked for. Applied to the model config
     and recursively to ``text_config`` / ``vision_config`` / ``audio_config`` /
     ``speech_config`` whenever a fused-experts module is present.
+
+    Experts that quantize only on the eager forward are refused on ``torch_a2a``, the
+    expert-parallel forward, which cannot fall back to eager; no config is changed then.
     """
     fused_experts = [module for module in model.modules() if _is_fused_experts_module(module)]
     if not fused_experts:
@@ -1594,32 +1590,37 @@ def normalize_experts_impl_on_the_fly(model):
     # A class with its own quantized wrapper -- GPT-OSS's quantizes down_proj's input by intercepting
     # the eager forward's bmm/matmul -- only works on the eager forward, and so does a fused-experts
     # wrapper that says so (FP8's), so keep main's forced eager for such a model.
-    force_eager = any(
-        (wrapper := QuantModuleRegistry.get(type(module))) is not None
-        and (not issubclass(wrapper, _QuantFusedExperts) or wrapper._eager_only)
-        for module in fused_experts
+    eager_only = sorted(
+        {
+            type(module).__name__
+            for module in fused_experts
+            if (wrapper := QuantModuleRegistry.get(type(module))) is not None
+            and (not issubclass(wrapper, _QuantFusedExperts) or wrapper._eager_only)
+        }
     )
 
-    def _normalize(cfg):
-        if cfg is None:
-            return
-        if hasattr(cfg, "_experts_implementation"):
-            if force_eager and cfg._experts_implementation != "torch_a2a":
-                cfg._experts_implementation = "eager"
-            elif cfg._experts_implementation not in supported_impls:
-                cfg._experts_implementation = "grouped_mm"
-        for sub in nested_cfg_attrs:
-            if hasattr(cfg, sub):
-                _normalize(getattr(cfg, sub))
-
-    if hasattr(model, "config"):
-        _normalize(model.config)
+    def _configs(cfg):
+        if cfg is not None:
+            yield cfg
+            for sub in nested_cfg_attrs:
+                yield from _configs(getattr(cfg, sub, None))
 
     # Some models construct auxiliary blocks from a deep copy of the root config.
     # Nemotron-H MTP does this, so updating only ``model.config`` leaves its fused
     # experts on an unsupported backend that bypasses the quantizer hooks.
-    for module in fused_experts:
-        _normalize(getattr(module, "config", None))
+    roots = [getattr(model, "config", None)] + [getattr(m, "config", None) for m in fused_experts]
+    configs = [c for root in roots for c in _configs(root) if hasattr(c, "_experts_implementation")]
+    if eager_only and any(c._experts_implementation == "torch_a2a" for c in configs):
+        raise NotImplementedError(
+            f"{', '.join(eager_only)} quantize only on the eager experts forward, but this model runs "
+            "its experts on `torch_a2a`, the expert-parallel forward, which cannot fall back to "
+            "eager. Quantize the model without expert parallelism."
+        )
+    for cfg in configs:
+        if eager_only:
+            cfg._experts_implementation = "eager"
+        elif cfg._experts_implementation not in supported_impls:
+            cfg._experts_implementation = "grouped_mm"
 
 
 def assert_fused_experts_intercepted(model):
