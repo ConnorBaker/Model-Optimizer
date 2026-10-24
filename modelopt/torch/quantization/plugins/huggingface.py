@@ -890,15 +890,6 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
         cfg = getattr(self, "config", None)
         return getattr(cfg, "_experts_implementation", None) in ("grouped_mm", "torch_a2a")
 
-    @property
-    def _is_transposed_experts(self) -> bool:
-        """True if the fused weights are stored ``(num_experts, in_dim, out_dim)`` (e.g. llama4/gpt-oss).
-
-        Set by transformers' ``use_experts_implementation(is_transposed=...)`` on the wrapped module;
-        per-channel/block (NVFP4) quant must run on the transposed view so the contraction dim is last.
-        """
-        return bool(getattr(self, "is_transposed", False))
-
     def _local_experts(self, weight: torch.Tensor) -> torch.Tensor:
         """``weight`` indexed the way the per-expert quantizers are: by this module's own experts.
 
@@ -921,23 +912,10 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
         ``amax`` during calibration, fake-quantizing afterwards), matching the
         eager per-expert ``F.linear`` semantics. Returns ``weight`` untouched when
         every quantizer is disabled so passthrough stays exact (and cheap).
-
-        For transposed experts (weight ``(num_experts, in_dim, out_dim)``) the slice is quantized
-        *transposed* (``in_dim`` last) via :func:`_transposed_quantize`, so per-channel/block (NVFP4)
-        blocks along the contraction dim -- matching the transposed calibration + export. For per-tensor
-        (FP8) the orientation is irrelevant, so this is a no-op difference there.
         """
         if all(not q.is_enabled for q in quantizers):
             return weight
         weight = self._local_experts(weight)
-        if self._is_transposed_experts:
-            return torch.stack(
-                [
-                    _transposed_quantize(weight[idx], quantizers[idx])
-                    for idx in range(self.num_experts)
-                ],
-                dim=0,
-            )
         return torch.stack([quantizers[idx](weight[idx]) for idx in range(self.num_experts)], dim=0)
 
     @property
@@ -998,10 +976,6 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
                     input = self.down_proj_input_quantizer(input)
                 else:
                     input = first_input_q(input)
-                # _quantize_grouped_weight quantizes each expert slice transposed when the experts are stored
-                # (num_experts, in_dim, out_dim) (self._is_transposed_experts), so per-channel/block (NVFP4)
-                # blocks along the contraction dim. ``is_transposed`` here is the same layout flag the
-                # grouped matmul uses, so the quantized weight goes straight into _orig_grouped_linear.
                 weight = self._quantize_grouped_weight(weight, quantizers)
                 self._down_proj_linear = not self._down_proj_linear
                 return _orig_grouped_linear(
@@ -1032,7 +1006,6 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
         experts modules, so weight-only calibration never reaches per-expert
         quantizers without this override.
         """
-        transposed = self._is_transposed_experts
         for weight_name, quantizers_name in (
             (self._first_proj_attr, self._first_proj_weight_quantizers_attr),
             ("down_proj", "down_proj_weight_quantizers"),
@@ -1042,10 +1015,7 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
             if weight is None or quantizers is None:
                 continue
             for idx, q in enumerate(quantizers):
-                # Calibrate the same (transposed) view the forward quantizes, so block NVFP4 locks
-                # _original_shape / _amax with the contraction dim last (and the export reads it that way).
-                expert_weight = self.get_expert_weight(weight_name, idx)
-                yield (expert_weight.transpose(-1, -2) if transposed else expert_weight), q
+                yield self.get_expert_weight(weight_name, idx), q
 
     def iter_weight_quantizers_for_calibration(self):
         """Yield the per-expert weight quantizers without slicing the fused 3-D weight.
@@ -1069,12 +1039,11 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
         """Bake each per-expert weight quantizer into its slice of the fused 3-D weight.
 
         The base ``fold_weight`` only handles singular ``*_weight_quantizer`` attributes and
-        would skip the ``nn.ModuleList`` of per-expert quantizers used here. The per-expert
-        ``(weight_slice, quantizer)`` pairs are the same ones :meth:`iter_weights_for_calibration`
-        yields, so we reuse it; each fake-quant quantizer's quantization and rotation are folded
-        in and disabled, and calibration buffers are dropped unless ``keep_attrs``.
+        would skip the ``nn.ModuleList`` of per-expert quantizers used here. It walks the per-expert
+        ``(weight_slice, quantizer)`` pairs :meth:`iter_weights_for_calibration` calibrates; each
+        fake-quant quantizer's quantization and rotation are folded in and disabled, and calibration
+        buffers are dropped unless ``keep_attrs``.
         """
-        transposed = self._is_transposed_experts
         for weight_name, quantizers_name in (
             (self._first_proj_attr, self._first_proj_weight_quantizers_attr),
             ("down_proj", "down_proj_weight_quantizers"),
@@ -1087,11 +1056,7 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
                 if not (isinstance(q, TensorQuantizer) and q.fake_quant):
                     continue
                 slice_ = self._local_experts(weight.data)[idx]
-                # Fold in the same (transposed) orientation the weight was calibrated/quantized in.
-                folded = (
-                    _transposed_quantize(slice_.float(), q) if transposed else q(slice_.float())
-                )
-                slice_.copy_(folded.to(weight.dtype))
+                slice_.copy_(q(slice_.float()).to(weight.dtype))
                 q.disable()
                 q.disable_rotate()
                 if keep_attrs and hasattr(q, "_pre_quant_scale"):
