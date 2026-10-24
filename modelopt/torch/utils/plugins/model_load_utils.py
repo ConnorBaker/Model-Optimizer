@@ -1760,7 +1760,7 @@ def _patch_finegrained_fp8_dequant(target_dtype=None):
         ):
             q = self._unpack_fp4(quantized)
         else:
-            q = quantized.to(torch.float32)
+            q = quantized.to(torch.float32, copy=True)
         rows, cols = q.shape[-2:]
         scale_rows, scale_cols = scales.shape[-2:]
         # Emit the MODEL compute dtype (bf16), NOT the scale dtype. DeepSeek's weight_scale_inv is F32;
@@ -1798,15 +1798,13 @@ def _patch_finegrained_fp8_dequant(target_dtype=None):
 
         block_m = _blk(rows, scale_rows, wbs[0])
         block_n = _blk(cols, scale_cols, wbs[1])
-        s = (
+        # In place on q, its own copy: the product would be a third full-size fp32 temporary.
+        q *= (
             scales.to(torch.float32)
             .repeat_interleave(block_m, dim=-2)
-            .repeat_interleave(block_n, dim=-1)
+            .repeat_interleave(block_n, dim=-1)[..., :rows, :cols]
         )
-        s = s[..., :rows, :cols]
-        return (q * s).to(out_dtype)
-
-    _fp8.Fp8Dequantize._dequantize_one = _dequantize_one
+        return q.to(out_dtype)
 
     # --- Fix the routed-expert block-FP8 load corruption (transformers 5.9) ---------------------
     # The FP8 quantizer's update_weight_conversions PREPENDS Fp8Dequantize to each converter's
@@ -1885,6 +1883,8 @@ def _patch_finegrained_fp8_dequant(target_dtype=None):
             f"block-FP8 load: could not fuse transformers' expert dequant into its merge ({e})."
         ) from e
 
+    # Rebound once the fuse is in, so a refused patch leaves transformers as it was.
+    _fp8.Fp8Dequantize._dequantize_one = _dequantize_one
     _FINEGRAINED_FP8_PATCHED = True
 
 
