@@ -1026,6 +1026,23 @@ def _refuse_packed_fused_expert_weights(name, module, method, updates):
             )
 
 
+def _check_experts_path(experts, grouped: bool) -> None:
+    """Raise if ``experts`` ran on the other path than the one its capture hook was set up for.
+
+    A capture hook is chosen by the path ``config._experts_implementation`` names; the interceptors
+    record the path that ran (``_grouped_offs`` set on the grouped one, cleared on the eager one),
+    and a capture fed by the other path would attribute inputs to the wrong experts.
+    """
+    ran_grouped = getattr(experts, "_grouped_offs", None) is not None
+    if ran_grouped != grouped:
+        impl = getattr(getattr(experts, "config", None), "_experts_implementation", None)
+        raise RuntimeError(
+            f"{type(experts).__name__} ran its experts on the {'grouped' if ran_grouped else 'eager'} "
+            f"path while its config selects {impl!r}; the weight-input capture would attribute "
+            "its inputs to the wrong experts."
+        )
+
+
 class _WeightInputHook:
     """Identify active input collectors so auxiliary modules can request a calibration forward."""
 
@@ -1052,6 +1069,7 @@ def _register_weight_input_hooks(model, names, capture, on_weight=None):
         def _expert_hook(_input_quantizer, args):
             if not args:
                 return
+            _check_experts_path(expert_module, grouped=False)
             idx = expert_module._current_expert_idx
             if idx in enabled:
                 # Read the weight fresh (valid under accelerate/FSDP re-materialization), indexed by
@@ -1073,9 +1091,8 @@ def _register_weight_input_hooks(model, names, capture, on_weight=None):
         def _expert_hook(_input_quantizer, args):
             if not args:
                 return
+            _check_experts_path(expert_module, grouped=True)
             offs = expert_module._grouped_offs
-            if offs is None:
-                return
             x = args[0]
             # This rank's experts, in quantizer order: an expert-parallel weight is a DTensor whose
             # index names a global expert (see ``_local_experts``).
@@ -2501,12 +2518,12 @@ def gptq(
 
     def _make_expert_hook(experts, per_expert):
         def _expert_hook(_input_quantizer, _args, output):
-            if getattr(experts, "_running_grouped_mm", False):
+            grouped = getattr(experts, "_running_grouped_mm", False)
+            _check_experts_path(experts, grouped)
+            if grouped:
                 # grouped_mm and torch_a2a quantize one expert-sorted batch per projection: split
                 # it back per expert by the cumulative token counts, as the eager loop feeds it.
                 offs = experts._grouped_offs
-                if offs is None:
-                    return
                 start = 0
                 for idx, end in enumerate(offs.tolist()):
                     handle = per_expert.get(idx)

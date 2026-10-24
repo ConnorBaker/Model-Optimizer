@@ -1860,6 +1860,29 @@ class TestGroupedMMExperts:
             # The down-proj input flows through a GEMM, hence the tolerance.
             torch.testing.assert_close(grouped[name][1], hessian, rtol=1e-3, atol=1e-4)
 
+    @pytest.mark.parametrize(
+        ("selected", "ran"), [("grouped_mm", "eager"), ("eager", "grouped_mm")]
+    )
+    def test_a_capture_refuses_a_forward_on_the_other_path(self, selected, ran):
+        """The capture hooks are chosen by the path the config selects; fed by the other path they
+        would attribute inputs to the wrong experts, so they raise instead."""
+        model = _GroupedMoEModel(selected)
+        try:
+            mtq.quantize(model, self._quant_cfg(), self._forward_loop_all_experts)
+            handles = _register_weight_input_hooks(model, module_name_maps(model), lambda *a: None)
+            model.config._experts_implementation = ran
+            linear, grouped_linear = F.linear, _moe_integration._grouped_linear
+            try:
+                with pytest.raises(RuntimeError, match="wrong experts"):
+                    self._forward_loop_all_experts(model)
+                # The forward's interceptors are undone even though it raised.
+                assert (F.linear, _moe_integration._grouped_linear) == (linear, grouped_linear)
+            finally:
+                for handle in handles:
+                    handle.remove()
+        finally:
+            self._cleanup_registry(_SyntheticGroupedExperts)
+
     @pytest.mark.parametrize("impl", ["grouped_mm", "torch_a2a"])
     def test_local_hessian_captures_per_expert_in_grouped_mode(self, cpu_dist_workers, impl):
         """local_hessian splits the expert-sorted grouped batch by offsets and refines

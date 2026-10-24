@@ -953,6 +953,8 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
         # forward() resets the toggle before each call to super().forward().
         def _quantized_linear(input, weight, bias=None):
             self._intercept_count += 1
+            # The eager path: no expert-sorted batch for a capture hook to split.
+            self._grouped_offs = None
             if self._down_proj_linear:
                 idx = self._current_expert_idx
                 input = self.down_proj_input_quantizer(input)
