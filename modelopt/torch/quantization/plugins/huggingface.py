@@ -822,6 +822,9 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
     # Under expert parallelism each rank's experts see only the tokens routed to them, so calibration
     # shares the layer's input amax over the expert-parallel group (see max_calibrate).
     _share_input_amax_across_ep = True
+    # Whether the wrapper quantizes only on the eager per-expert forward, so a model holding it must
+    # calibrate there (see normalize_experts_impl_on_the_fly).
+    _eager_only = False
 
     @property
     def _first_proj_input_quantizer_attr(self) -> str:
@@ -1117,6 +1120,10 @@ class _QuantNemotronHExperts(_QuantFusedExperts):
 
 class _QuantFP8Experts(_QuantFusedExperts):
     """Scale-aware PTQ for native Transformers FP8 experts, dequantized per expert."""
+
+    # The block scales apply in get_expert_weight, which only the eager forward reaches: transformers'
+    # FP8 grouped_mm forward runs its own kernels, which nothing here intercepts.
+    _eager_only = True
 
     @property
     def _first_proj_attr(self):
@@ -1618,11 +1625,11 @@ def normalize_experts_impl_on_the_fly(model):
     # intercepts it too -- don't clobber it back to grouped_mm.
     supported_impls = (None, "eager", "grouped_mm", "torch_a2a")
     # A class with its own quantized wrapper -- GPT-OSS's quantizes down_proj's input by intercepting
-    # the eager forward's bmm/matmul -- only works on the eager forward, so keep main's forced eager
-    # for such a model.
+    # the eager forward's bmm/matmul -- only works on the eager forward, and so does a fused-experts
+    # wrapper that says so (FP8's), so keep main's forced eager for such a model.
     force_eager = any(
         (wrapper := QuantModuleRegistry.get(type(module))) is not None
-        and not issubclass(wrapper, _QuantFusedExperts)
+        and (not issubclass(wrapper, _QuantFusedExperts) or wrapper._eager_only)
         for module in fused_experts
     )
 

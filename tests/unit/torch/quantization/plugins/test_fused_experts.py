@@ -1234,6 +1234,20 @@ class TestNormalizeExpertsImpl:
         normalize_experts_impl_on_the_fly(model)
         assert not hasattr(cfg, "_experts_implementation")
 
+    def test_forces_eager_for_experts_quantized_on_the_eager_forward_only(self):
+        """Native FP8 experts apply their block scales on the eager forward; transformers' FP8
+        grouped_mm forward runs kernels nothing intercepts, so a model holding them calibrates on
+        eager, as main forced every MoE to."""
+        model = _NonMoEModelWithConfig(_StubConfig(impl="grouped_mm"))
+        model.experts = FP8Experts(
+            PretrainedConfig(
+                hidden_size=256, intermediate_size=256, num_experts=2, hidden_act="silu"
+            ),
+            block_size=(128, 128),
+        )
+        normalize_experts_impl_on_the_fly(model)
+        assert model.config._experts_implementation == "eager"
+
     @pytest.mark.parametrize("impl", ["eager", "grouped_mm", None])
     def test_leaves_a_supported_value_unchanged(self, impl):
         """``eager``, ``grouped_mm`` and an explicit None (the model's eager ``F.linear`` forward) are
