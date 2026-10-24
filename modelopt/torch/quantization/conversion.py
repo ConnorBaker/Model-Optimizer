@@ -212,11 +212,9 @@ def update_quantize_metadata(
     metadata["quantizer_state"] = quantizer_state(model)
     if shared_state_metadata := SharedWeightGlobalAmaxState.metadata(model):
         metadata["shared_quant_states"] = shared_state_metadata
-        # max / mse / local_hessian all carry ``shared_states`` (via _SharedStatesConfig); restore
-        # rebuilds the ties with the patterns in effect now.
-        metadata["shared_quant_patterns"] = SharedWeightGlobalAmaxState.resolve_patterns(
-            shared_states=getattr(config, "shared_states", None)
-        )
+        # Record the patterns calibration grouped with, so restore ties the same groups; ``config``
+        # need not be the calibration algorithm's (e.g. LoRA and AutoQuantize pass a default one).
+        metadata["shared_quant_patterns"] = SharedWeightGlobalAmaxState.grouping_patterns(model)
     else:
         metadata.pop("shared_quant_states", None)
         metadata.pop("shared_quant_patterns", None)

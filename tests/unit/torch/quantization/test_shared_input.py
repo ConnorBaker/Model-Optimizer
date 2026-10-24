@@ -26,7 +26,12 @@ import torch.nn as nn
 
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
-from modelopt.torch.quantization.config import MaxCalibConfig, QuantizerAttributeConfig
+from modelopt.torch.quantization.config import (
+    MaxCalibConfig,
+    QuantizeConfig,
+    QuantizerAttributeConfig,
+)
+from modelopt.torch.quantization.conversion import update_quantize_metadata
 from modelopt.torch.quantization.model_calib import _sync_mla_fused_down_proj_amax, max_calibrate
 from modelopt.torch.quantization.nn import (
     NVFP4StaticQuantizer,
@@ -600,3 +605,30 @@ def test_mla_down_projections_of_older_checkpoints_restore_ungrouped(tmp_path):
     restored = _DummyMLA()
     mto.restore(restored, path)
     assert not hasattr(restored, "_shared_quant_states")
+
+
+def test_custom_grouping_patterns_survive_save_and_restore(tmp_path):
+    """Restore groups as calibration did, even where the metadata is written with a default config."""
+    q_and_k = r"(?:(.*)\.)?(?:q_proj|k_proj)"
+    cfg = {
+        "quant_cfg": [
+            {"enable": False, "quantizer_name": "*"},
+            {"cfg": _STATIC_NVFP4, "quantizer_name": "*weight_quantizer"},
+        ],
+        "algorithm": {
+            "method": "max",
+            "shared_states": {"weight_global_amax": {"patterns": [q_and_k]}},
+        },
+    }
+    attn = _DummyAttention()
+    mtq.quantize(attn, cfg, lambda m: m(torch.randn(2, 32)))
+    assert _single_global_amax_state(attn).members == (attn.q_proj, attn.k_proj)
+    metadata = {}
+    update_quantize_metadata(attn, QuantizeConfig(), metadata)  # as LoRA and AutoQuantize do
+    assert metadata["shared_quant_patterns"] == [q_and_k]
+
+    path = tmp_path / "model.pth"
+    mto.save(attn, path)
+    restored = _DummyAttention()
+    mto.restore(restored, path)
+    assert _single_global_amax_state(restored).members == (restored.q_proj, restored.k_proj)
