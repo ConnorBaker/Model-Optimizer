@@ -2637,14 +2637,17 @@ def _ep_weight_input_hooks_read_local_experts_job(rank, size):
     n_local = _EP_EXPERTS // size
     mtq.quantize(model, _WEIGHT_ONLY_INT8_EXPERTS_CFG)
 
-    seen = {}
+    seen, captured = {}, []
     with CommDebugMode() as comms:
         handles = _register_weight_input_hooks(
             model,
             module_name_maps(model),
-            lambda *args: None,
+            lambda quantizer, weight, inputs: captured.append(weight),
             on_weight=lambda name, weight, quantizer: seen.__setitem__(name, (weight, quantizer)),
         )
+        # An eager forward's per-expert call: the capture reads this rank's first expert too.
+        model.experts._current_expert_idx = 0
+        model.experts.gate_up_proj_input_quantizer(torch.randn(2, _EP_HIDDEN))
     for handle in handles:
         handle.remove()
     assert comms.get_total_counts() == 0, dict(comms.get_comm_counts())
@@ -2653,6 +2656,9 @@ def _ep_weight_input_hooks_read_local_experts_job(rank, size):
         assert quantizer is getattr(model.experts, f"{name}_weight_quantizers")[0]
         local_first = getattr(whole, name)[rank * n_local].detach()
         torch.testing.assert_close(weight, local_first, atol=0, rtol=0, msg=name)
+    torch.testing.assert_close(
+        captured[0], whole.gate_up_proj[rank * n_local].detach(), atol=0, rtol=0
+    )
 
 
 def test_ep_weight_input_hooks_read_this_ranks_experts_without_a_collective(cpu_dist_workers):

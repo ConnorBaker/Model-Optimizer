@@ -1054,8 +1054,10 @@ def _register_weight_input_hooks(model, names, capture, on_weight=None):
                 return
             idx = expert_module._current_expert_idx
             if idx in enabled:
-                # Read the weight fresh (valid under accelerate/FSDP re-materialization).
-                capture(quantizers[idx], getattr(expert_module, weight_name)[idx], args[0])
+                # Read the weight fresh (valid under accelerate/FSDP re-materialization), indexed by
+                # this rank's own experts as the grouped hook below is (see ``_local_experts``).
+                weight = expert_module._local_experts(getattr(expert_module, weight_name))
+                capture(quantizers[idx], weight[idx], args[0])
 
         return _expert_hook
 
