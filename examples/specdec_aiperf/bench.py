@@ -27,8 +27,11 @@ import os
 import shutil
 import subprocess
 import sys
+import traceback
 import urllib.request
 from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import accumulate
 from pathlib import Path
@@ -41,11 +44,59 @@ MTBENCH_TOPICS = [
 ]  # fmt: skip
 # What examples/specdec_bench/prepare_data.py leaves in SPEED-Bench turns it could not resolve.
 SPEED_PLACEHOLDER = "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH"
-RESPONSES_FILE = {
-    "mtbench": "mtbench_responses.jsonl",
-    "specbench": "specbench_responses.jsonl",
-    "speed": "specbench_responses.jsonl",
-}
+
+
+@dataclass(frozen=True)
+class Request:
+    key: int | str  # this request's Request_AL key, as specdec_bench writes it for the dataset
+    question_id: int | str
+    category: str | None
+    system_prompt: str | None
+    turns: list[str]
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    steps: list[int]  # tokens per step, counted like specdec_bench's streamed chunks
+    times: list[float]  # request start, first token, then every later chunk, in seconds
+    num_tokens: int
+    reply: str
+
+
+@dataclass(frozen=True)
+class DatasetSpec:
+    read_rows: Callable[[str, int | None], list[dict]]  # (path, num_requests) -> rows in run order
+    responses_file: str
+    key_by_index: bool = (
+        False  # MT-Bench keys Request_AL by request index, the others by question_id
+    )
+
+
+@dataclass(frozen=True)
+class Setup:
+    spec: DatasetSpec
+    requests: list[Request]
+    model: str
+    tokenizer: str
+    temperatures: list[float]
+    request_fields: dict  # sent with every request, besides the temperature
+
+
+# ---------------------------------------------------------------------------------------------
+# Datasets
+# ---------------------------------------------------------------------------------------------
+
+
+def _read_jsonl(path, num_requests=None):
+    with open(path) as f:
+        return [json.loads(line) for line in f][:num_requests]
+
+
+def _read_mtbench(path, num_requests):
+    rows = _read_jsonl(path, num_requests)
+    for i, row in enumerate(rows):
+        row.setdefault("category", MTBENCH_TOPICS[i // 10])
+    return rows
 
 
 def _stratified(rows, n):
@@ -62,55 +113,112 @@ def _stratified(rows, n):
     return picked[:n]
 
 
-def load_requests(dataset, path, num_requests=None):
-    """Requests with question_id, category, system_prompt and turns."""
-    if dataset == "speed":
-        import pyarrow.parquet as pq
+def _read_speed(path, num_requests):
+    """A SPEED-Bench split prepared by specdec_bench's prepare_data.py."""
+    import pyarrow.parquet as pq
 
-        path = Path(path)
-        files = sorted(path.rglob("*.parquet")) if path.is_dir() else [path]
-        rows = [row for f in files for row in pq.read_table(f).to_pylist()]
-        if any(turn.startswith(SPEED_PLACEHOLDER) for row in rows for turn in row["turns"]):
-            raise ValueError(f"{path} has unresolved turns; run specdec_bench's prepare_data.py")
-        if num_requests is not None:
-            rows = _stratified(rows, num_requests)
-    else:
-        with open(path) as f:
-            rows = [json.loads(line) for line in f][:num_requests]
-    requests = []
-    for i, row in enumerate(rows):
-        category = row.get("category")
-        if category is None and dataset == "mtbench":
-            category = MTBENCH_TOPICS[i // 10]
-        requests.append(
-            {
-                "question_id": row.get("question_id", i),
-                "category": category,
-                "system_prompt": row.get("system_prompt"),
-                "turns": list(row["turns"] if "turns" in row else row["prompt"]),
-            }
+    path = Path(path)
+    files = sorted(path.rglob("*.parquet")) if path.is_dir() else [path]
+    rows = [row for f in files for row in pq.read_table(f).to_pylist()]
+    if any(turn.startswith(SPEED_PLACEHOLDER) for row in rows for turn in row["turns"]):
+        raise ValueError(f"{path} has unresolved turns; run specdec_bench's prepare_data.py")
+    return rows if num_requests is None else _stratified(rows, num_requests)
+
+
+DATASETS = {
+    "mtbench": DatasetSpec(_read_mtbench, "mtbench_responses.jsonl", key_by_index=True),
+    "specbench": DatasetSpec(_read_jsonl, "specbench_responses.jsonl"),
+    "speed": DatasetSpec(_read_speed, "specbench_responses.jsonl"),
+}
+
+
+def load_requests(spec, path, num_requests=None):
+    return [
+        Request(
+            key=i if spec.key_by_index else row.get("question_id", i),
+            question_id=row.get("question_id", i),
+            category=row.get("category"),
+            system_prompt=row.get("system_prompt"),
+            turns=list(row["turns"] if "turns" in row else row["prompt"]),
         )
-    return requests
+        for i, row in enumerate(spec.read_rows(path, num_requests))
+    ]
+
+
+# ---------------------------------------------------------------------------------------------
+# Server and AIPerf
+# ---------------------------------------------------------------------------------------------
+
+
+def _request_json(url, payload=None):
+    data = None if payload is None else json.dumps(payload).encode()
+    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=300) as response:
+        return json.load(response)
+
+
+def check_server(url, model):
+    """Fail in seconds, not after a full AIPerf run, when the server reports no spec-decode stats."""
+    message = {"role": "user", "content": "Count from 1 to 20."}
+    reply = _request_json(
+        f"{url}/v1/chat/completions", {"model": model, "messages": [message], "max_tokens": 32}
+    )
+    # vLLM puts the stats at the response root, TensorRT-LLM on the choice.
+    stats = (reply.get("metrics") or {}).get("speculative_decoding")
+    if not (stats or reply["choices"][0].get("speculative_decoding")):
+        raise RuntimeError(
+            f"{url} returns no per-request spec-decode stats, so acceptance cannot be measured. "
+            "Serve with speculative decoding and --per-request-spec-decode-metrics summary "
+            "(vLLM v0.29.0 or later)."
+        )
+
+
+def _versions(url):
+    versions = {"aiperf_version": None, "server_version": None}
+    with contextlib.suppress(importlib.metadata.PackageNotFoundError):
+        versions["aiperf_version"] = importlib.metadata.version("aiperf")
+    with contextlib.suppress(OSError):
+        versions["server_version"] = _request_json(f"{url}/version").get("version")
+    return versions
 
 
 def write_input(requests, path):
     """Write an AIPerf multi_turn file with one session per request, keyed by request index."""
     with open(path, "w") as f:
         for i, request in enumerate(requests):
-            turns = [{"text": turn} for turn in request["turns"]]
-            if request["system_prompt"] is not None:
-                turns.insert(0, {"role": "system", "text": request["system_prompt"]})
+            turns = [{"text": turn} for turn in request.turns]
+            if request.system_prompt is not None:
+                turns.insert(0, {"role": "system", "text": request.system_prompt})
             f.write(json.dumps({"session_id": str(i), "turns": turns}) + "\n")
 
 
-def _get_json(url):
-    with urllib.request.urlopen(url, timeout=30) as response:
-        return json.load(response)
-
-
-def _read_jsonl(path):
-    with open(path) as f:
-        return [json.loads(line) for line in f]
+def run_aiperf(args, setup, extra, concurrency, artifact_dir):
+    cmd = [
+        args.aiperf_bin, "profile",
+        "--model", setup.model, "--tokenizer", setup.tokenizer, "--url", args.url,
+        "--endpoint-type", "chat", "--streaming",
+        "--input-file", str(artifact_dir / "input.jsonl"),
+        "--custom-dataset-type", "multi_turn",
+        "--dataset-sampling-strategy", "sequential",
+        # Counts sessions; without it AIPerf sends 10 requests, all first turns.
+        "--num-conversations", str(len(setup.requests)),
+        "--concurrency", str(concurrency),
+        "--extra-inputs", json.dumps(extra),
+        "--use-server-token-count",
+        "--export-level", "raw",
+        "--output-artifact-dir", str(artifact_dir),
+        "--ui", "none",
+        "--no-gpu-telemetry",
+    ]  # fmt: skip
+    if args.trust_remote_code:
+        cmd.append("--tokenizer-trust-remote-code")
+    env = dict(os.environ)
+    if os.path.isdir(setup.tokenizer):
+        # In HF offline mode AIPerf 0.13 looks every tokenizer up in the Hub cache, local paths too.
+        for var in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+            env.pop(var, None)
+    subprocess.run(cmd, check=True, env=env, stdin=subprocess.DEVNULL)
+    return cmd
 
 
 def _key(record):
@@ -130,54 +238,59 @@ def _reply(raw):
 
 
 def _seconds(metric):
-    assert metric["unit"] == "ms", metric
+    # All timings are derived from these; another unit would scale every one of them silently.
+    assert metric["unit"] == "ms", f"expected AIPerf timings in ms, got {metric['unit']}"
     value = metric["value"]
     return [v / 1e3 for v in value] if isinstance(value, list) else value / 1e3
 
 
 def collect(artifact_dir, requests):
-    """Per request: per-turn step lengths and replies; per turn: token times and output tokens."""
+    """Read AIPerf's exports back into one TurnResult per request turn."""
     records = {_key(r): r for r in _read_jsonl(artifact_dir / "profile_export.jsonl")}
     replies = {_key(r): _reply(r) for r in _read_jsonl(artifact_dir / "profile_export_raw.jsonl")}
-    steps, texts, times, tokens = [], [], [], []
+    results = []
     for i, request in enumerate(requests):
-        request_steps, request_texts = [], []
-        for turn in range(len(request["turns"])):
+        turns = []
+        for turn in range(len(request.turns)):
             record = records.get((i, turn))
             if record is None or "spec_decode_acceptance" not in record:
                 raise RuntimeError(
-                    f"No spec-decode stats for request {i} turn {turn}: the request failed, or the "
-                    "server was started without --per-request-spec-decode-metrics."
+                    f"Request {i} turn {turn} failed; see AIPerf's logs in {artifact_dir}"
                 )
-            # Counted like specdec_bench's streamed chunks: the prefill token, then each verify step.
             histogram = record["spec_decode_acceptance"]["acceptance_histogram"]
-            request_steps.append([1] + [int(j) + 1 for j, n in histogram.items() for _ in range(n)])
-            request_texts.append(replies[(i, turn)])
             metrics = record["metrics"]
             start = record["metadata"]["request_start_ns"] / 1e9
             first = start + _seconds(metrics["time_to_first_token"])
             gaps = (
                 _seconds(metrics["inter_chunk_latency"]) if "inter_chunk_latency" in metrics else []
             )
-            times.append([start, first] + [first + t for t in accumulate(gaps)])
-            tokens.append(metrics["output_sequence_length"]["value"])
-        steps.append(request_steps)
-        texts.append(request_texts)
-    return steps, texts, times, tokens
+            turns.append(
+                TurnResult(
+                    # The prefill token, then 1 + accepted drafts for every verify step.
+                    steps=[1] + [int(j) + 1 for j, n in histogram.items() for _ in range(n)],
+                    times=[start, first] + [first + t for t in accumulate(gaps)],
+                    num_tokens=metrics["output_sequence_length"]["value"],
+                    reply=replies[(i, turn)],
+                )
+            )
+        results.append(turns)
+    return results
 
 
-def acceptance_metrics(requests, steps, by_index=False):
-    """specdec_bench's acceptance_rate.json: a request's AL pools its turns; averages are per request.
+# ---------------------------------------------------------------------------------------------
+# specdec_bench's result files
+# ---------------------------------------------------------------------------------------------
 
-    ``Request_AL`` is keyed by request index for MT-Bench and by question_id otherwise, as there.
-    """
+
+def acceptance_metrics(requests, results):
+    """specdec_bench's acceptance_rate.json: a request's AL pools its turns; averages are per request."""
     out = {"Request_AL": {}}
     per_category = defaultdict(list)
     histogram = defaultdict(int)
-    for i, (request, turns) in enumerate(zip(requests, steps)):
-        lengths = [length for turn in turns for length in turn]
-        out["Request_AL"][i if by_index else request["question_id"]] = sum(lengths) / len(lengths)
-        per_category[request["category"]].append(sum(lengths) / len(lengths))
+    for request, turns in zip(requests, results):
+        lengths = [length for turn in turns for length in turn.steps]
+        out["Request_AL"][request.key] = sum(lengths) / len(lengths)
+        per_category[request.category].append(sum(lengths) / len(lengths))
         for length in lengths:
             histogram[length] += 1
     if None not in per_category:
@@ -209,25 +322,27 @@ def _stats(data):
     }
 
 
-def timing_metrics(times, tokens, num_gpus):
-    """specdec_bench's timing.json from per-request [start, first token, ..., last token] seconds."""
-    span = max(t[-1] for t in times) - min(t[0] for t in times)
-    out = {"Output TPS": sum(tokens) / span}
+def timing_metrics(results, num_gpus):
+    """specdec_bench's timing.json."""
+    turns = [turn for request in results for turn in request]
+    span = max(t.times[-1] for t in turns) - min(t.times[0] for t in turns)
+    out = {"Output TPS": sum(t.num_tokens for t in turns) / span}
     out["Output TPS/gpu"] = out["Output TPS"] / num_gpus
     e2e, ttft, step_times, rates = [], [], [], []
-    for num_tokens, t in zip(tokens, times):
+    for turn in turns:
+        t = turn.times
         if len(t) > 1:
             e2e.append(t[-1] - t[0])
             ttft.append(t[1] - t[0])
         if len(t) > 2:
-            rates.append((num_tokens - 1) / (t[-1] - t[1]))
+            rates.append((turn.num_tokens - 1) / (t[-1] - t[1]))
             step_times.extend(np.diff(t))
     out["E2E Request Time"] = _stats(e2e)
     out["TTFT Time"] = _stats(ttft)
     if step_times:
         out["Request Generation Step Time"] = _stats(step_times)
         out["Request Generation Tokens Per Second"] = _stats(rates)
-    out["Number of Output Tokens"] = _stats(tokens)
+    out["Number of Output Tokens"] = _stats([t.num_tokens for t in turns])
     return out
 
 
@@ -237,51 +352,33 @@ def _write_metric(path, metric):
         json.dump([metric], f, indent=4)
 
 
-def _versions(url):
-    versions = {"aiperf_version": None, "server_version": None}
-    with contextlib.suppress(importlib.metadata.PackageNotFoundError):
-        versions["aiperf_version"] = importlib.metadata.version("aiperf")
-    with contextlib.suppress(OSError):
-        versions["server_version"] = _get_json(f"{url}/version").get("version")
-    return versions
+def write_results(out, setup, results, config, num_gpus):
+    acceptance = acceptance_metrics(setup.requests, results)
+    _write_metric(out / "acceptance_rate.json", acceptance)
+    _write_metric(out / "timing.json", timing_metrics(results, num_gpus))
+    with open(out / setup.spec.responses_file, "w") as f:
+        for request, turns in zip(setup.requests, results):
+            line = {"question_id": request.question_id, "category": request.category}
+            line["turns"] = request.turns
+            line["choices"] = [{"index": 0, "turns": [turn.reply for turn in turns]}]
+            f.write(json.dumps(line) + "\n")
+    with open(out / "configuration.json", "w") as f:
+        json.dump(config, f, indent=4)
+    return acceptance
 
 
-def run_aiperf(args, model, tokenizer, extra, num_sessions, concurrency, artifact_dir):
-    cmd = [
-        args.aiperf_bin, "profile",
-        "--model", model, "--tokenizer", tokenizer, "--url", args.url,
-        "--endpoint-type", "chat", "--streaming",
-        "--input-file", str(artifact_dir / "input.jsonl"),
-        "--custom-dataset-type", "multi_turn",
-        "--dataset-sampling-strategy", "sequential",
-        # Counts sessions; without it AIPerf sends 10 requests, all first turns.
-        "--num-conversations", str(num_sessions),
-        "--concurrency", str(concurrency),
-        "--extra-inputs", json.dumps(extra),
-        "--use-server-token-count",
-        "--export-level", "raw",
-        "--output-artifact-dir", str(artifact_dir),
-        "--ui", "none",
-        "--no-gpu-telemetry",
-    ]  # fmt: skip
-    if args.trust_remote_code:
-        cmd.append("--tokenizer-trust-remote-code")
-    env = dict(os.environ)
-    if os.path.isdir(tokenizer):
-        # In HF offline mode AIPerf 0.13 looks every tokenizer up in the Hub cache, local paths too.
-        for var in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
-            env.pop(var, None)
-    subprocess.run(cmd, check=True, env=env, stdin=subprocess.DEVNULL)
-    return cmd
+# ---------------------------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------------------------
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True, help="Server base URL, e.g. http://localhost:8000")
     parser.add_argument("--model", help="Served model name (default: the first in /v1/models)")
     parser.add_argument("--tokenizer", help="Tokenizer for AIPerf (default: the model name)")
     parser.add_argument("--mtbench", help="Shorthand for --dataset mtbench --dataset_path PATH")
-    parser.add_argument("--dataset", choices=["mtbench", "specbench", "speed"])
+    parser.add_argument("--dataset", choices=list(DATASETS))
     parser.add_argument(
         "--dataset_path",
         help="JSONL questions, or for speed a split prepared by examples/specdec_bench/prepare_data.py",
@@ -311,63 +408,80 @@ def main():
     if args.aiperf_bin is None:
         sibling = Path(sys.executable).with_name("aiperf")
         args.aiperf_bin = str(sibling) if sibling.exists() else shutil.which("aiperf") or "aiperf"
+    return args
 
+
+def prepare(args):
+    """Resolve everything the runs share, and check the server once before any of them."""
     runtime = {}
     if args.runtime_params:
         with open(args.runtime_params) as f:
             runtime = yaml.safe_load(f) or {}
-    # Same defaults as specdec_bench: greedy without sampling_kwargs, else temperature 1.
+    # specdec_bench's defaults: greedy without sampling_kwargs, else temperature 1.
     sampling = runtime.get("sampling_kwargs", {"temperature": 0})
-    model = args.model or _get_json(f"{args.url}/v1/models")["data"][0]["id"]
-    tokenizer = args.tokenizer or model
-    requests = load_requests(args.dataset, args.dataset_path, args.num_requests)
+    fields = {
+        # Explicit, or vllm serve fills them from the model's generation_config.json.
+        "top_p": sampling.get("top_p", 1.0),
+        "top_k": sampling.get("top_k", 0),
+        "max_tokens": args.output_length,
+        # Turn 2 replays the turn-1 reply with special tokens, as specdec_bench does.
+        "skip_special_tokens": False,
+    }
+    if runtime.get("chat_template_args"):
+        fields["chat_template_kwargs"] = runtime["chat_template_args"]
+    if args.ignore_eos:
+        fields["ignore_eos"] = True
+    model = args.model or _request_json(f"{args.url}/v1/models")["data"][0]["id"]
+    check_server(args.url, model)
+    spec = DATASETS[args.dataset]
+    return Setup(
+        spec=spec,
+        requests=load_requests(spec, args.dataset_path, args.num_requests),
+        model=model,
+        tokenizer=args.tokenizer or model,
+        temperatures=args.temperature or [sampling.get("temperature", 1.0)],
+        request_fields=fields,
+    )
 
-    for temperature in args.temperature or [sampling.get("temperature", 1.0)]:
+
+def run_config(args, setup, temperature, concurrency):
+    """Benchmark one temperature x concurrency and write it to <save_dir>/t<T>_c<C>/."""
+    out = Path(args.save_dir) / f"t{temperature:g}_c{concurrency}"
+    artifact_dir = out / "aiperf"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_input(setup.requests, artifact_dir / "input.jsonl")
+    extra = {"temperature": temperature, **setup.request_fields}
+    cmd = run_aiperf(args, setup, extra, concurrency, artifact_dir)
+    results = collect(artifact_dir, setup.requests)
+    config = {
+        **vars(args),
+        "temperature": temperature,
+        "concurrency": concurrency,
+        "served_model": setup.model,
+        **_versions(args.url),
+        # Required by specdec_bench's upload_to_s3.py; set from the env as specdec_bench does.
+        "container_image": os.environ.get("CONTAINER_IMAGE") or None,
+        "aiperf_command": cmd,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    acceptance = write_results(out, setup, results, config, args.num_gpus)
+    print(f"{out}: Average_AL {acceptance['Average_AL']:.4f}", flush=True)
+
+
+def main():
+    args = parse_args()
+    setup = prepare(args)
+    failed = []
+    for temperature in setup.temperatures:
         for concurrency in args.concurrency:
-            out = Path(args.save_dir) / f"t{temperature:g}_c{concurrency}"
-            artifact_dir = out / "aiperf"
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            write_input(requests, artifact_dir / "input.jsonl")
-            extra = {
-                # Explicit, or vllm serve fills them from the model's generation_config.json.
-                "temperature": temperature,
-                "top_p": sampling.get("top_p", 1.0),
-                "top_k": sampling.get("top_k", 0),
-                "max_tokens": args.output_length,
-                # Turn 2 replays the turn-1 reply with special tokens, as specdec_bench does.
-                "skip_special_tokens": False,
-            }
-            if runtime.get("chat_template_args"):
-                extra["chat_template_kwargs"] = runtime["chat_template_args"]
-            if args.ignore_eos:
-                extra["ignore_eos"] = True
-            cmd = run_aiperf(
-                args, model, tokenizer, extra, len(requests), concurrency, artifact_dir
-            )
-
-            steps, texts, times, tokens = collect(artifact_dir, requests)
-            acceptance = acceptance_metrics(requests, steps, by_index=args.dataset == "mtbench")
-            _write_metric(out / "acceptance_rate.json", acceptance)
-            _write_metric(out / "timing.json", timing_metrics(times, tokens, args.num_gpus))
-            with open(out / RESPONSES_FILE[args.dataset], "w") as f:
-                for request, replies in zip(requests, texts):
-                    line = {k: request[k] for k in ("question_id", "category", "turns")}
-                    line["choices"] = [{"index": 0, "turns": replies}]
-                    f.write(json.dumps(line) + "\n")
-            config = {
-                **vars(args),
-                "temperature": temperature,
-                "concurrency": concurrency,
-                "served_model": model,
-                **_versions(args.url),
-                # Required by specdec_bench's upload_to_s3.py; set from the env as specdec_bench does.
-                "container_image": os.environ.get("CONTAINER_IMAGE") or None,
-                "aiperf_command": cmd,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            with open(out / "configuration.json", "w") as f:
-                json.dump(config, f, indent=4)
-            print(f"{out}: Average_AL {acceptance['Average_AL']:.4f}", flush=True)
+            try:
+                run_config(args, setup, temperature, concurrency)
+            except Exception:  # noqa: PERF203
+                # One bad point must not cost the rest of a sweep; the exit code still reports it.
+                traceback.print_exc()
+                failed.append(f"t{temperature:g}_c{concurrency}")
+    if failed:
+        sys.exit(f"Failed: {', '.join(failed)}")
 
 
 if __name__ == "__main__":

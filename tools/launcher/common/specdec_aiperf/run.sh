@@ -28,7 +28,8 @@ trap 'exit_handler' EXIT
 #
 # Required env: HF_MODEL_CKPT
 # Optional env: AIPERF_VENV (default /tmp/aiperf-venv; created from the example's requirements.txt
-#               when missing), VLLM_STARTUP_TIMEOUT (seconds, default 1800)
+#               when missing, so point it at a shared directory to install only once),
+#               VLLM_STARTUP_TIMEOUT (seconds, default 1800)
 
 EXAMPLE_DIR=modules/Model-Optimizer/examples/specdec_aiperf
 AIPERF_VENV=${AIPERF_VENV:-/tmp/aiperf-venv}
@@ -70,6 +71,9 @@ until curl -sf "http://localhost:${PORT}/health" >/dev/null; do
     fi
     sleep 10
     WAITED=$((WAITED + 10))
+    if [ $((WAITED % 60)) -eq 0 ]; then
+        echo "Waiting for vllm serve: ${WAITED}s"
+    fi
 done
 
 STATUS=PASS

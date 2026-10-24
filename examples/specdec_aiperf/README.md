@@ -48,8 +48,13 @@ aiperf-venv/bin/python bench.py --url http://localhost:8000 \
 ```
 
 `--dataset speed --dataset_path <split>` reads a SPEED-Bench split prepared by specdec_bench's
-`prepare_data.py`, and `--dataset specbench` reads Spec-Bench questions. `--runtime_params` takes the
-same YAML as specdec_bench: its `sampling_kwargs` and `chat_template_args` are sent with every request.
+`prepare_data.py`, and `--dataset specbench` reads Spec-Bench questions. Every point uses the same
+requests, so acceptance lengths across concurrencies are comparable. `--runtime_params` takes the same
+YAML as specdec_bench: its `sampling_kwargs` and `chat_template_args` are sent with every request.
+
+Before the first run, `bench.py` sends one short request and stops if the response carries no
+spec-decode stats. A point that fails is reported and skipped, the remaining points still run, and the
+script exits non-zero.
 
 To match a specdec_bench run:
 
@@ -65,4 +70,7 @@ To match a specdec_bench run:
   vLLM fails at startup.
 
 `tools/launcher/common/specdec_aiperf/run.sh` runs the server and the benchmark as one launcher task; see
-`tools/launcher/examples/Qwen/Qwen3-8B/specdec_aiperf_dflash.yaml`.
+`tools/launcher/examples/Qwen/Qwen3-8B/specdec_aiperf_dflash.yaml`. It installs AIPerf into `AIPERF_VENV`
+when that is missing; point it at a shared directory so the installation happens once.
+
+To add a dataset, write a reader that returns its rows and register it in `DATASETS` in `bench.py`.
