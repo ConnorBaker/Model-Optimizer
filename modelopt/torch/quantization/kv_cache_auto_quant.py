@@ -19,6 +19,7 @@ import fnmatch
 import hashlib
 import json
 import math
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -42,8 +43,6 @@ from .conversion import set_quantizer_by_cfg
 from .nn import TensorQuantizer
 
 __all__ = ["AutoQuantizeKVSearcher"]
-
-from collections.abc import Callable
 
 _KV_QUANTIZER_ATTRS = ("k_bmm_quantizer", "v_bmm_quantizer")
 _KV_AUTOQUANT_SCHEMA_VERSION = 1
