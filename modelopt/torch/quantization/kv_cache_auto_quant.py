@@ -15,14 +15,12 @@
 
 """Layer-wise KV-cache AutoQuantize using isolated forward KL sensitivity."""
 
-from __future__ import annotations
-
 import fnmatch
 import hashlib
 import json
 import math
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -45,8 +43,7 @@ from .nn import TensorQuantizer
 
 __all__ = ["AutoQuantizeKVSearcher"]
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
+from collections.abc import Callable
 
 _KV_QUANTIZER_ATTRS = ("k_bmm_quantizer", "v_bmm_quantizer")
 _KV_AUTOQUANT_SCHEMA_VERSION = 1

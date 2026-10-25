@@ -21,19 +21,19 @@ layer-by-layer calibration, and :class:`_CheckpointState` for persisting
 per-layer calibration progress to disk.
 """
 
-from __future__ import annotations
-
 import json
 import os
 import shutil
 from collections import deque
+from collections.abc import Callable, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any, Self
 
 import torch
 import torch.nn as nn
 
+from modelopt.torch.opt.searcher import ForwardLoop
 from modelopt.torch.utils import distributed as dist
 from modelopt.torch.utils import print_rank_0, warn_rank_0
 from modelopt.torch.utils.network import (
@@ -43,11 +43,6 @@ from modelopt.torch.utils.network import (
 )
 
 from .core_utils import has_accelerate_offload
-
-if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
-
-    from modelopt.torch.opt.searcher import ForwardLoop
 
 
 class _EarlyStopForwardError(Exception):
@@ -759,7 +754,7 @@ class _CheckpointState:
         save_every: int = 1,
         calib_mutates_weights: bool = True,
         save_layer_state: bool = True,
-    ) -> _CheckpointState | None:
+    ) -> Self | None:
         """Create from folder. Detects resume point. Returns None if no checkpoint_dir."""
         if not checkpoint_dir:
             return None
