@@ -363,6 +363,7 @@ def test_the_model_keeps_the_plan_its_checkpoint_declares(ep_world_of_two, monke
     monkeypatch.setattr(model_load_utils, "_auto_class", lambda *args, **kwargs: _Loader)
     monkeypatch.setattr(model_load_utils, "record_unplaced_source_keys", lambda *args: None)
     monkeypatch.setattr(model_load_utils, "_refuse_unquantizable_experts", next_check)
+
     class _Config(SimpleNamespace):
         base_model_ep_plan = _EP_PLAN
 
