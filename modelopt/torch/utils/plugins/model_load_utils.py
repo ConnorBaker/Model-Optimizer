@@ -1776,7 +1776,8 @@ def load_and_prepare_ep(
     # kwarg resolves non-fp8 impls back to "grouped_mm", but @use_experts_implementation reads
     # `config._experts_implementation` at FORWARD time, so set it on every (sub)config now. (Without
     # this the torch_a2a_experts style passes a 5th process_group arg to grouped_mm_experts_forward ->
-    # TypeError.)
+    # TypeError.) Unlike the plan it stays set, and an export still writes no torch_a2a: transformers
+    # keeps it as ``_experts_implementation_internal``, which it leaves out of a serialized config.
     for _m in model.modules():
         _cfg = getattr(_m, "config", None)
         if _cfg is not None and hasattr(_cfg, "_experts_implementation"):

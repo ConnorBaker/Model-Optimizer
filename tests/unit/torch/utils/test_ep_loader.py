@@ -393,6 +393,63 @@ def test_the_model_keeps_the_plan_its_checkpoint_declares(ep_world_of_two, monke
     assert ("base_model_ep_plan" in vars(model.config)) is declared
 
 
+def test_a_loaded_model_keeps_its_sharding_styles_out_of_its_saved_config(
+    ep_world_of_two, monkeypatch
+):
+    """What the loader leaves on a transformers model, as transformers treats it. Built with the
+    torch_a2a styles, the model keeps them as ``model.tp_plan``, which calibration re-installs the
+    all-to-all forwards by, while its config goes back to the checkpoint's plan; and the experts
+    implementation its forwards dispatch on, torch_a2a, stays out of the config it serializes,
+    which an export writes."""
+    from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+    from transformers.distributed import DistributedConfig
+
+    if not Qwen3MoeConfig.base_model_ep_plan:
+        pytest.skip("this transformers ships no expert-parallel plan for Qwen3-MoE")
+
+    class _PastError(Exception):
+        """Raised by the load's next check."""
+
+    built = []
+
+    class _Loader:
+        @staticmethod
+        def from_pretrained(path, config, **kwargs):
+            config.distributed_config = DistributedConfig(enable_expert_parallel=True)
+            with torch.device("meta"):
+                built.append(Qwen3MoeForCausalLM(config))
+            return built[-1]
+
+    def next_check(experts):
+        raise _PastError
+
+    monkeypatch.setattr(
+        "torch.distributed.device_mesh.init_device_mesh", lambda *args, **kwargs: _Mesh()
+    )
+    monkeypatch.setattr(model_load_utils, "_auto_class", lambda *args, **kwargs: _Loader)
+    monkeypatch.setattr(model_load_utils, "record_unplaced_source_keys", lambda *args: None)
+    monkeypatch.setattr(model_load_utils, "_refuse_unquantizable_experts", next_check)
+    config = Qwen3MoeConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+        num_experts=4,
+        num_experts_per_tok=1,
+    )
+
+    with pytest.raises(_PastError):
+        load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
+
+    (model,) = built
+    assert model.config.base_model_ep_plan == Qwen3MoeConfig.base_model_ep_plan
+    assert "torch_a2a_experts" in set(model.tp_plan.values())
+    assert model.config._experts_implementation == "torch_a2a"
+    assert not any("experts_implementation" in key for key in model.config.to_dict())
+
 
 def test_the_weights_load_in_the_checkpoints_dtype_through_its_class(ep_world_of_two, monkeypatch):
     """The checkpoint's ``dtype`` reaches ``from_pretrained``, and the class that builds it is chosen
