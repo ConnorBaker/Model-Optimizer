@@ -507,30 +507,46 @@ _NO_EP_YET = (
     "checkpoint is an unquantized causal LM, load it in a single process, or replicate "
     r".*DistributionPlan\(2, 1, 'replicate'\)"
 )
+_NEEDS_LATER = (
+    "needs a later transformers to be quantized expert-parallel, and the plan replicates .* "
+    "Upgrade transformers to shard its experts, or shard the whole model with FSDP2"
+)
 
 
 @pytest.mark.parametrize(
-    ("config", "ep_degree", "refusal"),
+    ("config", "ep_degree", "refusal", "version"),
     [
         pytest.param(
-            _deepseek_v3(n_routed_experts=3), None, _CAN_BE_EP.format(3), id="auto_finds_no_degree"
+            _deepseek_v3(n_routed_experts=3),
+            None,
+            _CAN_BE_EP.format(3),
+            None,
+            id="auto_finds_no_degree",
         ),
         pytest.param(
-            _qwen3_moe(num_experts=8), "1", _CAN_BE_EP.format(8), id="explicit_degree_one"
+            _qwen3_moe(num_experts=8), "1", _CAN_BE_EP.format(8), None, id="explicit_degree_one"
         ),
         pytest.param(
             _deepseek_v3(n_routed_experts=8),
             "1",
             _CAN_BE_EP.format(8),
+            None,
             id="explicit_degree_one_spec_plan",
         ),
         pytest.param(
-            GptOssConfig(num_local_experts=4, **_TINY), None, _NO_EP_YET, id="spec_refuses_ep"
+            GptOssConfig(num_local_experts=4, **_TINY),
+            None,
+            _NO_EP_YET,
+            None,
+            id="spec_refuses_ep",
+        ),
+        pytest.param(
+            _deepseek_v3(n_routed_experts=8), None, _NEEDS_LATER, "5.6.2", id="below_the_ep_floor"
         ),
     ],
 )
 def test_an_ep_capable_moe_left_whole_on_every_rank_is_an_error(
-    run_as, serve, monkeypatch, tmp_path, config, ep_degree, refusal
+    run_as, serve, monkeypatch, tmp_path, config, ep_degree, refusal, version
 ):
     """No EP degree above 1 divides 3 experts over 2 ranks, and an explicit 1 asks for none,
     whether the plan comes with the config (Qwen3-MoE) or only from the model's spec, which an EP
@@ -539,7 +555,15 @@ def test_an_ep_capable_moe_left_whole_on_every_rank_is_an_error(
     carries a plan too, but its spec refuses expert parallelism, so auto picks no EP degree for it
     and this check refuses it as an MoE that cannot be expert-parallel yet, offering every other
     way out (FSDP2 only for an unquantized causal LM); the spec's own refusal, a
-    NotImplementedError and so a RuntimeError too, words it differently."""
+    NotImplementedError and so a RuntimeError too, words it differently. Below the transformers
+    release expert parallelism needs, no EP degree is offered, since none would load: upgrading
+    is."""
+    if version is not None:
+        monkeypatch.setattr(transformers, "__version__", version)
+    if refusal.startswith("can be") and Version(transformers.__version__) < Version(
+        _EP_MIN_TRANSFORMERS
+    ):
+        refusal = _NEEDS_LATER
     if ep_degree is not None:
         if config.model_type == "qwen3_moe" and Version(transformers.__version__) < Version("5.7"):
             pytest.skip("qwen3_moe's base_model_ep_plan ships in transformers 5.7")
