@@ -732,6 +732,7 @@ def test_the_dense_knob_replicates_or_shards_over_the_whole_world(
         assert resolve_distribution_plan(str(tmp_path))[0].dense == dense
 
 
+@needs_ep_transformers
 @pytest.mark.parametrize(
     ("config", "ep_size", "experts"),
     [(LlamaConfig(**_TINY), 2, 0), (_qwen3_moe(num_experts=6), 4, 6)],
@@ -741,9 +742,7 @@ def test_an_ep_degree_that_cannot_shard_the_experts_is_refused(
     run_as, serve, tmp_path, config, ep_size, experts
 ):
     """Every rank of an EP group must hold whole experts, and a model without routed experts has
-    none to shard."""
-    if experts and Version(transformers.__version__) < Version("5.7"):
-        pytest.skip("qwen3_moe's base_model_ep_plan ships in transformers 5.7")
+    none to shard. (Below the expert-parallel load's transformers, any EP degree is refused first.)"""
     run_as(4)
     serve(config)
 

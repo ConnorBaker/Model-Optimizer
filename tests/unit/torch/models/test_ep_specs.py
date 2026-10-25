@@ -24,7 +24,12 @@ transformers = pytest.importorskip("transformers")
 from packaging.version import Version
 
 from modelopt.torch.models import EPSpec, ModelSpec, get_spec, get_specs
-from modelopt.torch.utils.moe import _EP_MIN_TRANSFORMERS, _ep_config, apply_distributed_support
+from modelopt.torch.utils.moe import (
+    _EP_MIN_TRANSFORMERS,
+    _ep_config,
+    apply_distributed_support,
+    check_distributed_support,
+)
 
 EP_MODEL_TYPES = [s.model_type for s in get_specs() if s.ep_spec is not None]
 
@@ -104,6 +109,16 @@ def test_the_models_own_plan_always_wins(model_type, config):
     apply_distributed_support(model_type, config)
     assert _ep_config(config).base_model_ep_plan == own
     assert not hasattr(getattr(config, "text_config", cfg()), "base_model_ep_plan")
+
+
+def test_a_model_without_a_spec_still_needs_the_loads_transformers(monkeypatch):
+    """A plan that ships with transformers needs no spec, but its load needs the release every
+    expert-parallel load does: auto picks no EP degree below it, rather than reach the load."""
+    monkeypatch.setattr(transformers, "__version__", "5.6.2")
+    with pytest.raises(RuntimeError, match=r"requires transformers >= 5\.7.*without expert"):
+        check_distributed_support("no_such_model_type")
+    monkeypatch.setattr(transformers, "__version__", _EP_MIN_TRANSFORMERS)
+    check_distributed_support("no_such_model_type")
 
 
 @needs_ep_transformers

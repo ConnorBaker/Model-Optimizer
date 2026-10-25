@@ -155,15 +155,14 @@ def _ep_spec(model_type: str):
 def check_distributed_support(model_type: str) -> None:
     """Refuse ``model_type``'s expert parallelism if its spec does, or below its transformers floor.
 
-    The floor is its spec's release, or the expert-parallel load's own when that is later.
+    The floor is the expert-parallel load's own, or its spec's release when that is later; a model
+    with no spec or no EP section still needs the load's.
     :func:`apply_distributed_support` checks this before it prepares a config; a config already
     prepared with its plan needs only the check. An EP degree left to ``auto`` picks none for a
     model this refuses (:func:`_spec_refuses_ep`), so only an EP degree asked for explicitly, or an
     expert-parallel plan handed in, meets these errors; both name the way around expert parallelism.
     """
     ep = _ep_spec(model_type)
-    if ep is None:
-        return
     # The FSDP2 load builds a causal LM and reads its tensors as stored, so a quantized or
     # multimodal checkpoint (GPT-OSS's MXFP4, Llama-4's) needs a single process.
     without_ep = (
@@ -171,16 +170,17 @@ def check_distributed_support(model_type: str) -> None:
         "examples/hf_ptq/hf_ptq.py, or MODELOPT_FSDP_SIZE=world) if the checkpoint is an "
         "unquantized causal LM"
     )
-    if ep.unsupported:
+    if ep is not None and ep.unsupported:
         raise NotImplementedError(
             f"{model_type} cannot be quantized expert-parallel yet: {ep.unsupported} Quantize it "
             f"{without_ep}."
         )
     from packaging.version import parse
 
-    # A spec that supplies a plan but states no release still needs the load's floor: auto must
-    # pick no EP degree below it, rather than reach the load and fail there.
-    floor = max(_EP_MIN_TRANSFORMERS, ep.requires_transformers or _EP_MIN_TRANSFORMERS, key=parse)
+    # A model whose spec states no release, or that has no spec, still needs the load's floor: auto
+    # must pick no EP degree below it, rather than reach the load and fail there.
+    stated = ep.requires_transformers if ep is not None else None
+    floor = max(_EP_MIN_TRANSFORMERS, stated or _EP_MIN_TRANSFORMERS, key=parse)
     try:
         require_transformers(floor, f"{model_type} expert-parallel PTQ")
     except RuntimeError as e:
