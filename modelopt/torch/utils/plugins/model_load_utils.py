@@ -1463,9 +1463,9 @@ def _decide_distribution(
         if _spec_refuses_ep(hf_config.model_type):
             # Below the release its expert parallelism needs: an EP degree above 1 is refused too.
             raise RuntimeError(
-                f"{hf_config.model_type} needs a later transformers to be quantized "
-                f"expert-parallel, and the plan replicates it at world_size={world_size}, so every "
-                f"rank would hold the whole MoE. Upgrade transformers to shard its experts, or "
+                f"{hf_config.model_type} can be expert-parallel, but the plan resolved to ep_size=1 "
+                f"at world_size={world_size}, so every rank would hold the whole MoE, and this "
+                "transformers cannot shard its experts. Upgrade transformers to shard them, or "
                 f"{others}"
             )
         raise RuntimeError(

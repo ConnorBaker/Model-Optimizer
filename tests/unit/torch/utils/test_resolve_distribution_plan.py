@@ -508,8 +508,8 @@ _NO_EP_YET = (
     r".*DistributionPlan\(2, 1, 'replicate'\)"
 )
 _NEEDS_LATER = (
-    "needs a later transformers to be quantized expert-parallel, and the plan replicates .* "
-    "Upgrade transformers to shard its experts, or shard the whole model with FSDP2"
+    "can be expert-parallel, but the plan resolved .* this transformers cannot shard its experts. "
+    "Upgrade transformers to shard them, or shard the whole model with FSDP2"
 )
 
 
