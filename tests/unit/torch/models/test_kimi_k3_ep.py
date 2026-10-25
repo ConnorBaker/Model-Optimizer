@@ -49,6 +49,7 @@ from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
 
 from modelopt.torch.models import _onfly_decompress, get_spec
 from modelopt.torch.models.kimi_k3 import ep as kimi_k3
+from modelopt.torch.utils import moe
 from modelopt.torch.utils.moe import check_distributed_support
 
 ROUTES = torch.tensor([[0, 3], [1, 2], [3, 1], [2, 0], [1, 3]])  # top-2 experts of 5 tokens
@@ -609,6 +610,43 @@ def test_prepare_sets_the_plan_and_a2a_experts_and_hands_the_quant_config_to_the
     assert seen == [(quant, quant)]
     assert config.quantization_config is None
     assert text.quantization_config is None
+
+
+@pytest.fixture
+def torch_a2a_unregistered(monkeypatch):
+    """The process as the plan decision finds it, before anything registered torch_a2a; what the
+    test registers is dropped after it."""
+    experts = type(ALL_EXPERTS_FUNCTIONS)
+    registered = {k: v for k, v in experts._global_mapping.items() if k != "torch_a2a"}
+    monkeypatch.setattr(experts, "_global_mapping", registered)
+    monkeypatch.setattr(moe, "_TORCH_A2A_REGISTERED", False)
+
+
+@pytest.mark.usefixtures(
+    "private_conversion_registry", "remote_checkpoint", "torch_a2a_unregistered"
+)
+def test_a_model_builds_from_the_prepared_config_before_the_expert_parallel_load():
+    """The plan decision builds the model from prepare's config on the meta device before the
+    expert-parallel load registers torch_a2a, and transformers refuses to build a model whose experts
+    implementation it has not registered: prepare registers the one it names."""
+    text = SimpleNamespace()
+    _prepare(SimpleNamespace(text_config=text, auto_map=_AUTO_MAP))
+
+    # Kimi-K3's own model is the checkpoint's code; every transformers model runs the same check.
+    config = transformers.Qwen3MoeConfig(
+        hidden_size=8,
+        intermediate_size=8,
+        moe_intermediate_size=4,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=16,
+    )
+    config._experts_implementation = text._experts_implementation
+    with torch.device("meta"):
+        transformers.Qwen3MoeForCausalLM(config)
 
 
 @pytest.mark.usefixtures("private_conversion_registry", "remote_checkpoint")

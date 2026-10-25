@@ -72,6 +72,8 @@ import sys
 import torch
 import torch.nn as nn
 
+from modelopt.torch.utils.moe import register_torch_a2a
+
 from .. import _onfly_decompress
 from .._remote_code import stage_full_remote_closure
 
@@ -613,6 +615,9 @@ def prepare(
         # grouped_gemm shards the bf16 fused params; the experts container goes through moe_tp_experts
         # (-> torch_a2a_experts).
         text_cfg.base_model_ep_plan = dict(BASE_MODEL_EP_PLAN)
+    # transformers refuses to build a model whose experts implementation it has not registered, and
+    # the plan decision builds this one on the meta device before the expert-parallel load runs.
+    register_torch_a2a()
     text_cfg._experts_implementation = "torch_a2a"
 
     # The 896 routed experts are compressed-tensors `mxfp4-pack-quantized` (4-bit, group 32); everything
