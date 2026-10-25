@@ -25,8 +25,7 @@ register(
         min_transformers_version="5.5",
         ep_spec=EPSpec(
             # No plan here: qwen3_moe's own base_model_ep_plan ships in transformers, and it is
-            # the architecture the all-to-all path was built around. Its plan lands in 5.7, later
-            # than the 5.6 EP framework floor, so the model carries the higher requirement.
+            # the architecture the all-to-all path was built around. Its plan lands in 5.7.
             requires_transformers="5.7",
         ),
         moe_spec=MoESpec(

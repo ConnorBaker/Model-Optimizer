@@ -188,12 +188,11 @@ class EPSpec(SpecSection):
     mask them."""
 
     requires_transformers: str | None = None
-    """Earliest transformers release that supports THIS model expert-parallel, when it is
-    later than the framework floor.
+    """Earliest transformers release that supports THIS model expert-parallel.
 
     Distinct from ``ModelSpec.min_transformers_version``, which is about the modeling code
-    matching the spec. A model can be fully modelled and still not be shardable: qwen3_moe's
-    own ``base_model_ep_plan`` lands in 5.7, while the shared EP framework is 5.6."""
+    matching the spec. A model can be fully modelled and still not be shardable: qwen3_moe is
+    modelled from 5.5, but its own ``base_model_ep_plan`` lands in 5.7."""
 
     plan_config_attr: str | tuple[str, ...] | None = None
     """The nested config attribute carrying the expert-parallel plan, for a VLM whose MoE is
