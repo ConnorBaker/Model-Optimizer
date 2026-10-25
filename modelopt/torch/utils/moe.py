@@ -213,7 +213,9 @@ def apply_distributed_support(
     nothing at all rather than failing.
 
     An existing plan always wins: stock transformers ships one for some models, and overwriting it
-    would substitute our idea of the layout for the model's own.
+    would substitute our idea of the layout for the model's own. It wins wherever the load reads
+    one (:func:`_ep_config`), not only on the config the spec would take: on the root, or on
+    another nested config.
 
     Returns the config to load, unchanged for a model type with no spec or no EP section. The
     generic all-to-all transport is not wired here -- it self-registers in
@@ -249,7 +251,7 @@ def apply_distributed_support(
                     f"{model_type} expects its expert-parallel plan on "
                     f"config.{' or config.'.join(attrs)}, which this config does not have."
                 )
-        if not getattr(target, "base_model_ep_plan", None):
+        if not getattr(_ep_config(hf_config), "base_model_ep_plan", None):
             target.base_model_ep_plan = dict(ep.base_model_ep_plan)
 
     if ep.prepare is not None:

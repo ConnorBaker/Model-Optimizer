@@ -24,7 +24,7 @@ transformers = pytest.importorskip("transformers")
 from packaging.version import Version
 
 from modelopt.torch.models import EPSpec, ModelSpec, get_spec, get_specs
-from modelopt.torch.utils.moe import _EP_MIN_TRANSFORMERS, apply_distributed_support
+from modelopt.torch.utils.moe import _EP_MIN_TRANSFORMERS, _ep_config, apply_distributed_support
 
 EP_MODEL_TYPES = [s.model_type for s in get_specs() if s.ep_spec is not None]
 
@@ -82,12 +82,28 @@ def test_the_omni_vlm_puts_its_plan_on_the_nested_config():
 
 
 @needs_ep_transformers
-def test_the_models_own_plan_always_wins():
+@pytest.mark.parametrize(
+    ("model_type", "config"),
+    [
+        ("deepseek_v3", lambda own: cfg(base_model_ep_plan=own)),
+        (
+            "nemotron_h_omni",
+            lambda own: cfg(text_config=cfg(), llm_config=cfg(base_model_ep_plan=own)),
+        ),
+        ("nemotron_h_omni", lambda own: cfg(base_model_ep_plan=own, text_config=cfg())),
+    ],
+    ids=["on-the-root", "on-another-nested-config", "on-a-vlms-root"],
+)
+def test_the_models_own_plan_always_wins(model_type, config):
     """Stock transformers ships a plan for some models; overwriting it would substitute our idea
-    of the layout for the model's own."""
-    config = cfg(base_model_ep_plan={"layers.*.mlp.experts": "stock_style"})
-    apply_distributed_support("deepseek_v3", config)
-    assert config.base_model_ep_plan == {"layers.*.mlp.experts": "stock_style"}
+    of the layout for the model's own. It wins wherever the load reads it, not only on the config
+    the spec would take: ours on text_config would shadow the model's on llm_config, which the
+    load reads after it, or lie unused beside a plan on the root."""
+    own = {"layers.*.mlp.experts": "stock_style"}
+    config = config(own)
+    apply_distributed_support(model_type, config)
+    assert _ep_config(config).base_model_ep_plan == own
+    assert not hasattr(getattr(config, "text_config", cfg()), "base_model_ep_plan")
 
 
 @needs_ep_transformers
