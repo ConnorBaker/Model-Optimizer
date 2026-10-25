@@ -1,0 +1,122 @@
+schema_version: 1
+config_kind: historical_experiment_record
+method: QAD
+entrypoint: ${RECOVERY_DISTILL_ENTRYPOINT}
+historical_entrypoint_sha256: 64598f14416f0e0558cf7465da088dc7a5c92f7227cf8836207cfe9e54da27dc
+runtime_helper_sha256:
+  enable_sm103_flash.py: b1461d50447285888089b6fb06be76f0d306d2fd1c24d68a04a18f9671a7d0b0
+  bound_adam_tensor_batch.py: 99bd1e8db832861c56a5cdfe2d5869df4758461ced1565bc4dc4fb0a15b78c4e
+training_container: NeMo 26.08.00
+hardware:
+  gpus: 4
+  gpu_type: GB300
+teacher: Original BF16 teacher for the QAD checkpoint.
+student: Original fake-quantized QAD checkpoint at iteration 500; preserve active quantizers.
+dataset:
+  directory: datasets/prompt7
+  file: training.jsonl
+  examples: 334
+  format: JSONL with input and output string fields
+  max_sequence_tokens: 32768
+objective:
+  teacher_logit_kl_top_k: 4096
+  kd_loss_scale: 1.0
+  input_tokens_masked: true
+  lm_cross_entropy_loss: false
+  moe_aux_loss_coeff: 0.0
+schedule:
+  iterations: 42
+  global_batch_size: 8
+  micro_batch_size: 1
+  learning_rate: 1.0e-06
+  minimum_learning_rate: 1.0e-06
+  warmup_iterations: 0
+  seed: 20261018
+  note: 'Approximately one epoch: ceil(334 / 8). Not the original 500-iteration QAD schedule.'
+topology:
+  tensor_parallel_size: 1
+  expert_parallel_size: 4
+  pipeline_parallel_size: 1
+  context_parallel_size: 1
+arguments:
+  - --teacher_hf_path
+  - ${TEACHER_HF_PATH}
+  - --student_hf_path
+  - ${STUDENT_HF_PATH}
+  - --student_megatron_path
+  - ${STUDENT_MEGATRON_PATH}
+  - --tp_size
+  - '1'
+  - --ep_size
+  - '4'
+  - --pp_size
+  - '1'
+  - --cp_size
+  - '1'
+  - --sft
+  - --sft_dataset_root
+  - ${SFT_DATASET_ROOT}
+  - --seq_length
+  - '32768'
+  - --mbs
+  - '1'
+  - --gbs
+  - '8'
+  - --train_iters
+  - '42'
+  - --lr
+  - 1e-6
+  - --min_lr
+  - 1e-6
+  - --lr_warmup_iters
+  - '0'
+  - --kd_loss_scale
+  - '1'
+  - --logit_kl_topk
+  - '4096'
+  - --moe_aux_loss_coeff
+  - '0'
+  - --recompute_granularity
+  - full
+  - --recompute_method
+  - uniform
+  - --recompute_num_layers
+  - '1'
+  - --no_async_save
+  - --checkpoint_keep_last
+  - '1'
+  - --eval_iters
+  - '0'
+  - --save_interval
+  - '10'
+  - --log_interval
+  - '1'
+  - --exit_duration_in_mins
+  - '205'
+  - --output_dir
+  - ${OUTPUT_DIR}
+  - --seed
+  - '20261018'
+export:
+  entrypoint: examples/megatron_bridge/export_quantized_megatron_to_hf.py
+  format: NVFP4 unified Hugging Face
+  checkpoint_iteration: 42
+  arguments:
+    - --hf_model_name_or_path
+    - ${STUDENT_HF_PATH}
+    - --megatron_path
+    - ${RECOVERY_MEGATRON_PATH}
+    - --pp_size
+    - '4'
+    - --export_unified_hf_path
+    - ${EXPORT_DIR}
+compatibility:
+  current_main_gpu_validated: false
+  historical_topk_flag: --logit_kl_topk
+  current_main_topk_flag: --logit_kl_top_k
+  loss_equivalence_to_current_main_verified: false
+  notes:
+    - The original distillation entrypoint was experiment-local; its full source and runtime patches are not packaged here.
+    - Current main documents a residual probability bucket for top-k KL. A CLI rename alone does not establish loss equivalence.
+    - Transformer Engine 2.17.1 required an experiment-local SM103 FlashAttention eligibility fix for head dimension 256.
+    - The historical runtime also bounded Adam tensor batches. Validate attention selection, checkpoint restoration, and optimizer behavior before rerunning.
