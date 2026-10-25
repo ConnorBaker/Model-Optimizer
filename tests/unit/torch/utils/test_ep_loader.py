@@ -290,8 +290,15 @@ def test_routed_experts_without_experts_in_their_names_are_refused(ep_world_of_t
 
 @pytest.mark.parametrize(
     ("loaded", "held", "named"),
-    [(4, 2, None), (3, 3, None), (None, None, None), (4, 4, None), (None, None, 4)],
-    ids=["dividing", "not-dividing", "not-shown", "sharded-over-another-mesh", "never-sharded"],
+    [(4, 2, None), (3, 3, None), (None, None, None), (4, 4, None), (None, None, 4), (None, 0, 4)],
+    ids=[
+        "dividing",
+        "not-dividing",
+        "not-shown",
+        "sharded-over-another-mesh",
+        "never-sharded",
+        "owning-no-weights",
+    ],
 )
 def test_an_expert_count_the_config_does_not_name_is_read_off_the_loaded_experts(
     ep_world_of_two, gloo_world_of_one, monkeypatch, loaded, held, named
@@ -301,7 +308,9 @@ def test_an_expert_count_the_config_does_not_name_is_read_off_the_loaded_experts
     and 5.16.0 splits a count ep_size does not divide without an error. A count neither shows is
     refused, as the distribution plan's decision refuses it. So is a rank holding another share of
     the experts than ``ep_size`` gives it: sharded over another mesh than its EP group, or never
-    sharded, which plain weights show against the count the config names."""
+    sharded, which plain weights show against the count the config names. Experts whose container
+    owns no weights itself (each expert's in a child module) show no share at all, and are refused
+    rather than passed unchecked."""
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import DTensor, Shard
 
@@ -309,6 +318,13 @@ def test_an_expert_count_the_config_does_not_name_is_read_off_the_loaded_experts
         """Raised by the load's next check: the experts' count passed."""
 
     model = _model_with_decoder_at("model.")
+    if held == 0:
+        for layer in model.model.layers:
+            experts, weights = layer.mlp.experts, nn.Module()
+            for name, param in list(experts.named_parameters(recurse=False)):
+                delattr(experts, name)
+                weights.register_parameter(name, param)
+            experts.add_module("weights", weights)
     if loaded is not None:
         mesh = init_device_mesh("cpu", (1,))
         for layer in model.model.layers:
@@ -345,6 +361,8 @@ def test_an_expert_count_the_config_does_not_name_is_read_off_the_loaded_experts
     )
     if (loaded, held) == (4, 2):
         outcome = pytest.raises(_PastError)
+    elif held == 0:
+        outcome = pytest.raises(RuntimeError, match="no routed-expert weight shows how")
     elif loaded == 4 or named:
         outcome = pytest.raises(
             RuntimeError, match="holds 4 of a routed-expert container's 4 experts"

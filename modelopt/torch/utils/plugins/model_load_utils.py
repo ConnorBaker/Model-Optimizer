@@ -1840,8 +1840,9 @@ def load_and_prepare_ep(
     # of its own for the load, which _experts_sharded_over swaps for the expert-parallel one) would
     # run without an error, computing tokens against other experts' weights and merging the scales of
     # different experts. A DTensor (transformers 5.16 on) shows the whole count and this rank's share;
-    # a plain tensor shows the share, checked against the config's count. Every rank refuses alike,
-    # whichever ranks hold a wrong share.
+    # a plain tensor shows the share, checked against the config's count when it names one. Weights
+    # that show neither, as a container owning none itself would, are refused too: an unchecked share
+    # passes as a correct one. Every rank refuses alike, whichever ranks hold a wrong share.
     held = [
         (param.shape[0], param.to_local().shape[0])
         if isinstance(param, DTensor)
@@ -1852,6 +1853,12 @@ def load_and_prepare_ep(
     ]
 
     def _check_share() -> None:
+        if not held:
+            raise RuntimeError(
+                f"{plan!r}: no routed-expert weight shows how its experts are shared out over the "
+                "expert-parallel ranks, so the all-to-all transport's expert-to-rank mapping cannot "
+                "be checked. Quantize the model without expert parallelism."
+            )
         wrong = sorted({(whole, share) for whole, share in held if share * ep_degree != whole})
         if wrong:
             whole, share = wrong[0]
