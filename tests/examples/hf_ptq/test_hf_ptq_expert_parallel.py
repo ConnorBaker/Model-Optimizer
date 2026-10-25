@@ -37,8 +37,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import transformers
 from _test_utils.examples.hf_ptq_example_utils import example_utils
 from _test_utils.torch.transformers_models import get_tiny_tokenizer
+from packaging.version import Version
 from PIL import Image
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, DeepseekV3Config, LlamaConfig
@@ -46,6 +48,7 @@ from transformers import AutoConfig, DeepseekV3Config, LlamaConfig
 import modelopt.torch.utils.distributed as dist
 from modelopt.torch.models import get_spec
 from modelopt.torch.utils.distributed import DistributionPlan, ParallelState, set_distribution_plan
+from modelopt.torch.utils.moe import _EP_MIN_TRANSFORMERS
 from modelopt.torch.utils.plugins import model_load_utils
 from modelopt.torch.utils.plugins.model_load_utils import load_pretrained
 
@@ -155,6 +158,14 @@ def _serve(monkeypatch, hf_ptq, config):
     return config
 
 
+# DeepSeek-V3 is expert-parallel only from the transformers release the expert-parallel load needs;
+# below it, a multi-rank run of it is refused before the route the test exercises.
+needs_ep_transformers = pytest.mark.skipif(
+    Version(transformers.__version__) < Version(_EP_MIN_TRANSFORMERS),
+    reason=f"expert parallelism needs transformers >= {_EP_MIN_TRANSFORMERS}",
+)
+
+
 def _deepseek_v3(n_routed_experts):
     """DeepSeek-V3 without a plan of its own, so only its model spec can make it EP-capable.
 
@@ -197,6 +208,7 @@ def test_dense_sharding_without_expert_parallelism_needs_use_fsdp2(hf_ptq, monke
         hf_ptq._resolve_distribution(_args(torchrun(world_size=2)))
 
 
+@needs_ep_transformers
 @pytest.mark.parametrize("ep_degree", [2, 4])
 def test_dense_fsdp2_within_expert_data_parallel_replicas_is_refused(
     hf_ptq, monkeypatch, torchrun, ep_degree
@@ -243,7 +255,12 @@ def test_a_tensorrt_llm_checkpoint_export_needs_a_single_process(
 
 @pytest.mark.parametrize(
     ("world_size", "env", "use_fsdp2"),
-    [(2, {"MODELOPT_EP_DEGREE": "2"}, False), (2, {}, False), (2, {}, True), (1, {}, False)],
+    [
+        pytest.param(2, {"MODELOPT_EP_DEGREE": "2"}, False, marks=needs_ep_transformers),
+        pytest.param(2, {}, False, marks=needs_ep_transformers),
+        (2, {}, True),
+        (1, {}, False),
+    ],
     ids=["expert_parallel", "replicated", "use_fsdp2", "single_process"],
 )
 def test_an_auto_quantize_recipe_is_refused_on_the_routes_this_script_adds(
@@ -276,7 +293,7 @@ def test_an_auto_quantize_recipe_is_refused_on_the_routes_this_script_adds(
 @pytest.mark.parametrize(
     ("make_config", "world_size"),
     [
-        (lambda: _deepseek_v3(n_routed_experts=8), 2),
+        pytest.param(lambda: _deepseek_v3(n_routed_experts=8), 2, marks=needs_ep_transformers),
         (lambda: LlamaConfig(**_TINY), 2),
         (lambda: LlamaConfig(**_TINY), 1),
     ],
@@ -302,7 +319,9 @@ def test_the_single_process_load_options_are_refused_on_the_routes_this_script_a
 @pytest.mark.parametrize(
     ("make_config", "world_size", "refused"),
     [
-        (lambda: _deepseek_v3(n_routed_experts=8), 2, True),
+        pytest.param(
+            lambda: _deepseek_v3(n_routed_experts=8), 2, True, marks=needs_ep_transformers
+        ),
         (lambda: LlamaConfig(**_TINY), 2, False),
         (lambda: LlamaConfig(**_TINY), 1, False),
     ],
@@ -352,6 +371,7 @@ def _record_load_pretrained(hf_ptq, monkeypatch):
             DistributionPlan(4, ep_size=4, dense="fsdp"),
             {"trust_remote_code": True, "attn_implementation": "eager"},
             id="expert_parallel",
+            marks=needs_ep_transformers,
         ),
         pytest.param(
             lambda: LlamaConfig(architectures=["LlamaForCausalLM"], **_TINY),
