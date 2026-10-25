@@ -128,7 +128,8 @@ def tied_qwen3_path(tmp_path_factory):
         intermediate_size=512,
         tie_word_embeddings=True,
     )
-    return str(model_dir)
+    with assert_unmodified_tree(model_dir) as path:
+        yield str(path)
 
 
 @pytest.fixture(scope="module")
