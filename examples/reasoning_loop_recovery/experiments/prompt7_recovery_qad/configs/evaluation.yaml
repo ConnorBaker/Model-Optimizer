@@ -1,0 +1,58 @@
+schema_version: 1
+config_kind: historical_experiment_record
+benchmark: SciCode (Subtask)
+split_file: ../data/subtask_split.json
+max_completion_tokens: 131072
+max_model_len: 262144
+temperature: 0.6
+top_p: 0.95
+enable_thinking: true
+presence_penalty: 0.0
+tensor_parallel_size: 1
+concurrency_per_worker: 8
+reasoning_parser: qwen3
+prerequisites:
+  policy: Generate preceding steps with the same checkpoint, seed, and prompt variant.
+  supplied_reference_step_ids:
+    - '13.6'
+    - '62.1'
+    - '76.3'
+  include_in_target_metrics: false
+context_policy: Fail the affected chain if prompt plus output cap exceeds context; never lower the output cap.
+checkpoints:
+  original_qad: checkpoints/original_qad_nvfp4
+  prompt7_recovery_qad: checkpoints/prompt7_recovery_nvfp4
+seeds:
+  - 61000
+  - 61001
+  - 61002
+  - 61003
+  - 61004
+  - 61005
+  - 61006
+  - 61007
+  - 61008
+  - 61009
+attempts_per_subtask: 10
+responses_per_checkpoint: 550
+training_subtask_responses_per_checkpoint: 440
+held_out_subtask_responses_per_checkpoint: 110
+extra_prompt:
+retain_all_attempts: true
+comparison_unit: Matched subtask and seed; prerequisites are generated separately by each checkpoint.
+metrics:
+  - cap_hits
+  - missing_final
+  - cap_and_missing_final
+  - high_repetition
+  - correct
+  - mean_tokens
+  - median_tokens
+  - p95_tokens
+definitions:
+  cap_hit: finish_reason == 'length' or completion_tokens >= 131072
+  missing_final: Empty parsed final-answer content.
+  high_repetition: Saved reasoning_repetition score >= 0.5.
+  correct: Passes official SciCode tests.
+  tokens: Reported completion tokens, including reasoning.
+  p95: Sorted completion tokens at ceil(0.95 * N) - 1.
