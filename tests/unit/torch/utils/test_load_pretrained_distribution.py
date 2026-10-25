@@ -26,6 +26,7 @@ import inspect
 import pytest
 import torch
 from _test_utils.torch.distributed.utils import bounded_collectives
+from packaging.version import Version
 
 transformers = pytest.importorskip("transformers")
 
@@ -66,6 +67,13 @@ def _deepseek_v3(n_routed_experts=8):
     )
     config.base_model_ep_plan = None  # holds even if a later transformers ships a plan
     return config
+
+
+# Below the expert-parallel load's transformers floor, no load plans expert parallelism.
+needs_ep_transformers = pytest.mark.skipif(
+    Version(transformers.__version__) < Version(moe._EP_MIN_TRANSFORMERS),
+    reason=f"expert parallelism needs transformers >= {moe._EP_MIN_TRANSFORMERS}",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -300,6 +308,7 @@ def test_a_model_class_of_the_callers_own_loads_whole(
     assert loaders == {}
 
 
+@needs_ep_transformers
 def test_an_expert_parallel_plan_loads_through_the_ep_loader(
     run_as, serve, loaders, auto_class, monkeypatch, tmp_path
 ):
@@ -327,6 +336,7 @@ def test_an_expert_parallel_plan_loads_through_the_ep_loader(
     assert auto_class.calls == []
 
 
+@needs_ep_transformers
 @pytest.mark.parametrize(
     ("planned", "passed_as", "preparations"),
     [(False, None, 1), (True, None, 1), (True, "hf_config", 0), (True, "config", 1)],
