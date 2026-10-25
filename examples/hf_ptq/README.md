@@ -652,7 +652,7 @@ See [Recipe-based Quantization](#recipe-based-quantization) for the recipe forma
 
 Under `torchrun`, `hf_ptq.py` shards an MoE model's routed experts across the ranks (expert parallelism) instead of loading the whole model on every GPU. Each rank holds `num_experts / ep_degree` experts and calibrates on its own shard of the calibration data. An all-to-all sends every token to the rank that owns its expert, so each expert's quantizers see the tokens routed to it from all ranks. The dense (non-expert) part is replicated on every rank, or FSDP2-sharded when it does not fit one GPU. Each rank then writes its share of the unified HF checkpoint, without gathering the model onto one GPU.
 
-A model can be expert-parallel when its config declares a `base_model_ep_plan`. transformers ships one for several MoEs, and ModelOpt supplies the plan or an adapter for others (see the `ep_spec` entries in `modelopt/torch/models/*/specs.py`). Expert parallelism needs transformers 5.6 or newer, and some models a newer release; a run that cannot be expert-parallel is refused before loading.
+A model can be expert-parallel when its config declares a `base_model_ep_plan`. transformers ships one for several MoEs, and ModelOpt supplies the plan or an adapter for others (see the `ep_spec` entries in `modelopt/torch/models/*/specs.py`). Expert parallelism needs transformers 5.7 or newer, and some models a newer release; a run that cannot be expert-parallel is refused before loading.
 
 ```bash
 torchrun --nproc_per_node=<num_gpus_per_node> \
