@@ -1,0 +1,55 @@
+schema_version: 1
+experiment: prompt7_recovery_qad_334
+evaluation_config: ../evaluation/evaluation.yaml
+verified_from: Saved per-response metrics; unique (subtask, seed) pairs checked against the complete expected set.
+training_examples: 334
+training_iterations: 42
+models:
+  original_qad:
+    train:
+      responses: 440
+      cap_hits: 41
+      missing_final: 42
+      cap_and_missing_final: 40
+      correct: 57
+      high_repetition: 70
+      mean_tokens: 23677.354545454546
+      median_tokens: 8836.5
+      p95_tokens: 131072
+    held_out:
+      responses: 110
+      cap_hits: 12
+      missing_final: 12
+      cap_and_missing_final: 12
+      correct: 6
+      high_repetition: 16
+      mean_tokens: 23742.063636363637
+      median_tokens: 8314.5
+      p95_tokens: 131072
+  prompt7_recovery_qad:
+    train:
+      responses: 440
+      cap_hits: 17
+      missing_final: 15
+      cap_and_missing_final: 15
+      correct: 57
+      high_repetition: 24
+      mean_tokens: 18766.504545454547
+      median_tokens: 5911.0
+      p95_tokens: 70877
+    held_out:
+      responses: 110
+      cap_hits: 7
+      missing_final: 7
+      cap_and_missing_final: 7
+      correct: 7
+      high_repetition: 8
+      mean_tokens: 19230.590909090908
+      median_tokens: 5923.5
+      p95_tokens: 131072
+limitations:
+  - Affected-subtask selection enriches the evaluation for baseline failures.
+  - Training and held-out subtasks may share parent problems.
+  - 10 attempts per subtask.
+  - Cap hits and high repetition are different metrics; cap hits alone do not prove looping.
+  - Matching seeds does not make checkpoint-specific prerequisite generations identical.
