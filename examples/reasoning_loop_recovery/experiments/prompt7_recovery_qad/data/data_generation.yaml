@@ -5,7 +5,7 @@ checkpoint:
   format: NVFP4
   file: checkpoints/original_qad_nvfp4
 benchmark: SciCode (Subtask)
-split_file: ../evaluation/subtask_split.yaml
+split_file: subtask_split.yaml
 max_completion_tokens: 131072
 max_model_len: 262144
 temperature: 0.6

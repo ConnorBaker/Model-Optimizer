@@ -18,7 +18,7 @@ source_checkpoint:
   weights_included: false
   public_download_url:
 generation_config: data_generation.yaml
-split_file: ../evaluation/subtask_split.yaml
+split_file: subtask_split.yaml
 prompt_file: prompt7.txt
 tokenizer_transformers_version: 5.20.1
 counts:
