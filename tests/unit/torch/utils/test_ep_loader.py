@@ -337,9 +337,11 @@ def test_an_expert_count_the_config_does_not_name_is_read_off_the_loaded_experts
         load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
 
 
-def test_the_model_keeps_the_plan_its_checkpoint_declares(ep_world_of_two, monkeypatch):
+@pytest.mark.parametrize("declared", [True, False], ids=["on-the-config", "a-class-default"])
+def test_the_model_keeps_the_plan_its_checkpoint_declares(ep_world_of_two, monkeypatch, declared):
     """The load shards by the torch_a2a styles, but the config the model keeps goes back to the
-    checkpoint's plan: an export writes it out, and nothing without ModelOpt knows those styles."""
+    checkpoint's plan: an export writes it out, and nothing without ModelOpt knows those styles. A
+    plan the config class ships (transformers' own, e.g. Qwen3-MoE's) stays off the instance."""
 
     class _PastError(Exception):
         """Raised by the load's next check."""
@@ -361,12 +363,16 @@ def test_the_model_keeps_the_plan_its_checkpoint_declares(ep_world_of_two, monke
     monkeypatch.setattr(model_load_utils, "_auto_class", lambda *args, **kwargs: _Loader)
     monkeypatch.setattr(model_load_utils, "record_unplaced_source_keys", lambda *args: None)
     monkeypatch.setattr(model_load_utils, "_refuse_unquantizable_experts", next_check)
-    config = SimpleNamespace(base_model_ep_plan=dict(_EP_PLAN), num_experts=4)
+    class _Config(SimpleNamespace):
+        base_model_ep_plan = _EP_PLAN
+
+    config = _Config(num_experts=4, **({"base_model_ep_plan": dict(_EP_PLAN)} if declared else {}))
 
     with pytest.raises(_PastError):
         load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
 
     assert model.config.base_model_ep_plan == _EP_PLAN
+    assert ("base_model_ep_plan" in vars(model.config)) is declared
 
 
 def test_the_weights_load_in_the_checkpoints_dtype_through_its_class(ep_world_of_two, monkeypatch):
