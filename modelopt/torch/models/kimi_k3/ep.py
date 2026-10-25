@@ -434,7 +434,11 @@ def _patch_kimi_cache_get_mask_sizes(kmod) -> None:
     inputs_embeds.shape[1], an int), but the remote ``KimiDynamicCache.get_mask_sizes(cache_position, layer_idx)`` does
     ``cache_position.shape[0]`` -- it expects a TENSOR (older tf) -> ``AttributeError: 'int' object has no attribute
     'shape'`` in the calibration forward. Re-implement to accept either an int query_length or a tensor cache_position
-    (the body is otherwise trivial: kv_length = query_length + past_seen_tokens, kv_offset = 0). Idempotent.
+    (the body is otherwise trivial: kv_length = query_length + past_seen_tokens, kv_offset = 0).
+
+    tf 5.15's mask preprocessing also asks the cache for ``get_query_offset(layer_idx)``, which the remote
+    cache predates (``AttributeError`` once ``generate`` decodes with a cache). Add it when the class has
+    none, as transformers' own caches answer it: the tokens already cached. Idempotent.
     """
     Cache = getattr(kmod, "KimiDynamicCache", None)  # noqa: N806 (a class, keeping its own name)
     if Cache is None or getattr(Cache, "_kimi_k3_gms_patched", False):
@@ -445,10 +449,16 @@ def _patch_kimi_cache_get_mask_sizes(kmod) -> None:
         past_seen_tokens = self.get_seq_length(layer_idx)
         return ql + past_seen_tokens, 0
 
+    def _get_query_offset(self, layer_idx=0):
+        return self.get_seq_length(layer_idx)
+
     Cache.get_mask_sizes = _get_mask_sizes
+    added = "" if hasattr(Cache, "get_query_offset") else " and added get_query_offset (tf>=5.15)"
+    if added:
+        Cache.get_query_offset = _get_query_offset
     Cache._kimi_k3_gms_patched = True
     print(
-        "[kimi_k3] patched KimiDynamicCache.get_mask_sizes (accept int query_length; tf>=5.13)",
+        f"[kimi_k3] patched KimiDynamicCache.get_mask_sizes (accept int query_length; tf>=5.13){added}",
         flush=True,
     )
 

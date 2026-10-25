@@ -455,16 +455,24 @@ def test_create_causal_mask_shim_lets_a_rejected_mask_input_raise():
         )
 
 
-def test_kimi_cache_mask_sizes_accept_a_query_length_or_a_cache_position():
+def test_kimi_cache_mask_sizes_and_query_offset_count_the_cached_tokens():
     """transformers >= 5.13 passes the query length as an int; the remote cache expects a
-    ``cache_position`` tensor. Either way kv_length is the query length plus the cached tokens."""
+    ``cache_position`` tensor. Either way kv_length is the query length plus the cached tokens.
+    transformers >= 5.15 also asks for the query offset, which the remote cache lacks: the cached
+    tokens, as transformers' own caches answer. A cache with its own offset keeps it."""
     remote = _remote_module()
     kimi_k3._patch_kimi_cache_get_mask_sizes(remote)
     cache = remote.KimiDynamicCache(seen_tokens=5)
 
     assert cache.get_mask_sizes(3, 2) == (8, 0)
     assert cache.get_mask_sizes(torch.arange(4), 1) == (9, 0)
-    assert remote.calls == [("get_seq_length", 2), ("get_seq_length", 1)]
+    assert cache.get_query_offset(2) == 5
+    assert remote.calls == [("get_seq_length", 2), ("get_seq_length", 1), ("get_seq_length", 2)]
+
+    remote = _remote_module()
+    remote.KimiDynamicCache.get_query_offset = own = lambda self, layer_idx=0: 7
+    kimi_k3._patch_kimi_cache_get_mask_sizes(remote)
+    assert remote.KimiDynamicCache.get_query_offset is own
 
 
 def test_tie_weights_shim_leaves_an_inherited_tie_weights_alone(monkeypatch):
