@@ -1564,9 +1564,10 @@ def load_and_prepare_ep(
 
     EP CANNOT be applied to a meta-init model (transformers' ``GroupedGemmParallel.shard_tensor``
     slices materialized tensors), so this loads real weights via ``from_pretrained`` over the ``ep``
-    submesh. Requires the transformers MoE EP framework (ExpertsInterface / grouped-GEMM EP styles /
-    enable_expert_parallel), first present in transformers >= 5.6. (Per-model plugins enforce a higher
-    floor where their stock support landed later, e.g. qwen3_moe's stock base_model_ep_plan in >= 5.7.)
+    submesh. Requires transformers >= 5.7: the MoE EP framework (ExpertsInterface / grouped-GEMM EP
+    styles / enable_expert_parallel) is in 5.6, but 5.6 builds a model only with the experts
+    implementations it ships, never ``torch_a2a``. (A model whose expert-parallel support landed
+    later states the release it needs in its spec.)
 
     Assumes the caller has already initialized (and device-bound) the process group -- distributed
     bring-up is the launcher's job, not this loader's (hf_ptq.main() does it via ``distributed_run``).
@@ -1601,10 +1602,11 @@ def load_and_prepare_ep(
         )
     if plan.world_size != size():
         raise ValueError(f"{plan!r} is for {plan.world_size} ranks, but this run has {size()}.")
-    # Hard floor: the transformers MoE expert-parallel framework. Below 5.6 there is no ExpertsInterface
-    # / grouped-GEMM EP styles, and enable_expert_parallel silently shards nothing (no error) -> fail loud.
+    # Hard floor: below 5.6 there is no ExpertsInterface / grouped-GEMM EP styles, and
+    # enable_expert_parallel silently shards nothing (no error); 5.6 checks a model's experts
+    # implementation against the ones it ships, so from_pretrained would refuse torch_a2a.
     require_transformers(
-        "5.6", "ModelOpt DP=EP expert-parallel PTQ (transformers MoE EP framework)"
+        "5.7", "ModelOpt DP=EP expert-parallel PTQ (transformers MoE EP framework)"
     )
     from torch.distributed.device_mesh import init_device_mesh
     from transformers import AutoConfig

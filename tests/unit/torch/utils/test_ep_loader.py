@@ -152,6 +152,17 @@ def test_the_loader_refuses_a_plan_for_another_world(gloo_world_of_one):
         load_and_prepare_ep("unused", DistributionPlan(2, ep_size=2))
 
 
+def test_the_loader_refuses_a_transformers_that_builds_no_model_with_torch_a2a(monkeypatch):
+    """transformers 5.6 checks a model's experts implementation against the ones it ships, so its
+    from_pretrained would refuse torch_a2a once the load had set everything up: refused first."""
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "size", lambda group=None: 2)
+    monkeypatch.setattr("transformers.__version__", "5.6.2")
+
+    with pytest.raises(RuntimeError, match=r"requires transformers >= 5\.7"):
+        load_and_prepare_ep("unused", DistributionPlan(2, ep_size=2), hf_config=SimpleNamespace())
+
+
 def test_a_hub_id_is_made_local_before_the_weights_load(monkeypatch):
     """The export reads the tensors the load could not place back from the checkpoint it records,
     which must be a local directory: a Hub ID there leaves the export nothing to read. The load
