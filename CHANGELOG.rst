@@ -18,6 +18,7 @@ Changelog
 *Speculative Decoding*
 
 - Add the **external draft** speculative-decoding mode: train a pretrained standalone draft model against a cached base model, instead of grafting a draft head onto the target. Select it with ``mtsp.convert(draft, [("external", cfg)])`` or the ``speculative_external`` recipe; the draft keeps its own embeddings and lm_head and exports as an ordinary HF checkpoint.
+- Add ``dflash_fused_loss`` to the DFlash config. DFlash, DFlash2 and LiLiCorr training then computes its loss in row chunks fused with the frozen ``lm_head`` projection instead of materializing the draft's full-vocabulary logits, which saves time and memory on large vocabularies.
 
 *Megatron Framework (M-LM / M-Bridge)*
 
