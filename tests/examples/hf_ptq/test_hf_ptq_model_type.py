@@ -63,16 +63,6 @@ def test_pre_quantize_generation_skip(hf_ptq, model_type: str, skips_generation:
     assert len(generate_calls) == (0 if skips_generation else 1)
 
 
-def test_pre_quantize_skips_the_preview_of_a_model_without_generate(hf_ptq):
-    """A remote-code class that does not inherit GenerationMixin (Kimi-K3's) has no generate."""
-    args = SimpleNamespace(specdec_offline_dataset=None, skip_generate=False)
-    batch = {"input_ids": torch.ones(2, 4, dtype=torch.long)}
-
-    _, _, generated = hf_ptq.pre_quantize(args, torch.nn.Module(), "kimi_k3", None, [batch], False)
-
-    assert generated is None
-
-
 @pytest.mark.parametrize(
     ("ids", "mask"), [([0, 0, 1, 2], [0, 0, 1, 1]), ([1, 2, 0, 0], [1, 1, 0, 0])]
 )

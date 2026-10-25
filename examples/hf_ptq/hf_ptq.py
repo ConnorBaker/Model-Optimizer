@@ -942,9 +942,6 @@ def pre_quantize(
             allow_fallback=False,
             trust_remote_code=args.trust_remote_code,
         )
-    elif not hasattr(full_model, "generate"):
-        # A remote-code class that does not inherit GenerationMixin has none (Kimi-K3's).
-        generated_ids_before_ptq = None
     else:
         with keep_the_experts_implementation(full_model):
             generated_ids_before_ptq = full_model.generate(
