@@ -1572,7 +1572,7 @@ def load_and_prepare_ep(
     Assumes the caller has already initialized (and device-bound) the process group -- distributed
     bring-up is the launcher's job, not this loader's (hf_ptq.main() does it via ``distributed_run``).
     The expert-parallel mesh stays recoverable from the model
-    (:func:`~modelopt.torch.utils.moe.expert_parallel_mesh`).
+    (:func:`~modelopt.torch.utils.moe.expert_parallel_mesh`), once the caller has recorded the plan.
     """
     from modelopt.torch.utils.distributed import (
         ParallelState,
