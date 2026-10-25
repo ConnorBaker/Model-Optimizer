@@ -346,7 +346,7 @@ def _patch_kda_beta_sigmoid(kmod) -> None:
         if getattr(orig, "_kimi_k3_beta_wrapped", False):
             continue
 
-        def _make(orig_fn):
+        def _make(orig_fn, name):
             # Where beta sits when passed by position. The flag only ever arrives by name: fla-core
             # takes it through **kwargs -- which is exactly why it ignores it -- so it is read off the
             # call's keywords, never off the kernel's signature.
@@ -358,22 +358,30 @@ def _patch_kda_beta_sigmoid(kmod) -> None:
 
             def _wrapped(*args, **kwargs):
                 if kwargs.get("use_beta_sigmoid_in_kernel"):
-                    beta = kwargs.get("beta")
-                    if isinstance(beta, torch.Tensor):
-                        kwargs["beta"] = torch.sigmoid(beta.float()).to(beta.dtype)
-                        kwargs["use_beta_sigmoid_in_kernel"] = False
-                    elif beta_pos is not None and beta_pos < len(args):
-                        beta = args[beta_pos]
-                        if isinstance(beta, torch.Tensor):
-                            squashed = torch.sigmoid(beta.float()).to(beta.dtype)
-                            args = (*args[:beta_pos], squashed, *args[beta_pos + 1 :])
-                            kwargs["use_beta_sigmoid_in_kernel"] = False
+                    pos = None if "beta" in kwargs else beta_pos
+                    if pos is not None and pos >= len(args):
+                        pos = None
+                    beta = args[pos] if pos is not None else kwargs.get("beta")
+                    if not isinstance(beta, torch.Tensor):
+                        # Passed on, the flag fla-core ignores leaves the raw gate in.
+                        raise RuntimeError(
+                            f"kimi_k3: {name} was asked to apply sigmoid(beta) in the kernel, which "
+                            "fla-core ignores, but this adapter cannot find the beta gate to apply it "
+                            f"itself (signature: {params or 'unavailable'}); on the raw gate the KDA "
+                            "recurrence diverges to inf on trained weights."
+                        )
+                    squashed = torch.sigmoid(beta.float()).to(beta.dtype)
+                    if pos is None:
+                        kwargs["beta"] = squashed
+                    else:
+                        args = (*args[:pos], squashed, *args[pos + 1 :])
+                    kwargs["use_beta_sigmoid_in_kernel"] = False
                 return orig_fn(*args, **kwargs)
 
             setattr(_wrapped, "_kimi_k3_beta_wrapped", True)
             return _wrapped
 
-        setattr(kmod, fname, _make(orig))
+        setattr(kmod, fname, _make(orig, fname))
     kmod._kimi_k3_beta_sigmoid_patched = True
     print(
         "[kimi_k3] patched chunk_kda/fused_recurrent_kda: apply sigmoid(beta) in torch "
@@ -453,10 +461,12 @@ def _patch_kimi_cache_get_mask_sizes(kmod) -> None:
         return self.get_seq_length(layer_idx)
 
     Cache.get_mask_sizes = _get_mask_sizes
-    added = "" if hasattr(Cache, "get_query_offset") else " and added get_query_offset (tf>=5.15)"
-    if added:
+    # The cache's own method is kept; ours replaces an inherited one, as the cache's own answer.
+    has_own = "get_query_offset" in vars(Cache)
+    if not has_own:
         Cache.get_query_offset = _get_query_offset
     Cache._kimi_k3_gms_patched = True
+    added = "" if has_own else " and added get_query_offset (tf>=5.15)"
     print(
         f"[kimi_k3] patched KimiDynamicCache.get_mask_sizes (accept int query_length; tf>=5.13){added}",
         flush=True,

@@ -392,6 +392,17 @@ def test_kda_beta_is_squashed_in_torch_only_when_the_kernel_flag_asks_for_it(by)
     assert [(seen is beta, flag) for _, seen, flag in remote.calls] == [(True, False)] * 2
 
 
+def test_a_kernel_call_whose_beta_the_patch_cannot_find_is_refused():
+    """A kernel whose signature hides beta (behind a decorator's ``*args``), asked for the sigmoid
+    fla-core ignores, would run on the raw gate: the call is refused instead."""
+    remote = _remote_module()
+    remote.chunk_kda = lambda *args, **kwargs: pytest.fail("ran on the raw gate")
+    kimi_k3._patch_kda_beta_sigmoid(remote)
+
+    with pytest.raises(RuntimeError, match="cannot find the beta gate"):
+        remote.chunk_kda(1, 2, 3, 4, torch.zeros(2), use_beta_sigmoid_in_kernel=True)
+
+
 def test_kda_layers_whose_kernels_the_beta_patch_cannot_find_are_refused():
     """Left unwrapped, the raw gate would show up only as a NaN amax after a whole calibration, so
     KDA layers without the kernels to wrap stop the load; a model without KDA layers loads."""
