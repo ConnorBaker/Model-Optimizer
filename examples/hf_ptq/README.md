@@ -175,6 +175,8 @@ scripts/huggingface_example.sh --model $HF_PATH --quant <QFORMAT> --tp [1|2|4|8]
 
 > *FP8 calibration over a large model with limited GPU memory is not recommended but possible with the [accelerate](https://huggingface.co/docs/accelerate/en/usage_guides/big_modeling) package. Please tune the device_map setting in [`example_utils.py`](./example_utils.py) if needed for model loading and the calibration process can be slow.*
 
+> *Models with linear-attention layers (Qwen3-Next, Qwen3.5, Qwen3.8, GLM-5.x Flash, Kimi Linear, OLMo Hybrid) run those layers through Transformers' slow PyTorch reference kernels unless the [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) kernels are installed. Install them without changing your torch and Transformers versions with `pip install --no-deps flash-linear-attention fla-core einops`; the kernels live in `fla-core`, so both packages are needed. On GLM-5.3-Flash over 4x GB300 they more than halved layerwise GPTQ calibration, mostly because the fused kernels need far less memory per sample, so a larger calibration batch fits.*
+
 > *Huggingface models trained with `modelopt.torch.speculative` can be used as regular Huggingface models in PTQ. Note: there is a known issue with Huggingface models loaded across multiple GPUs for inference (i.e., "Expected all tensors to be on the same device, but found at least two devices..."). When encountered this error in PTQ of speculative decoding models, try reducing the number of GPUs used.*
 
 > *Calibration by default uses left padding_side for the Huggingface tokenizer as it usually leads to lower accuracy loss. The exported tokenizer files restores the default padding_side.*
