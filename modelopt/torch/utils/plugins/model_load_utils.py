@@ -1738,6 +1738,8 @@ def load_and_prepare_ep(
     # expert PARAMS grouped_gemm, and name the container through their parents.
     swapped_plan.update(dict.fromkeys(_routed_expert_keys(ep_plan), "torch_a2a_experts"))
     from_pretrained_kwargs["experts_implementation"] = "torch_a2a"
+    # The checkpoint's own plan, for the config the model keeps (below); None: a class default.
+    declared_plan = vars(ep_cfg).get("base_model_ep_plan")
     ep_cfg.base_model_ep_plan = swapped_plan
     from_pretrained_kwargs["config"] = hf_config
     if is_master():
@@ -1753,6 +1755,17 @@ def load_and_prepare_ep(
     with _experts_sharded_over(ep_submesh):
         model = loader.from_pretrained(ckpt_path, **from_pretrained_kwargs)
     model.eval()
+    # The swapped styles drove the sharding, and the model keeps the plan it was sharded by
+    # (``model.tp_plan``, copied when it was built). The config it keeps goes back to the
+    # checkpoint's plan: an export writes the config out, and nothing without ModelOpt knows the
+    # torch_a2a styles.
+    kept_config = getattr(model, "config", None)
+    if kept_config is not None:
+        kept_ep_config = _ep_config(kept_config)
+        if declared_plan is None:
+            vars(kept_ep_config).pop("base_model_ep_plan", None)
+        else:
+            kept_ep_config.base_model_ep_plan = declared_plan
     # Force the experts forward to dispatch to `torch_a2a`: from_pretrained's `experts_implementation`
     # kwarg resolves non-fp8 impls back to "grouped_mm", but @use_experts_implementation reads
     # `config._experts_implementation` at FORWARD time, so set it on every (sub)config now. (Without

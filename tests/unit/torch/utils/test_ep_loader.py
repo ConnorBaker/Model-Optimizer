@@ -22,6 +22,7 @@ over, and ``_ckpt_quant_method`` reads the checkpoint's native quantization. Eve
 CPU process.
 """
 
+import copy
 import dataclasses
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -334,6 +335,38 @@ def test_an_expert_count_the_config_does_not_name_is_read_off_the_loaded_experts
 
     with outcome:
         load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
+
+
+def test_the_model_keeps_the_plan_its_checkpoint_declares(ep_world_of_two, monkeypatch):
+    """The load shards by the torch_a2a styles, but the config the model keeps goes back to the
+    checkpoint's plan: an export writes it out, and nothing without ModelOpt knows those styles."""
+
+    class _PastError(Exception):
+        """Raised by the load's next check."""
+
+    model = _model_with_decoder_at("model.")
+
+    class _Loader:
+        @staticmethod
+        def from_pretrained(path, config, **kwargs):
+            model.config = copy.deepcopy(config)  # transformers keeps a copy of the config
+            return model
+
+    def next_check(experts):
+        raise _PastError
+
+    monkeypatch.setattr(
+        "torch.distributed.device_mesh.init_device_mesh", lambda *args, **kwargs: _Mesh()
+    )
+    monkeypatch.setattr(model_load_utils, "_auto_class", lambda *args, **kwargs: _Loader)
+    monkeypatch.setattr(model_load_utils, "record_unplaced_source_keys", lambda *args: None)
+    monkeypatch.setattr(model_load_utils, "_refuse_unquantizable_experts", next_check)
+    config = SimpleNamespace(base_model_ep_plan=dict(_EP_PLAN), num_experts=4)
+
+    with pytest.raises(_PastError):
+        load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
+
+    assert model.config.base_model_ep_plan == _EP_PLAN
 
 
 def test_the_weights_load_in_the_checkpoints_dtype_through_its_class(ep_world_of_two, monkeypatch):
