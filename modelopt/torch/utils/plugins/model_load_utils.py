@@ -208,17 +208,18 @@ def build_meta_causal_lm(
     dtype = getattr(hf_config, "dtype", None) or torch.bfloat16
     from accelerate import init_empty_weights  # only real callers of this function need it
 
-    registered = getattr(getattr(auto_class, "_model_mapping", None), "_extra_content", None)
-    kept = dict(registered) if registered is not None else {}
+    # Where transformers records the class a remote-code build registers. Read without a fallback:
+    # if a release moves it, this fails here rather than leave one rank's model without generate.
+    registered = auto_class._model_mapping._extra_content
+    kept = dict(registered)
     try:
         with init_empty_weights(include_buffers=False):
             model = auto_class.from_config(
                 hf_config, dtype=dtype, trust_remote_code=trust_remote_code
             )
     finally:
-        if registered is not None:
-            registered.clear()
-            registered.update(kept)
+        registered.clear()
+        registered.update(kept)
     model.eval()
     return model
 
