@@ -6,6 +6,10 @@ when the anti-repetition instruction is removed at evaluation time.
 
 This experiment uses **334 training examples and 42 QAD iterations** on Qwen3.6-35B-A3B.
 
+**Original QAD** means the NVFP4 QAD Qwen3.6-35B-A3B checkpoint after 500 QAD iterations,
+before recovery training. **Recovery QAD** means the checkpoint after the additional 42 iterations
+on the prompt-7-generated dataset.
+
 The YAML files **record the settings used in the completed experiment**. They are not yet consumed
 by scripts in this directory and cannot be passed directly to SciCode, Megatron Bridge, or ModelOpt
 Launcher.
@@ -45,8 +49,8 @@ Recomputed from saved per-response metrics, checking the complete unique `(subta
 
 | Model | Cap hits | No final | Both | Correct |
 | --- | ---: | ---: | ---: | ---: |
-| Original QAD | 41/440 | 42/440 | 40/440 | 57/440 |
-| Prompt-7-data QAD | 17/440 | 15/440 | 15/440 | 57/440 |
+| Original QAD | 41/440 (9.32%) | 42/440 | 40/440 | 57/440 |
+| Prompt-7-data QAD | 17/440 (3.86%) | 15/440 | 15/440 | 57/440 |
 
 Cap-hit rate decreased from **9.32% to 3.86%**. Mean completion tokens decreased from 23,677 to 18,767.
 
@@ -54,8 +58,8 @@ Cap-hit rate decreased from **9.32% to 3.86%**. Mean completion tokens decreased
 
 | Model | Cap hits | No final | Both | Correct |
 | --- | ---: | ---: | ---: | ---: |
-| Original QAD | 12/110 | 12/110 | 12/110 | 6/110 |
-| Prompt-7-data QAD | 7/110 | 7/110 | 7/110 | 7/110 |
+| Original QAD | 12/110 (10.91%) | 12/110 | 12/110 | 6/110 |
+| Prompt-7-data QAD | 7/110 (6.36%) | 7/110 | 7/110 | 7/110 |
 
 Cap-hit rate decreased from **10.91% to 6.36%**. Mean completion tokens decreased from 23,742 to 19,231.
 
