@@ -1574,7 +1574,13 @@ def load_and_prepare_ep(
     The expert-parallel mesh stays recoverable from the model
     (:func:`~modelopt.torch.utils.moe.expert_parallel_mesh`).
     """
-    from modelopt.torch.utils.distributed import ParallelState, is_initialized, is_master, size
+    from modelopt.torch.utils.distributed import (
+        ParallelState,
+        all_reduce,
+        is_initialized,
+        is_master,
+        size,
+    )
     from modelopt.torch.utils.moe import (
         _EXPERTS_STYLES,
         _ep_config,
@@ -1827,6 +1833,39 @@ def load_and_prepare_ep(
                 "transport shares out equally over the expert-parallel ranks; the config names no "
                 f"count, and the loaded experts' weights show {sorted(counts) or 'none'}."
             )
+    # Each rank must hold its share of every container's experts, the share the all-to-all transport
+    # routes tokens by. transformers 5.18 builds a mesh of its own for the load and
+    # _experts_sharded_over hands it the expert-parallel one; were that to stop working, the experts
+    # would be sharded over another mesh without an error, and calibration would merge the scales of
+    # different experts. The DTensors transformers shards them into (5.16 on) show both counts; every
+    # rank refuses alike, whichever ranks hold a wrong share.
+    sharded = [
+        param
+        for module in expert_modules.values()
+        for param in module.parameters(recurse=False)
+        if isinstance(param, DTensor)
+    ]
+
+    def _check_share() -> None:
+        wrong = sorted(
+            {
+                (param.shape[0], param.to_local().shape[0])
+                for param in sharded
+                if param.to_local().shape[0] * ep_degree != param.shape[0]
+            }
+        )
+        if wrong:
+            whole, held = wrong[0]
+            raise RuntimeError(
+                f"{plan!r}: this rank holds {held} of a routed-expert container's {whole} experts, "
+                f"not {whole // ep_degree}: transformers sharded them over a mesh other than this "
+                "rank's expert-parallel group, so the all-to-all transport would send tokens to "
+                "ranks without their experts, and calibration would merge the scales of different "
+                "experts."
+            )
+
+    if sharded:
+        all_reduce("each rank's share of the routed experts", _check_share, lambda _: None)
     _refuse_unquantizable_experts(expert_modules.values())
 
     # Each module's ParallelState for calibration's amax sync: dense modules reduce over the whole world;
