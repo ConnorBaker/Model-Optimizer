@@ -46,6 +46,7 @@ changing them does not invalidate the cache.
 | `apply_chat_template` | no | `true` | If true, expects OpenAI messages format |
 | `train_only_assistant_tokens` | no | `auto` | Label policy for chat datasets: `auto`, `true`, or `false`. See below |
 | `chat_key` | no | `"messages"` | Key containing conversations |
+| `chat_pretemplated` | no | `false` | Set if each message's `content` already contains rendered chat markup (e.g. literal `<\|im_start\|>{role}\n...<\|im_end\|>\n`). Skips `apply_chat_template` (which would double-wrap the markers) and concatenates `content` directly, still deriving assistant-only labels via a ChatML token scan. Takes precedence over `apply_chat_template`. Only tested with ChatML markup. |
 | `category` | no | `""` | Label for logging |
 
 ## Chat Label Masking

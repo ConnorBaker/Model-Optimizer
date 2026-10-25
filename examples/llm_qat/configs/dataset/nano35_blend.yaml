@@ -1,0 +1,39 @@
+# Nano 3.5 QAD datablend for Qwen3.5-9B.
+#
+# Mirrors the 60/40 mix defined by mxin's Megatron blend manifest
+# (Ultra-SFTb2-512K.part2-stage1_stage2_mixed_512k-6_4.local.json, readable on aws-cmh only):
+#   0.6 -> Ultra-SFTb2-512K.part2.jsonl.with_hermes.jsonl      (~500 GB)
+#   0.4 -> blend_82_10_8.512k.filtered.jsonl                   (~250 GB)
+#
+# On gcp-nrt these files are only readable via kkrommydas (group llmservice) -- see
+# reference_gcp_nrt_cluster memory. Records are {"messages": [...]} with each message's
+# `content` already containing rendered ChatML markup, so `chat_pretemplated: true` is
+# required on both sources (see configs/dataset/README.md) to avoid double-templating.
+#
+# blend_size sized for the first full QAD run's budget: train_samples=1600 / eval_samples=50
+# (see slurm_qwen35_qad/qad_full.sh) with headroom in each split. train_samples/eval_samples
+# in the training config subset this pool without invalidating the tokenization cache, so
+# blend_size can be raised later (new run = new cache key) without re-deriving the mix.
+
+blend_size: 4000
+splits:
+  train: 0.90
+  eval: 0.05
+  test: 0.05
+
+sources:
+  - hf_path: json
+    split: train
+    ratio: 0.6
+    chat_pretemplated: true
+    category: ultra_sftb2_hermes
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/projects/coreai_numerics_nemotron/users/kkrommydas/nano35_fp4kv/qad_data/Ultra-SFTb2-512K-hermes20k/Ultra-SFTb2-512K.part2.jsonl.with_hermes.jsonl
+
+  - hf_path: json
+    split: train
+    ratio: 0.4
+    chat_pretemplated: true
+    category: ultra_v3_blend_82_10_8
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/projects/coreai_numerics_nemotron/users/kkrommydas/nano35_fp4kv/qad_data/ultra_v3_outputs_blend_82_10_8.512k.filtered.jsonl/blend_82_10_8.512k.filtered.jsonl

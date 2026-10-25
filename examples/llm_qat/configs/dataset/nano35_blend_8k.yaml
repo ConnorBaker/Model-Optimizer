@@ -1,0 +1,35 @@
+# Nano 3.5 QAD datablend for Qwen3.5-9B -- LARGER BUDGET variant of nano35_blend.yaml, to test
+# whether the first QAD run's limited recovery (see project_qwen35_9b_qad memory) was bottlenecked
+# by training budget. Same 60/40 mix / chat_pretemplated sources as nano35_blend.yaml, just a
+# bigger blend_size so a larger train_samples cap (8000, ~5x the original 1600) is available.
+#
+# blend_size=14000 chosen for margin: the original blend_size=4000 yielded 2757 filtered train
+# samples (69% yield after dropping no-valid-label samples), so 14000*0.9*0.69 =~ 8700 expected
+# filtered train samples, comfortably above the 8000 cap. New blend_size = new cache key, so this
+# does not collide with or invalidate the original nano35_blend.yaml's cache.
+#
+# See nano35_blend.yaml for full source/manifest provenance notes (mix ratio derivation, gcp-nrt
+# read-access path).
+
+blend_size: 14000
+splits:
+  train: 0.90
+  eval: 0.05
+  test: 0.05
+
+sources:
+  - hf_path: json
+    split: train
+    ratio: 0.6
+    chat_pretemplated: true
+    category: ultra_sftb2_hermes
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/projects/coreai_numerics_nemotron/users/kkrommydas/nano35_fp4kv/qad_data/Ultra-SFTb2-512K-hermes20k/Ultra-SFTb2-512K.part2.jsonl.with_hermes.jsonl
+
+  - hf_path: json
+    split: train
+    ratio: 0.4
+    chat_pretemplated: true
+    category: ultra_v3_blend_82_10_8
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/projects/coreai_numerics_nemotron/users/kkrommydas/nano35_fp4kv/qad_data/ultra_v3_outputs_blend_82_10_8.512k.filtered.jsonl/blend_82_10_8.512k.filtered.jsonl

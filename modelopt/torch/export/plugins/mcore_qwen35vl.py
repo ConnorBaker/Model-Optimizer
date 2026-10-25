@@ -56,6 +56,15 @@ _qwen3_5_extra_export: dict = {
     "shared_experts.linear_fc1": GatedMLPSlicing("model.layers.{}.mlp.shared_expert."),
     "shared_experts.linear_fc2": NameRemapping("model.layers.{}.mlp.shared_expert.down_proj."),
     "shared_experts.gate_weight": NameRemapping("model.layers.{}.mlp.shared_expert_gate.weight"),
+    # MTP predictor head. The inner TransformerLayer is walked by the base rules (is_mtp=True);
+    # these four are the wrapper's own parameters. Qwen3.5 stores them unindexed at the top level
+    # under different names than the Nemotron-H layout the exporter's ``mtp.*`` rules were written
+    # for, so without these entries ``_get_mtp_state_dict`` skips all four (its guards are
+    # ``if "mtp.enorm" in self.rules``) and the exported checkpoint silently loses the MTP head.
+    "mtp.eh_proj": NameRemapping("mtp.fc."),
+    "mtp.enorm": NameRemapping("mtp.pre_fc_norm_embedding."),
+    "mtp.hnorm": NameRemapping("mtp.pre_fc_norm_hidden."),
+    "mtp.final_layernorm": NameRemapping("mtp.norm."),
 }
 
 qwen3_5_vl_causal_lm_export = with_language_model_prefix(

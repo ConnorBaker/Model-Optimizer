@@ -1,0 +1,44 @@
+# Nano 3.5 datablend for the Qwen3.5-9B NVFP4 scale-only (LSQ) QAD run on OCI-JHB.
+#
+# Byte-for-byte the same sample draw as nano35_blend_8k.yaml (the blend the gcp-nrt
+# qad_5x_budget run used): same 60/40 mix, same blend_size 14000, same splits, same
+# chat_pretemplated flags. ONLY data_files change, pointing at the JHB prefix subsets
+# instead of the full 541 GB / 225 GB gcp-nrt source files (gcp-nrt is decommissioned
+# for compute and its Lustre is mounted read-only).
+#
+# Why the prefixes are sufficient at blend_size=14000: build_blend_dataset streams each
+# source with IterableDataset.shuffle(seed=42, buffer_size=10000) and then takes n samples
+# via skip/take, consuming exactly the first (10000 + n) records in file order.
+#   src1  0.6 * 14000 =  8400 emitted -> 18400 records consumed (prefix24000 holds 24000)
+#   src2  0.4 * 14000 =  5600 emitted -> 15600 records consumed (prefix20000 holds 20000)
+# Both prefixes cover the draw with margin, so the sample set is identical to the gcp-nrt
+# run's. See nano35_blend_jhb_64k.yaml for the prefix-file provenance and the per-record
+# 327680-char truncation budget (~87600 tokens at the measured 3.74 chars/token, well above
+# the 32768 used here).
+#
+# NOTE on comparability: the sample SET matches gcp-nrt, but _merge_distributed_shards
+# concatenates rank-major, so the train/eval SPLIT is world-size dependent. Only a
+# world_size-8 run reproduces the gcp-nrt split exactly.
+
+blend_size: 14000
+splits:
+  train: 0.90
+  eval: 0.05
+  test: 0.05
+
+sources:
+  - hf_path: json
+    split: train
+    ratio: 0.6
+    chat_pretemplated: true
+    category: ultra_sftb2_hermes
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/users/rohjoshi/qwen35_bf16/data/ultra_sftb2_hermes.prefix24000.jsonl
+
+  - hf_path: json
+    split: train
+    ratio: 0.4
+    chat_pretemplated: true
+    category: ultra_v3_blend_82_10_8
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/users/rohjoshi/qwen35_bf16/data/ultra_v3_blend_82_10_8.prefix20000.jsonl

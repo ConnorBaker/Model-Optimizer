@@ -1,0 +1,15 @@
+# Tiny blend for smoke-testing quantize.py / train.py plumbing only.
+# Single small source so a --calib_size 8 (or --train_samples 16) run doesn't pay the
+# download/stream cost of the full default blend.yaml (20000 samples across 7 sources).
+
+blend_size: 64
+splits:
+  train: 0.90
+  eval: 0.05
+  test: 0.05
+
+sources:
+  - hf_path: nvidia/Nemotron-SWE-v1
+    split: r2e_gym
+    ratio: 1
+    category: code

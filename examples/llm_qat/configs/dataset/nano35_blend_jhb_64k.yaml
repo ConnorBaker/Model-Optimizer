@@ -1,0 +1,43 @@
+# Nano 3.5 datablend for the Qwen3.5-9B BF16 run at seq 65536 / 400 steps on OCI-JHB.
+#
+# Same sources, ratios and chat_pretemplated flags as nano35_blend_jhb.yaml; ONLY blend_size
+# changes. 400 steps x GBS 32 needs 12800 train samples, and the measured yield is
+# 2757/4000 = 0.689 train samples per blend record, so blend_size 21000 -> ~14470 train
+# samples, leaving margin above the 12800 cap.
+#
+# That raises how many source records the loader consumes (10000 shuffle buffer + emitted):
+#   src1  0.6*21000 = 12600 emitted -> 22600 records   (prefix24000 file holds 24000)
+#   src2  0.4*21000 =  8400 emitted -> 18400 records   (prefix20000 file holds 20000)
+#
+# The prefix24000/prefix20000 files are NEW files (original prefix14000/prefix13000 concatenated
+# with a freshly extracted increment), so the seq-32768 run's inputs remain byte-identical and
+# untouched. 6 of the 7000 src2 increment records ran out of messages before reaching the char
+# budget and may tokenize below 65536; 0.086%, they simply pad.
+#
+# Per-record truncation budget is UNCHANGED at 327680 chars. Measured chars/token on this data
+# is 3.74, so that is ~87600 tokens per record -- above the 65536 needed here -- and keeping the
+# budget identical means the appended records are homogeneous with the 14000/13000 already
+# shipped. Verify post-hoc from the tokenized cache that attention_mask sums reach 65536.
+
+blend_size: 21000
+splits:
+  train: 0.90
+  eval: 0.05
+  test: 0.05
+
+sources:
+  - hf_path: json
+    split: train
+    ratio: 0.6
+    chat_pretemplated: true
+    category: ultra_sftb2_hermes
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/users/rohjoshi/qwen35_bf16/data/ultra_sftb2_hermes.prefix24000.jsonl
+
+  - hf_path: json
+    split: train
+    ratio: 0.4
+    chat_pretemplated: true
+    category: ultra_v3_blend_82_10_8
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/users/rohjoshi/qwen35_bf16/data/ultra_v3_blend_82_10_8.prefix20000.jsonl

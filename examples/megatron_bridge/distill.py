@@ -27,6 +27,7 @@ import os
 import torch
 from export_distilled_megatron_to_hf import export_llm_to_hf, save_vlm_to_hf
 from megatron.bridge import AutoBridge
+from megatron.bridge.data.sft_processing import ChatSFTPreprocessingConfig
 from megatron.bridge.models.distillation_provider import convert_to_distillation_provider
 from megatron.bridge.recipes.utils.optimizer_utils import (
     distributed_fused_adam_with_cosine_annealing,
@@ -122,6 +123,17 @@ def get_args():
     parser.add_argument("--tp_size", type=int, default=1, help="Tensor parallel size")
     parser.add_argument("--pp_size", type=int, default=1, help="Pipeline parallel size")
     parser.add_argument("--cp_size", type=int, default=1, help="Context parallel size")
+    parser.add_argument(
+        "--cp_comm_type",
+        type=str,
+        default=None,
+        choices=["p2p", "all_gather", "a2a", "a2a+p2p"],
+        help="Context-parallel communication strategy. Decides which attention kernel TE can "
+        "use: with the default 'p2p' ring exchange, cuDNN fused attention has a head_dim=256 "
+        "FORWARD kernel on sm103 but no BACKWARD one, so training reports 'No dot product "
+        "attention backend is available' while eval works. 'all_gather' collects the full KV "
+        "before attention, which asks for a different kernel.",
+    )
     parser.add_argument("--ep_size", type=int, default=1, help="Expert parallel size")
 
     # Dataset arguments
@@ -152,9 +164,28 @@ def get_args():
         "--sft_dataset_root",
         type=str,
         default=None,
-        help="Directory holding training.jsonl (and validation.jsonl when --eval_iters > 0) of "
-        '{"input": <prompt>, "output": <response>} records (used with --sft). See the README for '
-        "how the fields are tokenized and truncated.",
+        help="Directory holding training.jsonl (and validation.jsonl when --eval_iters > 0) "
+        "(used with --sft). Record schema depends on --sft_format. See the README for how the "
+        "fields are tokenized and truncated.",
+    )
+    parser.add_argument(
+        "--sft_format",
+        type=str,
+        default="prompt_completion",
+        choices=["prompt_completion", "chat"],
+        help='Record schema under --sft_dataset_root. "prompt_completion" reads '
+        '{"input": <prompt>, "output": <response>} and concatenates the two fields verbatim. '
+        '"chat" reads {"conversations"|"messages"|"conversation": [{"role", "content", '
+        '"reasoning_content"?}, ...]} and renders it with the tokenizer\'s chat template, so '
+        "multi-turn structure and reasoning traces survive.",
+    )
+    parser.add_argument(
+        "--sft_chat_loss_mode",
+        type=str,
+        default="assistant",
+        choices=["assistant", "last_turn", "full"],
+        help="Which tokens carry loss under --sft_format chat: every assistant turn, only the "
+        "final assistant turn, or the whole rendered conversation. Ignored otherwise.",
     )
     # Training & Eval arguments
     parser.add_argument(
@@ -319,7 +350,12 @@ def get_args():
         if absent:
             raise ValueError(f"--sft_dataset_root {args.sft_dataset_root} is missing: {absent}.")
         # Decided once here so it reaches print_args and costs a single tokenizer load.
-        args.sft_add_bos = _tokenizer_prepends_bos(args)
+        # Chat rendering emits its own special tokens, so the probe is prompt-completion only.
+        args.sft_add_bos = (
+            _tokenizer_prepends_bos(args) if args.sft_format == "prompt_completion" else False
+        )
+    if args.sft_chat_loss_mode != "assistant" and args.sft_format != "chat":
+        raise ValueError("--sft_chat_loss_mode only applies to --sft_format chat.")
 
     _check_shared_vocabulary(args)
 
@@ -384,6 +420,8 @@ def main(args: argparse.Namespace):
         # Override parallelism / training settings
         provider.tensor_model_parallel_size = args.tp_size
         provider.sequence_parallel = args.tp_size > 1
+        if args.cp_comm_type is not None:
+            provider.cp_comm_type = args.cp_comm_type
         provider.pipeline_model_parallel_size = args.pp_size
         provider.pipeline_dtype = torch.bfloat16
         provider.context_parallel_size = args.cp_size
@@ -503,19 +541,21 @@ def main(args: argparse.Namespace):
         "skip_getting_attention_mask_from_dataset": True,
     }
     if args.sft:
-        # SFT-masked distillation via Bridge's FinetuningDatasetConfig -> NeMo-style GPTSFTDataset,
-        # reading {"input", "output"} jsonl. Fields are tokenized as written except that each is
-        # ``.strip(" ")``-ed; see --sft_dataset_root help.
-        dataset_config = FinetuningDatasetConfig(
-            seq_length=args.seq_length,
-            dataset_root=args.sft_dataset_root,
-            seed=args.seed,
-            dataloader_type="batch",
-            # Honour --eval_iters 0 so a training-only dataset_root does not have to carry a
-            # dummy validation.jsonl just to satisfy the builder.
-            do_validation=args.eval_iters > 0,
-            do_test=False,
-            dataset_kwargs={
+        # SFT-masked distillation via Bridge's FinetuningDatasetConfig -> NeMo-style GPTSFTDataset.
+        # ``preprocessing`` and the semantic ``dataset_kwargs`` are mutually exclusive: Bridge
+        # rejects the pair outright (GPTSFTDatasetConfig.validate), and the legacy kwargs are the
+        # deprecated spelling of the same settings.
+        if args.sft_format == "chat":
+            # Rows carry structured conversations; GPTSFTChatDataset renders them through the
+            # tokenizer's own chat template, so reasoning_content and multi-turn structure are
+            # preserved and the loss mask follows the assistant spans.
+            sft_preprocessing = ChatSFTPreprocessingConfig(loss_mode=args.sft_chat_loss_mode)
+            sft_dataset_kwargs = None
+        else:
+            # {"input", "output"} jsonl. Fields are tokenized as written except that each is
+            # ``.strip(" ")``-ed; see --sft_dataset_root help.
+            sft_preprocessing = None
+            sft_dataset_kwargs = {
                 "prompt_template": "{input}{output}",
                 "label_key": "output",
                 "truncation_field": "input",
@@ -526,7 +566,18 @@ def main(args: argparse.Namespace):
                 # Prepended after truncation, so it survives a record that had to be cut.
                 "add_bos": args.sft_add_bos,
                 "add_eos": True,
-            },
+            }
+        dataset_config = FinetuningDatasetConfig(
+            seq_length=args.seq_length,
+            dataset_root=args.sft_dataset_root,
+            seed=args.seed,
+            dataloader_type="batch",
+            # Honour --eval_iters 0 so a training-only dataset_root does not have to carry a
+            # dummy validation.jsonl just to satisfy the builder.
+            do_validation=args.eval_iters > 0,
+            do_test=False,
+            preprocessing=sft_preprocessing,
+            dataset_kwargs=sft_dataset_kwargs,
         )
     elif args.use_mock_data:
         dataset_config = MockGPTDatasetConfig(**dataset_kwargs)

@@ -1,0 +1,27 @@
+# Tiny subset of the real Nano 3.5 QAD blend (same 60/40 sources, same chat_pretemplated
+# tokenize path as nano35_blend.yaml) for smoke-testing train.py end-to-end: real data shape,
+# real tokenize function, small enough to build fast. Local Lustre json files -- `take(n)`
+# under streaming=True reads only the first n lines, not the whole multi-hundred-GB file.
+
+blend_size: 64
+splits:
+  train: 0.90
+  eval: 0.05
+  test: 0.05
+
+sources:
+  - hf_path: json
+    split: train
+    ratio: 0.6
+    chat_pretemplated: true
+    category: ultra_sftb2_hermes
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/projects/coreai_numerics_nemotron/users/kkrommydas/nano35_fp4kv/qad_data/Ultra-SFTb2-512K-hermes20k/Ultra-SFTb2-512K.part2.jsonl.with_hermes.jsonl
+
+  - hf_path: json
+    split: train
+    ratio: 0.4
+    chat_pretemplated: true
+    category: ultra_v3_blend_82_10_8
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/projects/coreai_numerics_nemotron/users/kkrommydas/nano35_fp4kv/qad_data/ultra_v3_outputs_blend_82_10_8.512k.filtered.jsonl/blend_82_10_8.512k.filtered.jsonl

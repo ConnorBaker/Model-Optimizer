@@ -1,0 +1,46 @@
+# SMOKE variant of nano35_blend_jhb.yaml -- tiny blend_size only.
+#
+# Identical to nano35_blend.yaml (same 60/40 mix, same blend_size, same
+# chat_pretemplated flags) except that data_files point at the transferred
+# prefix subsets rather than the full 541 GB / 225 GB source files.
+#
+# Why a prefix is equivalent: build_blend_dataset streams each source with
+# IterableDataset.shuffle(seed=42, buffer_size=10000) and then takes n examples
+# across ranks via skip/take, so it consumes exactly the first (10000 + n)
+# records of the file in file order. At blend_size=4000 that is 10000+2400=12400
+# for source 1 and 10000+1600=11600 for source 2; the prefixes here hold 14000
+# and 13000, so the sample draw is unchanged.
+#
+# Each record was additionally truncated to its leading messages covering at
+# least 10 chars/token * 32768 tokens. The chat_pretemplated path concatenates
+# message contents and tokenizes with truncation to model_max_length, and BPE is
+# left-to-right, so dropping trailing messages past that budget cannot change
+# input_ids. Measured margin: ~601K / ~456K chars kept per record, i.e. ~14-18
+# chars per token actually needed.
+#
+# Source files live on OCI-HSG at
+#   .../coreai_numerics_nemotron/users/kkrommydas/nano35_fp4kv/qad_data/
+# (gcp-nrt, where the earlier QAD runs read them, is decommissioned.)
+
+blend_size: 40
+splits:
+  train: 0.90
+  eval: 0.05
+  test: 0.05
+
+sources:
+  - hf_path: json
+    split: train
+    ratio: 0.6
+    chat_pretemplated: true
+    category: ultra_sftb2_hermes
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/users/rohjoshi/qwen35_bf16/data/ultra_sftb2_hermes.prefix14000.jsonl
+
+  - hf_path: json
+    split: train
+    ratio: 0.4
+    chat_pretemplated: true
+    category: ultra_v3_blend_82_10_8
+    dataset_kwargs:
+      data_files: /lustre/fsw/portfolios/coreai/users/rohjoshi/qwen35_bf16/data/ultra_v3_blend_82_10_8.prefix13000.jsonl

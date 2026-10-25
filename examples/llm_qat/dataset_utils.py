@@ -75,6 +75,12 @@ class DatasetSourceConfig:
     train_only_assistant_tokens: bool | str = "auto"
     chat_key: str = "messages"
     category: str = ""
+    # Set when each message's `content` already contains fully rendered chat markup
+    # (e.g. literal <|im_start|>{role}\n...<|im_end|>\n per turn) rather than plain text.
+    # Skips apply_chat_template (which would re-wrap and double the markers) and instead
+    # concatenates message contents directly, still deriving assistant-only labels via the
+    # ChatML token scan. Takes precedence over apply_chat_template.
+    chat_pretemplated: bool = False
 
     def __post_init__(self):
         if not self.split:
@@ -362,6 +368,70 @@ def make_chat_tokenize_fn(
     return tokenize
 
 
+def make_pretemplated_chat_tokenize_fn(
+    tokenizer: PreTrainedTokenizerBase,
+    max_length: int,
+    chat_key: str = "messages",
+):
+    """Tokenize function for chat datasets whose ``content`` fields are already rendered.
+
+    Some sources store ``messages`` where each entry's ``content`` already includes that
+    turn's literal chat markup (e.g. ``<|im_start|>assistant\\n...<|im_end|>\\n``), typically
+    because the whole conversation was chat-templated upstream and then re-split back into
+    per-role entries. Calling ``apply_chat_template`` on such messages would wrap them a
+    second time and double the markers. This function instead concatenates the ``content``
+    strings directly and tokenizes the result.
+
+    Assistant-only labels are still derived, via the same ChatML token scan
+    (:func:`_chatml_assistant_mask`) used by the native chat path — it operates on the
+    tokenized ``input_ids`` and does not care whether the markers came from
+    ``apply_chat_template`` or were already present in the text.
+
+    Only tested against ChatML-style markup (``<|im_start|>``/``<|im_end|>``); other
+    pre-rendered formats would need a different mask function.
+    """
+
+    def tokenize(sample):
+        messages = sample.get(chat_key)
+        if not messages:
+            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+            return {
+                "input_ids": [pad_id] * max_length,
+                "attention_mask": [0] * max_length,
+                "labels": [IGNORE_TOKEN_ID] * max_length,
+            }
+
+        text = "".join(m.get("content", "") for m in messages)
+
+        try:
+            result = tokenizer(
+                text,
+                truncation=True,
+                max_length=max_length,
+                padding="max_length",
+            )
+        except (ValueError, TypeError, KeyError) as e:
+            warn_rank_0(f"Failed to tokenize sample: {e}. Skipping.")
+            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+            return {
+                "input_ids": [pad_id] * max_length,
+                "attention_mask": [0] * max_length,
+                "labels": [IGNORE_TOKEN_ID] * max_length,
+            }
+
+        input_ids = result["input_ids"]
+        label_mask = _chatml_assistant_mask(input_ids, tokenizer)
+        labels = [tid if mask else IGNORE_TOKEN_ID for tid, mask in zip(input_ids, label_mask)]
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": result["attention_mask"],
+            "labels": labels,
+        }
+
+    return tokenize
+
+
 def make_pretrain_tokenize_fn(
     tokenizer: PreTrainedTokenizerBase,
     max_length: int,
@@ -547,7 +617,8 @@ def _build_cache_path(
     for s in config.sources:
         sig += (
             f"|{s.hf_path}|{s.ratio}|{s.split}|{s.dataset_kwargs}"
-            f"|chat={s.apply_chat_template}|chat_key={s.chat_key}"
+            f"|chat={s.apply_chat_template}|pretemplated={s.chat_pretemplated}"
+            f"|chat_key={s.chat_key}"
             f"|train_only_assistant_tokens={s.train_only_assistant_tokens}"
         )
     cache_key = hashlib.sha1(sig.encode()).hexdigest()[:12]
@@ -654,7 +725,11 @@ def _tokenize_source_split(
     so no sharding is needed here. Uses ``parallel.effective_num_proc`` for
     multi-process tokenization.
     """
-    if source.apply_chat_template:
+    if source.chat_pretemplated:
+        tokenize_fn = make_pretemplated_chat_tokenize_fn(
+            tokenizer, max_length, chat_key=source.chat_key
+        )
+    elif source.apply_chat_template:
         tokenize_fn = make_chat_tokenize_fn(
             tokenizer,
             max_length,
