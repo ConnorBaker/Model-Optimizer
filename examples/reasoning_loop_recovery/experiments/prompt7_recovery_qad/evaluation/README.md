@@ -1,5 +1,8 @@
 # Evaluate without prompt 7
 
+Reuse the [dataset split](../data/subtask_split.yaml) to report results separately for the 44 training
+subtasks and 11 held-out subtasks.
+
 The [evaluation settings](evaluation.yaml) record the comparison protocol and metric definitions.
 
 Evaluation uses a **custom Python SciCode runner**, not `lm_eval` or NeMo Evaluator Launcher (NEL).

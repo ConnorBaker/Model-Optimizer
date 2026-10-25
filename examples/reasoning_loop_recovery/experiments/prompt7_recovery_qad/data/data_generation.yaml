@@ -1,0 +1,53 @@
+schema_version: 1
+config_kind: historical_experiment_record
+checkpoint:
+  role: original_qad
+  format: NVFP4
+  file: checkpoints/original_qad_nvfp4
+benchmark: SciCode (Subtask)
+split_file: ../evaluation/subtask_split.yaml
+max_completion_tokens: 131072
+max_model_len: 262144
+temperature: 0.6
+top_p: 0.95
+enable_thinking: true
+presence_penalty: 0.0
+tensor_parallel_size: 1
+concurrency_per_worker: 8
+reasoning_parser: qwen3
+prerequisites:
+  policy: Generate preceding steps with the same checkpoint, seed, and prompt variant.
+  supplied_reference_step_ids:
+    - '13.6'
+    - '62.1'
+    - '76.3'
+  include_in_target_metrics: false
+context_policy: Fail the affected chain if prompt plus output cap exceeds context; never lower the output cap.
+seeds:
+  - 60000
+  - 60001
+  - 60002
+  - 60003
+  - 60004
+  - 60005
+  - 60006
+  - 60007
+  - 60008
+  - 60009
+attempts_per_subtask: 10
+target_responses: 550
+training_candidates: 440
+held_out_responses_excluded_from_training: 110
+prompt:
+  role: user
+  addition_file: prompt7.txt
+  placement: Append after two newline characters.
+  remove_addition_from_training_inputs: true
+request_options:
+  logprobs: false
+  stream: false
+serving_options:
+  max_num_batched_tokens: 8192
+  enable_chunked_prefill: true
+  language_model_only: true
+  kv_cache_dtype: checkpoint default

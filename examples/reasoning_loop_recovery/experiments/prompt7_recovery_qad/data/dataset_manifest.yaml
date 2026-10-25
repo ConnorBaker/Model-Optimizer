@@ -1,0 +1,60 @@
+schema_version: 1
+dataset_id: prompt7_recovery_qad_334
+file: datasets/prompt7/training.jsonl
+public_download_url:
+data_included_in_repository: false
+format:
+  type: jsonl
+  fields:
+    input: Serialized chat prompt ending with <think>\n; prompt 7 removed.
+    output: Reasoning followed by \n</think>\n\n and final answer.
+  tokenized: false
+  eos: Not stored in output; dataset processing accounts for one EOS token.
+sha256: 012b6f0de591a53f8252847334b9a524df9cbf0319d2a6bc08828812de8bafb2
+bytes: 11519728
+source_checkpoint:
+  role: original_qad
+  format: NVFP4
+  weights_included: false
+  public_download_url:
+generation_config: data_generation.yaml
+split_file: ../evaluation/subtask_split.yaml
+prompt_file: prompt7.txt
+tokenizer_transformers_version: 5.20.1
+counts:
+  candidates: 440
+  kept: 334
+  correct_kept: 51
+  response_tokens: 2620083
+  excluded_repeated_20word_cycle: 66
+  excluded_cap: 31
+  excluded_high_repetition: 8
+  excluded_overlength: 1
+  train_iters_one_epoch_gbs8: 42
+  dataset_sha256: 012b6f0de591a53f8252847334b9a524df9cbf0319d2a6bc08828812de8bafb2
+  subtasks_represented: 44
+selection:
+  training_subtasks_only: true
+  correctness_filter: false
+  remove_prompt7: true
+  cap_tokens: 131072
+  require_nonempty_final: true
+  require_finish_reason: stop
+  reject_reasoning_repetition_at_or_above: 0.5
+  reject_any_20_word_ngram_at_or_above_occurrences: 8
+  max_sequence_tokens_including_eos: 32768
+  deduplicate_within_source: true
+  deduplication_key: SHA256(serialized_input + NUL + serialized_output)
+  filter_order:
+    - cap
+    - empty_final
+    - non_stop_finish
+    - high_repetition
+    - repeated_20word_cycle
+    - overlength
+    - duplicate
+preparation_script_sha256: 2200cdb0d901b16dde3130a5dba81464f5969041aca6a0c19196331f9e43b591
+notes:
+  - Counts and checksum identify the 334-example training dataset used in this experiment.
+  - 'Correctness was recorded separately: 51 of 334 selected responses passed tests.'
+  - Regeneration with the same seeds is not guaranteed to reproduce byte-identical responses across serving runtimes.
