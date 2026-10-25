@@ -289,18 +289,19 @@ def test_routed_experts_without_experts_in_their_names_are_refused(ep_world_of_t
 
 
 @pytest.mark.parametrize(
-    ("loaded", "held"),
-    [(4, 2), (3, 3), (None, None), (4, 4)],
-    ids=["dividing", "not-dividing", "not-shown", "sharded-over-another-mesh"],
+    ("loaded", "held", "named"),
+    [(4, 2, None), (3, 3, None), (None, None, None), (4, 4, None), (None, None, 4)],
+    ids=["dividing", "not-dividing", "not-shown", "sharded-over-another-mesh", "never-sharded"],
 )
 def test_an_expert_count_the_config_does_not_name_is_read_off_the_loaded_experts(
-    ep_world_of_two, gloo_world_of_one, monkeypatch, loaded, held
+    ep_world_of_two, gloo_world_of_one, monkeypatch, loaded, held, named
 ):
     """A config that names its expert count none of the ways the loader reads is checked against the
     loaded experts' weights: transformers keeps the whole count on the DTensors it shards them into,
     and 5.16.0 splits a count ep_size does not divide without an error. A count neither shows is
     refused, as the distribution plan's decision refuses it. So is a rank holding another share of
-    the experts than ``ep_size`` gives it: they were sharded over another mesh than its EP group."""
+    the experts than ``ep_size`` gives it: sharded over another mesh than its EP group, or never
+    sharded, which plain weights show against the count the config names."""
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import DTensor, Shard
 
@@ -339,10 +340,12 @@ def test_an_expert_count_the_config_does_not_name_is_read_off_the_loaded_experts
     monkeypatch.setattr(model_load_utils, "_auto_class", lambda *args, **kwargs: _Loader)
     monkeypatch.setattr(model_load_utils, "record_unplaced_source_keys", lambda *args: None)
     monkeypatch.setattr(model_load_utils, "_refuse_unquantizable_experts", next_check)
-    config = SimpleNamespace(base_model_ep_plan=_EP_PLAN)
+    config = SimpleNamespace(
+        base_model_ep_plan=_EP_PLAN, **({"num_experts": named} if named else {})
+    )
     if (loaded, held) == (4, 2):
         outcome = pytest.raises(_PastError)
-    elif loaded == 4:
+    elif loaded == 4 or named:
         outcome = pytest.raises(
             RuntimeError, match="holds 4 of a routed-expert container's 4 experts"
         )
@@ -355,7 +358,9 @@ def test_an_expert_count_the_config_does_not_name_is_read_off_the_loaded_experts
 
 
 @pytest.mark.parametrize("declared", [True, False], ids=["on-the-config", "a-class-default"])
-def test_the_model_keeps_the_plan_its_checkpoint_declares(ep_world_of_two, monkeypatch, declared):
+def test_the_model_keeps_the_plan_its_checkpoint_declares(
+    ep_world_of_two, gloo_world_of_one, monkeypatch, declared
+):
     """The load shards by the torch_a2a styles, but the config the model keeps goes back to the
     checkpoint's plan: an export writes it out, and nothing without ModelOpt knows those styles. A
     plan the config class ships (transformers' own, e.g. Qwen3-MoE's) stays off the instance."""
@@ -384,7 +389,8 @@ def test_the_model_keeps_the_plan_its_checkpoint_declares(ep_world_of_two, monke
     class _Config(SimpleNamespace):
         base_model_ep_plan = _EP_PLAN
 
-    config = _Config(num_experts=4, **({"base_model_ep_plan": dict(_EP_PLAN)} if declared else {}))
+    # 8 experts over 2 ranks: the stand-in model holds this rank's 4.
+    config = _Config(num_experts=8, **({"base_model_ep_plan": dict(_EP_PLAN)} if declared else {}))
 
     with pytest.raises(_PastError):
         load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
@@ -394,7 +400,7 @@ def test_the_model_keeps_the_plan_its_checkpoint_declares(ep_world_of_two, monke
 
 
 def test_a_loaded_model_keeps_its_sharding_styles_out_of_its_saved_config(
-    ep_world_of_two, monkeypatch
+    ep_world_of_two, gloo_world_of_one, monkeypatch
 ):
     """What the loader leaves on a transformers model, as transformers treats it. Built with the
     torch_a2a styles, the model keeps them as ``model.tp_plan``, which calibration re-installs the
@@ -415,10 +421,15 @@ def test_a_loaded_model_keeps_its_sharding_styles_out_of_its_saved_config(
     class _Loader:
         @staticmethod
         def from_pretrained(path, config, **kwargs):
+            # As transformers' expert-parallel load builds it: this rank's 2 of the 4 experts.
             config.distributed_config = DistributedConfig(enable_expert_parallel=True)
+            share = copy.deepcopy(config)
+            share.num_experts //= 2
             with torch.device("meta"):
-                built.append(Qwen3MoeForCausalLM(config))
-            return built[-1]
+                model = Qwen3MoeForCausalLM(share)
+            model.config = config
+            built.append(model)
+            return model
 
     def next_check(experts):
         raise _PastError
