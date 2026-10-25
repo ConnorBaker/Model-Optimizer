@@ -32,8 +32,8 @@ transformers = pytest.importorskip("transformers")
 
 from packaging.version import Version
 
-if Version(transformers.__version__) < Version("5.6"):
-    pytest.skip("Kimi-VL expert parallelism needs transformers >= 5.6", allow_module_level=True)
+if Version(transformers.__version__) < Version("5.7"):
+    pytest.skip("Kimi-VL expert parallelism needs transformers >= 5.7", allow_module_level=True)
 
 import transformers.dynamic_module_utils as dmu
 import transformers.utils.import_utils as import_utils
