@@ -34,6 +34,10 @@ from torch.distributed.nn.functional import all_to_all_single as autograd_all_to
 
 from .distributed import distribution_plan
 
+# The transformers release the expert-parallel load needs, for every model: 5.6 builds a model only
+# with the experts implementations it ships, never torch_a2a.
+_EP_MIN_TRANSFORMERS = "5.7"
+
 
 def require_transformers(min_version: str, feature: str) -> None:
     """Fail loudly if the installed transformers is older than ``min_version`` (the floor for ``feature``).
@@ -149,8 +153,9 @@ def _ep_spec(model_type: str):
 
 
 def check_distributed_support(model_type: str) -> None:
-    """Refuse ``model_type``'s expert parallelism if its spec does; enforce its transformers floor.
+    """Refuse ``model_type``'s expert parallelism if its spec does, or below its transformers floor.
 
+    The floor is its spec's release, or the expert-parallel load's own when that is later.
     :func:`apply_distributed_support` checks this before it prepares a config; a config already
     prepared with its plan needs only the check. An EP degree left to ``auto`` picks none for a
     model this refuses (:func:`_spec_refuses_ep`), so only an EP degree asked for explicitly, or an
@@ -171,11 +176,15 @@ def check_distributed_support(model_type: str) -> None:
             f"{model_type} cannot be quantized expert-parallel yet: {ep.unsupported} Quantize it "
             f"{without_ep}."
         )
-    if ep.requires_transformers:
-        try:
-            require_transformers(ep.requires_transformers, f"{model_type} expert-parallel PTQ")
-        except RuntimeError as e:
-            raise RuntimeError(f"{e} Or quantize it {without_ep}.") from None
+    from packaging.version import parse
+
+    # A spec that supplies a plan but states no release still needs the load's floor: auto must
+    # pick no EP degree below it, rather than reach the load and fail there.
+    floor = max(_EP_MIN_TRANSFORMERS, ep.requires_transformers or _EP_MIN_TRANSFORMERS, key=parse)
+    try:
+        require_transformers(floor, f"{model_type} expert-parallel PTQ")
+    except RuntimeError as e:
+        raise RuntimeError(f"{e} Or quantize it {without_ep}.") from None
 
 
 def _spec_refuses_ep(model_type: str) -> bool:

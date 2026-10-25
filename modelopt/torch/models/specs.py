@@ -188,7 +188,8 @@ class EPSpec(SpecSection):
     mask them."""
 
     requires_transformers: str | None = None
-    """Earliest transformers release that supports THIS model expert-parallel.
+    """Earliest transformers release that supports THIS model expert-parallel. The expert-parallel
+    load's own floor holds for every model with an EP section; the later of the two applies.
 
     Distinct from ``ModelSpec.min_transformers_version``, which is about the modeling code
     matching the spec. A model can be fully modelled and still not be shardable: qwen3_moe is

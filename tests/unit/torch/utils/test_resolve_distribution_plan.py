@@ -51,6 +51,7 @@ from modelopt.torch.models import EPSpec, get_spec
 from modelopt.torch.utils import moe
 from modelopt.torch.utils.distributed import DistributionPlan
 from modelopt.torch.utils.moe import (
+    _EP_MIN_TRANSFORMERS,
     _choose_ep_degree,
     _num_experts_from_config,
     _routed_expert_modules,
@@ -66,6 +67,12 @@ _TINY = {
     "num_key_value_heads": 1,
     "vocab_size": 32,
 }
+
+# Applying a model's spec enforces the transformers floor the expert-parallel load needs.
+needs_ep_transformers = pytest.mark.skipif(
+    Version(transformers.__version__) < Version(_EP_MIN_TRANSFORMERS),
+    reason=f"expert parallelism needs transformers >= {_EP_MIN_TRANSFORMERS}",
+)
 
 needs_qwen3_moe_ep_plan = pytest.mark.skipif(
     Version(transformers.__version__) < Version("5.7"),
@@ -414,6 +421,7 @@ def test_an_ep_degree_that_is_not_a_number_names_where_it_came_from(
         resolve_distribution_plan(str(tmp_path), **arguments)
 
 
+@needs_ep_transformers
 def test_the_spec_is_applied_before_the_decision(run_as, serve, tmp_path):
     """DeepSeek-V3's plan comes only from its spec. Deciding before applying it would read the MoE
     as dense; applied first, it shards, and the config handed on carries the spec's plan."""
@@ -439,10 +447,11 @@ def test_only_an_expert_parallel_plan_carries_the_spec_plan_on(run_as, serve, tm
 
 
 @pytest.mark.parametrize(
-    ("config", "floor", "error", "refusal"),
+    ("config", "floor", "version", "error", "refusal"),
     [
         pytest.param(
             GptOssConfig(num_local_experts=4, **_TINY),
+            None,
             None,
             NotImplementedError,
             "cannot be quantized expert-parallel yet",
@@ -451,21 +460,33 @@ def test_only_an_expert_parallel_plan_carries_the_spec_plan_on(run_as, serve, tm
         pytest.param(
             _qwen3_moe(num_experts=4),
             "99",
+            None,
             RuntimeError,
             "requires transformers >= 99",
             id="below-the-specs-floor",
         ),
+        pytest.param(
+            _deepseek_v3(n_routed_experts=4),
+            None,
+            "5.6.2",
+            RuntimeError,
+            r"requires transformers >= 5\.7",
+            id="below-the-expert-parallel-loads-floor",
+        ),
     ],
 )
 def test_a_run_without_expert_parallelism_needs_no_spec(
-    run_as, serve, monkeypatch, tmp_path, config, floor, error, refusal
+    run_as, serve, monkeypatch, tmp_path, config, floor, version, error, refusal
 ):
     """GPT-OSS cannot be expert-parallel, which its spec says by refusing an EP degree above 1, nor
-    can a model on a transformers older than its spec asks for. A run that rules expert parallelism
-    out does not ask the spec, nor does one leaving the EP degree to auto, which picks none for
+    can a model on a transformers older than its spec, or the expert-parallel load, asks for: a
+    plan the spec supplies does not lift the load's floor. A run that rules expert parallelism out
+    does not ask the spec, nor does one leaving the EP degree to auto, which picks none for
     either: asking for FSDP2 alone shards it whole."""
     if floor is not None:
         monkeypatch.setattr(get_spec(config.model_type).ep_spec, "requires_transformers", floor)
+    if version is not None:
+        monkeypatch.setattr(transformers, "__version__", version)
     run_as(2)
     serve(config)
 
@@ -837,6 +858,7 @@ def _every_rank_takes_rank0s_plan_job(rank, size, ckpt, knobs, expected, spec_ap
         assert applied is spec_applied, (rank, applied)
 
 
+@needs_ep_transformers
 @pytest.mark.parametrize(
     ("config", "knobs", "expected", "spec_applied"),
     [
@@ -922,6 +944,7 @@ def _one_rank_cannot_apply_the_spec_job(rank, size, ckpt):
     assert "cannot import the checkpoint's code" in raised, raised
 
 
+@needs_ep_transformers
 def test_a_rank_that_cannot_apply_the_spec_fails_every_rank(cpu_dist_workers, tmp_path):
     """A spec's preparation reads the checkpoint and imports its code on each rank, which can fail
     on one alone; the others must not wait for it in the plan's broadcast."""

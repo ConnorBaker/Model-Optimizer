@@ -2303,6 +2303,7 @@ def load_and_prepare_ep(
         size,
     )
     from modelopt.torch.utils.moe import (
+        _EP_MIN_TRANSFORMERS,
         _EXPERTS_STYLES,
         _ep_config,
         _num_experts_from_config,
@@ -2339,7 +2340,7 @@ def load_and_prepare_ep(
     # enable_expert_parallel silently shards nothing (no error); 5.6 checks a model's experts
     # implementation against the ones it ships, so from_pretrained would refuse torch_a2a.
     require_transformers(
-        "5.7", "ModelOpt DP=EP expert-parallel PTQ (transformers MoE EP framework)"
+        _EP_MIN_TRANSFORMERS, "ModelOpt DP=EP expert-parallel PTQ (transformers MoE EP framework)"
     )
     from torch.distributed.device_mesh import init_device_mesh
     from transformers import AutoConfig

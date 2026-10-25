@@ -19,12 +19,21 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("transformers")
+transformers = pytest.importorskip("transformers")
+
+from packaging.version import Version
 
 from modelopt.torch.models import EPSpec, ModelSpec, get_spec, get_specs
-from modelopt.torch.utils.moe import apply_distributed_support
+from modelopt.torch.utils.moe import _EP_MIN_TRANSFORMERS, apply_distributed_support
 
 EP_MODEL_TYPES = [s.model_type for s in get_specs() if s.ep_spec is not None]
+
+
+# Applying a spec enforces the transformers floor the expert-parallel load needs.
+needs_ep_transformers = pytest.mark.skipif(
+    Version(transformers.__version__) < Version(_EP_MIN_TRANSFORMERS),
+    reason=f"expert parallelism needs transformers >= {_EP_MIN_TRANSFORMERS}",
+)
 
 
 def cfg(**kw):
@@ -72,6 +81,7 @@ def test_the_omni_vlm_puts_its_plan_on_the_nested_config():
 # ----------------------------------------------------------------------------------- the applier
 
 
+@needs_ep_transformers
 def test_the_models_own_plan_always_wins():
     """Stock transformers ships a plan for some models; overwriting it would substitute our idea
     of the layout for the model's own."""
@@ -80,6 +90,7 @@ def test_the_models_own_plan_always_wins():
     assert config.base_model_ep_plan == {"layers.*.mlp.experts": "stock_style"}
 
 
+@needs_ep_transformers
 def test_the_attached_plan_is_a_copy():
     """Two models prepared in one process must not share one mutable dict."""
     a, b = cfg(), cfg()
@@ -90,6 +101,7 @@ def test_the_attached_plan_is_a_copy():
     assert "injected" not in get_spec("deepseek_v3").ep_spec.base_model_ep_plan
 
 
+@needs_ep_transformers
 @pytest.mark.parametrize(
     "attrs", [("llm_config",), ("text_config",), ("text_config", "llm_config")]
 )
@@ -106,11 +118,13 @@ def test_a_vlm_plan_lands_on_the_nested_config_only(attrs):
     assert not any(hasattr(other, "base_model_ep_plan") for other in others)
 
 
+@needs_ep_transformers
 def test_a_missing_nested_config_is_an_error_not_a_silent_skip():
     with pytest.raises(ValueError, match=r"config\.text_config or config\.llm_config"):
         apply_distributed_support("nemotron_h_omni", cfg())
 
 
+@needs_ep_transformers
 @pytest.mark.parametrize(
     "supplied",
     [
@@ -170,6 +184,7 @@ def test_a_refusal_comes_before_the_rest_of_the_section(monkeypatch):
     assert vars(config) == {}
 
 
+@needs_ep_transformers
 def test_prepare_runs_after_the_plan_is_attached_and_its_config_is_returned(monkeypatch):
     """A prepare hook may inspect or adjust the plan, so it must not run before there is one."""
     seen = {}
